@@ -74,7 +74,7 @@ pub struct ClusterTopology {
 
 impl ClusterTopology {
     pub fn new(cluster_name: &str) -> Self {
-        let mut t = Self::default();
+        let t = Self::default();
         // Store cluster name in a simple way
         let _ = cluster_name; // used by callers for display
         t

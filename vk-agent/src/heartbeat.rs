@@ -7,11 +7,14 @@ use tokio::time::Instant;
 ///
 /// If no heartbeat is received within `timeout`, the tracker enters **safe mode**
 /// and the agent will refuse Promote RPCs until the heartbeat resumes.
+/// `safe_mode_since` records when safe mode was entered so callers can enforce
+/// a hard fence after a configurable additional delay.
 #[derive(Debug)]
 pub struct HeartbeatTracker {
     last_seen: Arc<Mutex<Instant>>,
     timeout: Duration,
     in_safe_mode: Arc<AtomicBool>,
+    safe_mode_since: Arc<Mutex<Option<Instant>>>,
 }
 
 impl HeartbeatTracker {
@@ -23,6 +26,7 @@ impl HeartbeatTracker {
             last_seen: Arc::new(Mutex::new(Instant::now())),
             timeout,
             in_safe_mode: Arc::new(AtomicBool::new(false)),
+            safe_mode_since: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -30,6 +34,7 @@ impl HeartbeatTracker {
     pub fn touch(&self) {
         *self.last_seen.lock().unwrap() = Instant::now();
         if self.in_safe_mode.swap(false, Ordering::SeqCst) {
+            *self.safe_mode_since.lock().unwrap() = None;
             tracing::info!("pgcluster heartbeat restored — leaving safe mode");
         }
     }
@@ -37,6 +42,12 @@ impl HeartbeatTracker {
     /// Returns `true` when the agent is in safe mode (heartbeat lost).
     pub fn is_safe_mode(&self) -> bool {
         self.in_safe_mode.load(Ordering::SeqCst)
+    }
+
+    /// Returns how long the agent has been continuously in safe mode.
+    /// Returns `None` if the agent is not currently in safe mode.
+    pub fn time_in_safe_mode(&self) -> Option<Duration> {
+        self.safe_mode_since.lock().unwrap().map(|t| t.elapsed())
     }
 
     /// Spawn a background tokio task that checks every second whether the
@@ -48,15 +59,14 @@ impl HeartbeatTracker {
                 // advance (via tokio::time::advance in tests, or real time in
                 // production) immediately evaluates the timeout condition.
                 let elapsed = self.last_seen.lock().unwrap().elapsed();
-                if elapsed > self.timeout {
-                    if !self.in_safe_mode.load(Ordering::SeqCst) {
-                        self.in_safe_mode.store(true, Ordering::SeqCst);
-                        tracing::warn!(
-                            elapsed_secs = elapsed.as_secs_f64(),
-                            timeout_secs = self.timeout.as_secs_f64(),
-                            "pgcluster heartbeat lost — entering safe mode"
-                        );
-                    }
+                if elapsed > self.timeout && !self.in_safe_mode.load(Ordering::SeqCst) {
+                    self.in_safe_mode.store(true, Ordering::SeqCst);
+                    *self.safe_mode_since.lock().unwrap() = Some(Instant::now());
+                    tracing::warn!(
+                        elapsed_secs = elapsed.as_secs_f64(),
+                        timeout_secs = self.timeout.as_secs_f64(),
+                        "pgcluster heartbeat lost — entering safe mode"
+                    );
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -72,6 +82,7 @@ mod tests {
     async fn starts_not_in_safe_mode() {
         let tracker = HeartbeatTracker::new(Duration::from_secs(10));
         assert!(!tracker.is_safe_mode());
+        assert!(tracker.time_in_safe_mode().is_none());
     }
 
     #[tokio::test]
@@ -82,6 +93,7 @@ mod tests {
         assert!(tracker.is_safe_mode());
         tracker.touch();
         assert!(!tracker.is_safe_mode());
+        assert!(tracker.time_in_safe_mode().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -99,6 +111,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(tracker.is_safe_mode());
+        assert!(tracker.time_in_safe_mode().is_some());
     }
 
     #[tokio::test(start_paused = true)]
@@ -112,10 +125,12 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
         assert!(tracker.is_safe_mode());
+        assert!(tracker.time_in_safe_mode().is_some());
 
         // A new heartbeat should clear safe mode immediately.
         tracker.touch();
         assert!(!tracker.is_safe_mode());
+        assert!(tracker.time_in_safe_mode().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -141,5 +156,31 @@ mod tests {
         // A heartbeat clears safe mode and re-enables promote.
         tracker.touch();
         assert!(!tracker.is_safe_mode());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn time_in_safe_mode_tracks_duration() {
+        let tracker = HeartbeatTracker::new(Duration::from_secs(5));
+        let t = tracker.clone();
+        t.spawn_watchdog();
+
+        // No safe mode yet.
+        assert!(tracker.time_in_safe_mode().is_none());
+
+        // Expire the heartbeat — watchdog enters safe mode.
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(tracker.time_in_safe_mode().is_some());
+
+        // Advance further — time_in_safe_mode grows.
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::task::yield_now().await;
+        let elapsed = tracker.time_in_safe_mode().expect("should be in safe mode");
+        assert!(
+            elapsed >= Duration::from_secs(19),
+            "elapsed should be at least 19s, got {:?}",
+            elapsed
+        );
     }
 }

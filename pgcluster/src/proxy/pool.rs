@@ -194,6 +194,39 @@ impl ConnectionPool {
         }
     }
 
+    /// Donate a pre-authenticated connection to the pool.
+    ///
+    /// Use this after completing startup+auth on a fresh TCP connection so the
+    /// pool can hand it out for subsequent query routing.  Unlike `release`,
+    /// this path increments the total-connection counter (since `acquire` was
+    /// never called for this connection).
+    pub async fn inject(
+        &self,
+        database: &str,
+        user: &str,
+        backend_addr: &str,
+        node_id: &str,
+        conn: Arc<BackendConnection>,
+    ) {
+        let key = PoolKey::new(database, user, node_id, backend_addr);
+        let skey = key.string_key();
+        let max = self.config.max_connections_per_db_user as usize;
+
+        let bucket = self
+            .pools
+            .entry(skey)
+            .or_insert_with(|| Arc::new(PoolBucket::new(max)))
+            .clone();
+
+        bucket.increment();
+        conn.mark_idle();
+        let _ = conn.touch().await;
+        let mut idle = bucket.idle.lock().await;
+        idle.push(conn);
+        drop(idle);
+        bucket.released.notify_one();
+    }
+
     /// Remove all idle connections to `backend_addr` (used after a failover).
     ///
     /// In-use connections will be discarded when they are next `release()`d.

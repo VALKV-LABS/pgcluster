@@ -85,9 +85,7 @@ impl RaftNetwork<RaftTypeConfig> for RaftNetworkConnection {
         let mut client = raft_proto::raft_service_client::RaftServiceClient::new(channel);
 
         let resp = client
-            .append_entries(raft_proto::AppendEntriesRequest {
-                payload: payload.into(),
-            })
+            .append_entries(raft_proto::AppendEntriesRequest { payload })
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
             .into_inner();
@@ -109,9 +107,7 @@ impl RaftNetwork<RaftTypeConfig> for RaftNetworkConnection {
         let mut client = raft_proto::raft_service_client::RaftServiceClient::new(channel);
 
         let resp = client
-            .request_vote(raft_proto::VoteRequest {
-                payload: payload.into(),
-            })
+            .request_vote(raft_proto::VoteRequest { payload })
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
             .into_inner();
@@ -134,20 +130,17 @@ impl RaftNetwork<RaftTypeConfig> for RaftNetworkConnection {
 
         // make_channel errors are Network-typed; re-box to satisfy the richer
         // error type required by install_snapshot.
-        let channel = self
-            .make_channel()
-            .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&std::io::Error::new(
+        let channel = self.make_channel().await.map_err(|e| {
+            RPCError::Network(NetworkError::new(&std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 format!("{e:?}"),
-            ))))?;
+            )))
+        })?;
 
         let mut client = raft_proto::raft_service_client::RaftServiceClient::new(channel);
 
         let resp = client
-            .install_snapshot(raft_proto::SnapshotRequest {
-                payload: payload.into(),
-            })
+            .install_snapshot(raft_proto::SnapshotRequest { payload })
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?
             .into_inner();

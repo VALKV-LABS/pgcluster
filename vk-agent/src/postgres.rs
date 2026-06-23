@@ -20,6 +20,11 @@ impl LocalPostgres {
         Ok(Self { pool })
     }
 
+    /// Return a reference to the underlying connection pool.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Returns `true` when this node is a standby (in recovery).
     pub async fn is_in_recovery(&self) -> Result<bool> {
         let row: (bool,) = sqlx::query_as("SELECT pg_is_in_recovery()")
@@ -69,18 +74,18 @@ impl LocalPostgres {
 
     /// Returns rows from `pg_stat_replication` — non-empty only on a primary.
     pub async fn get_stat_replication(&self) -> Result<Vec<ReplicaStatus>> {
-        let rows: Vec<(String, Option<String>, Option<String>, Option<i64>, String)> =
-            sqlx::query_as(
-                "SELECT application_name,
+        type StatRow = (String, Option<String>, Option<String>, Option<i64>, String);
+        let rows: Vec<StatRow> = sqlx::query_as(
+            "SELECT application_name,
                         flush_lsn::text,
                         replay_lsn::text,
                         EXTRACT(EPOCH FROM replay_lag)::bigint * 1000000,
                         state
                  FROM pg_stat_replication",
-            )
-            .fetch_all(&self.pool)
-            .await
-            .context("get_stat_replication query failed")?;
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("get_stat_replication query failed")?;
 
         Ok(rows
             .into_iter()
@@ -195,7 +200,11 @@ mod tests {
         for s in &cases {
             let lsn = parse_lsn(s).unwrap();
             let formatted = format!("{:X}/{:08X}", lsn >> 32, lsn as u32);
-            assert_eq!(parse_lsn(&formatted).unwrap(), lsn, "roundtrip failed for {s}");
+            assert_eq!(
+                parse_lsn(&formatted).unwrap(),
+                lsn,
+                "roundtrip failed for {s}"
+            );
         }
     }
 }

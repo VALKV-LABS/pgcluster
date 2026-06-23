@@ -33,6 +33,13 @@ pub struct AgentConfig {
     #[serde(default = "default_heartbeat_timeout")]
     pub heartbeat_timeout_seconds: u64,
 
+    /// If pgcluster heartbeats are absent for this many seconds *after* safe mode
+    /// is entered, vk-agent calls `pg_ctl stop -m immediate` and exits, self-fencing
+    /// the local postgres against split-brain writes in a network partition.
+    /// Set to 0 or omit to disable (default: disabled).
+    #[serde(default)]
+    pub fence_timeout_seconds: Option<u64>,
+
     /// Optional TLS configuration for the gRPC server.
     #[serde(default)]
     pub tls: AgentTlsConfig,
@@ -154,6 +161,7 @@ listen_addr = "0.0.0.0:7001"
             postgres_password: None,
             postgres_dbname: "postgres".into(),
             heartbeat_timeout_seconds: 10,
+            fence_timeout_seconds: None,
             tls: Default::default(),
             pg_ctl_path: "pg_ctl".into(),
         };

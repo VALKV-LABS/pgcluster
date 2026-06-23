@@ -7,12 +7,18 @@ use pgcluster::proxy::session::{SessionState, TxnState};
 
 #[test]
 fn classify_select_is_read() {
-    assert_eq!(classify_statement("SELECT * FROM users"), StatementIntent::Read);
+    assert_eq!(
+        classify_statement("SELECT * FROM users"),
+        StatementIntent::Read
+    );
 }
 
 #[test]
 fn classify_insert_is_write() {
-    assert_eq!(classify_statement("INSERT INTO t VALUES (1)"), StatementIntent::Write);
+    assert_eq!(
+        classify_statement("INSERT INTO t VALUES (1)"),
+        StatementIntent::Write
+    );
 }
 
 #[test]
@@ -28,12 +34,18 @@ fn classify_begin_is_write() {
 
 #[test]
 fn classify_update_is_write() {
-    assert_eq!(classify_statement("UPDATE t SET x = 1"), StatementIntent::Write);
+    assert_eq!(
+        classify_statement("UPDATE t SET x = 1"),
+        StatementIntent::Write
+    );
 }
 
 #[test]
 fn classify_ddl_is_write() {
-    assert_eq!(classify_statement("CREATE TABLE foo (id INT)"), StatementIntent::Write);
+    assert_eq!(
+        classify_statement("CREATE TABLE foo (id INT)"),
+        StatementIntent::Write
+    );
     assert_eq!(classify_statement("DROP TABLE foo"), StatementIntent::Write);
     assert_eq!(
         classify_statement("ALTER TABLE foo ADD COLUMN bar TEXT"),
@@ -136,7 +148,10 @@ async fn write_routes_to_primary() {
         .expect("connect");
     tokio::spawn(async move { connection.await.ok() });
     client
-        .execute("CREATE TABLE IF NOT EXISTS proxy_test (id SERIAL, v TEXT)", &[])
+        .execute(
+            "CREATE TABLE IF NOT EXISTS proxy_test (id SERIAL, v TEXT)",
+            &[],
+        )
         .await
         .expect("create table");
     let rows_inserted = client
@@ -158,7 +173,10 @@ async fn read_only_txn_routes_to_replica() {
         .expect("connect");
     tokio::spawn(async move { connection.await.ok() });
     client.execute("BEGIN READ ONLY", &[]).await.expect("begin");
-    let rows = client.query("SELECT pg_is_in_recovery() AS r", &[]).await.expect("query");
+    let rows = client
+        .query("SELECT pg_is_in_recovery() AS r", &[])
+        .await
+        .expect("query");
     client.execute("COMMIT", &[]).await.expect("commit");
     let in_recovery: bool = rows[0].get("r");
     assert!(in_recovery, "read-only txn should be served by a replica");

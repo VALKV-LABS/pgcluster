@@ -72,8 +72,10 @@ mod tests {
 
     #[tokio::test]
     async fn synced_replica_returns_immediately() {
-        let mut t = ClusterTopology::default();
-        t.primary_node_id = "pg1".into();
+        let mut t = ClusterTopology {
+            primary_node_id: "pg1".into(),
+            ..Default::default()
+        };
         t.last_flush_lsns.insert("pg1".into(), 1000);
         t.last_flush_lsns.insert("pg2".into(), 999); // 1-byte lag — within 10
 
@@ -84,8 +86,10 @@ mod tests {
 
     #[tokio::test]
     async fn times_out_when_replica_behind() {
-        let mut t = ClusterTopology::default();
-        t.primary_node_id = "pg1".into();
+        let mut t = ClusterTopology {
+            primary_node_id: "pg1".into(),
+            ..Default::default()
+        };
         t.last_flush_lsns.insert("pg1".into(), 1000);
         t.last_flush_lsns.insert("pg2".into(), 0); // far behind
 
@@ -96,8 +100,10 @@ mod tests {
 
     #[tokio::test]
     async fn lag_zero_returns_immediately() {
-        let mut t = ClusterTopology::default();
-        t.primary_node_id = "pg1".into();
+        let mut t = ClusterTopology {
+            primary_node_id: "pg1".into(),
+            ..Default::default()
+        };
         t.last_flush_lsns.insert("pg1".into(), 500);
         t.last_flush_lsns.insert("pg2".into(), 500); // zero lag
 
@@ -108,8 +114,10 @@ mod tests {
 
     #[tokio::test]
     async fn lag_nonzero_waits_until_caught_up() {
-        let mut t = ClusterTopology::default();
-        t.primary_node_id = "pg1".into();
+        let mut t = ClusterTopology {
+            primary_node_id: "pg1".into(),
+            ..Default::default()
+        };
         t.last_flush_lsns.insert("pg1".into(), 100);
         t.last_flush_lsns.insert("pg2".into(), 95); // 5 bytes lag
 
@@ -121,8 +129,10 @@ mod tests {
 
     #[tokio::test]
     async fn lag_wait_times_out() {
-        let mut t = ClusterTopology::default();
-        t.primary_node_id = "pg1".into();
+        let mut t = ClusterTopology {
+            primary_node_id: "pg1".into(),
+            ..Default::default()
+        };
         t.last_flush_lsns.insert("pg1".into(), 10_000);
         t.last_flush_lsns.insert("pg2".into(), 0); // very far behind
 

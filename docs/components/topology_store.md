@@ -78,6 +78,7 @@ impl TopologyStore {
         t.node_configs.get(&t.primary_node_id).map(|c| c.postgres_addr.clone())
     }
 
+    ## TODO should we use replay_lsn instead of flush_lsn
     pub fn replica_addrs_within_lag(&self, max_lag_bytes: u64) -> Vec<String> {
         let t = self.state.read().unwrap();
         let primary_lsn = t.last_flush_lsns.get(&t.primary_node_id).copied().unwrap_or(0);
@@ -92,6 +93,10 @@ impl TopologyStore {
             .filter_map(|(id, _)| t.node_configs.get(id).map(|c| c.postgres_addr.clone()))
             .collect()
     }
+
+    ##TODO raw lsn comparison may be danegrous 
+    ## we hould use timeline as well ?
+    ## is there a bug we might priortizew lowr change
 
     pub fn best_failover_candidate(&self, failed_id: &str) -> Option<String> {
         let t = self.state.read().unwrap();

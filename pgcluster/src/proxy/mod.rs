@@ -18,9 +18,7 @@ use axum::{
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use crate::{
-    config::ProxyConfig, metrics_registry::Metrics, raft::TopologyWatch, tls::TlsManager,
-};
+use crate::{config::ProxyConfig, metrics_registry::Metrics, raft::TopologyWatch, tls::TlsManager};
 
 use pool::ConnectionPool;
 use router::Router;

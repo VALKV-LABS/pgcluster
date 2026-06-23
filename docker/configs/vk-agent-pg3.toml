@@ -6,4 +6,5 @@ postgres_user             = "postgres"
 postgres_password         = "test"
 postgres_dbname           = "postgres"
 heartbeat_timeout_seconds = 10
-pg_ctl_path               = "pg_ctl"
+fence_timeout_seconds     = 30
+pg_ctl_path               = "/usr/lib/postgresql/15/bin/pg_ctl"

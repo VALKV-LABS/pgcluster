@@ -96,8 +96,12 @@ shard-status:  ## Show container health for the multi-shard stack
 
 ##@ Convenience
 
-.PHONY: all ci
+.PHONY: all ci setup-hooks
 
 all: fmt check test  ## Format, lint, then unit test
 
 ci: check test test-integ  ## Full CI pipeline (lint + unit + integ)
+
+setup-hooks:  ## Install git hooks — run once after cloning (enables pre-push fmt+clippy)
+	git config core.hooksPath .githooks
+	chmod +x .githooks/pre-push

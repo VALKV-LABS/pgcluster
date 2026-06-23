@@ -1,6 +1,6 @@
-/// Integration tests for agent client connectivity.
-/// Requires a live vk-agent. Address is taken from AGENT_TEST_ADDR env var
-/// (default: 127.0.0.1:7001 for local dev; set to vk-agent:7001 in Docker).
+//! Integration tests for agent client connectivity.
+//! Requires a live vk-agent. Address is taken from AGENT_TEST_ADDR env var
+//! (default: 127.0.0.1:7001 for local dev; set to vk-agent:7001 in Docker).
 
 fn agent_addr() -> String {
     std::env::var("AGENT_TEST_ADDR").unwrap_or_else(|_| "127.0.0.1:7001".into())
@@ -56,7 +56,10 @@ async fn heartbeat_keeps_agent_active() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     // Agent is still alive (no panic / connection error)
-    client.get_status().await.expect("agent still active after heartbeats");
+    client
+        .get_status()
+        .await
+        .expect("agent still active after heartbeats");
 }
 
 #[tokio::test]

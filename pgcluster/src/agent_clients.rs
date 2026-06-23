@@ -134,12 +134,11 @@ impl AgentClientPool {
         if let Some(ch) = self.channels.get(node_id) {
             return Ok(AgentClient::from_channel(addr, ch.value().clone()));
         }
-        let channel =
-            tonic::transport::Endpoint::from_shared(format!("http://{}", addr))
-                .with_context(|| format!("invalid agent addr: {addr}"))?
-                .connect()
-                .await
-                .with_context(|| format!("connect to vk-agent {node_id} at {addr}"))?;
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", addr))
+            .with_context(|| format!("invalid agent addr: {addr}"))?
+            .connect()
+            .await
+            .with_context(|| format!("connect to vk-agent {node_id} at {addr}"))?;
         self.channels.insert(node_id.to_string(), channel.clone());
         Ok(AgentClient::from_channel(addr, channel))
     }

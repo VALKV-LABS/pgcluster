@@ -108,8 +108,10 @@ mod tests {
         primary: &str,
         replicas: &[(&str, u64)], // (node_id, lag_bytes)
     ) -> ClusterTopology {
-        let mut topo = ClusterTopology::default();
-        topo.primary_node_id = primary.to_owned();
+        let mut topo = ClusterTopology {
+            primary_node_id: primary.to_owned(),
+            ..Default::default()
+        };
 
         // Primary
         topo.node_roles
@@ -118,8 +120,8 @@ mod tests {
             primary.to_owned(),
             NodeConfig {
                 node_id: primary.to_owned(),
-                agent_addr: format!("127.0.0.1:7000"),
-                postgres_addr: format!("127.0.0.1:5432"),
+                agent_addr: "127.0.0.1:7000".to_string(),
+                postgres_addr: "127.0.0.1:5432".to_string(),
                 priority: 100,
                 tags: HashMap::new(),
             },

@@ -71,6 +71,121 @@ The stack exposes:
 | `8009` | REST API |
 | `9190` | Prometheus metrics |
 | `8008` | HTTP health check (for load balancers) |
+| `5490` | pg-primary direct (bypass proxy, debug only) |
+| `5491` | pg-replica-1 direct |
+| `5492` | pg-replica-2 direct |
+
+### Quick test with psql
+
+```bash
+# 1. Connect through the proxy, create a database, switch into it, then create a table
+psql postgres://postgres:test@localhost:5432/postgres
+
+# Inside psql — run each line in order:
+CREATE DATABASE myapp;
+\c myapp                  -- IMPORTANT: switch into myapp before creating the table
+CREATE TABLE users (id serial PRIMARY KEY, name text);
+INSERT INTO users (name) VALUES ('alice'), ('bob');
+SELECT * FROM users;
+\q
+
+# 2. Verify the data replicated to both replicas (read directly, bypassing proxy)
+psql postgres://postgres:test@localhost:5491/myapp -c "SELECT * FROM users;"
+psql postgres://postgres:test@localhost:5492/myapp -c "SELECT * FROM users;"
+
+# 3. Check cluster status via the REST API
+curl http://localhost:8009/api/status | jq .
+curl http://localhost:8009/api/nodes  | jq .
+```
+
+> **Note:** `psql` must be installed locally. On Windows use WSL, or run it inside the container:
+> ```bash
+> docker exec -it docker-pg-primary-1 psql -U postgres postgres
+> ```
+
+### Cluster administration
+
+All admin commands hit the REST API on port `8009`. Use `jq` to pretty-print responses.
+
+#### Health & status
+
+```bash
+# Proxy health — 200 if a primary is known, 503 if not
+curl -s http://localhost:8009/health | jq .
+# → { "status": "ok", "primary": "pg1", "raft_leader": true }
+
+# Cluster overview — leader id, topology version, failover count
+curl -s http://localhost:8009/api/status | jq .
+
+# Full topology — all nodes, roles, LSNs, lag bytes
+curl -s http://localhost:8009/api/topology | jq .
+
+# Node list — role, replication lag, LSN per node
+curl -s http://localhost:8009/api/nodes | jq .
+
+# Single node
+curl -s http://localhost:8009/api/nodes/pg1 | jq .
+
+# Replication slots
+curl -s http://localhost:8009/api/replication/slots | jq .
+
+# Prometheus metrics (raft leader, lag, failover count, pool saturation)
+curl -s http://localhost:9190/metrics | grep pgcluster_
+```
+
+#### Planned switchover (zero-downtime)
+
+Switchover gracefully hands off the primary role to a replica. Writes are paused until the replica catches up (up to `timeout_secs`), then the proxy re-points automatically.
+
+```bash
+# Switchover to pg2 (replica must be within 1 MiB lag, 30 s timeout)
+curl -s -X POST http://localhost:8009/api/switchover \
+  -H "Content-Type: application/json" \
+  -d '{"target_node_id": "pg2"}' | jq .
+# → { "success": true, "message": "switchover to pg2 initiated" }
+
+# Optional: tighten the lag threshold or extend the timeout
+curl -s -X POST http://localhost:8009/api/switchover \
+  -H "Content-Type: application/json" \
+  -d '{"target_node_id": "pg2", "max_lag_bytes": 65536, "timeout_secs": 60}' | jq .
+
+# Watch the primary flip
+watch -n1 'curl -s http://localhost:8009/api/status | jq .primary_node_id'
+```
+
+> Returns `202 Accepted` immediately — switchover runs in the background. Poll `/api/status` to confirm completion.
+
+#### Manual failover (simulate a failure)
+
+Failover marks a node offline and triggers automatic promotion of the best replica.
+
+```bash
+# Mark pg1 offline — the monitor will promote the best replica
+curl -s -X POST http://localhost:8009/api/failover \
+  -H "Content-Type: application/json" \
+  -d '{"failed_node_id": "pg1"}' | jq .
+# → { "triggered": true, "message": "failover initiated for pg1" }
+
+# Confirm the new primary
+curl -s http://localhost:8009/api/status | jq .primary_node_id
+```
+
+#### Node management
+
+```bash
+# Add a new node to the topology
+curl -s -X POST http://localhost:8009/api/nodes/add \
+  -H "Content-Type: application/json" \
+  -d '{
+    "node_id":       "pg4",
+    "agent_addr":    "vk-agent-4:7001",
+    "postgres_addr": "pg-node-4:5432",
+    "priority":      70
+  }' | jq .
+
+# Remove a node
+curl -s -X DELETE http://localhost:8009/api/nodes/pg4 | jq .
+```
 
 ### Single binary
 

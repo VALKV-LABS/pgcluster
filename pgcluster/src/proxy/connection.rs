@@ -103,22 +103,25 @@ impl ProxyConnection {
                 }
             };
 
-        let auth_conn = match pool
-            .acquire(&database, &user, &primary_addr, &primary_node_id)
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                write_error_response(
-                    &mut client,
-                    "FATAL",
-                    "08006",
-                    &format!("could not connect to primary: {e}"),
-                )
-                .await?;
-                return Ok(());
-            }
-        };
+        // Always open a FRESH TCP connection for the startup+auth exchange.
+        // We bypass pool.acquire() here because pooled connections are already
+        // authenticated; sending a startup message to them would cause Postgres
+        // to log "invalid frontend message type 0" and close the connection.
+        let auth_conn = Arc::new(
+            match BackendConnection::connect(&primary_node_id, &primary_addr).await {
+                Ok(c) => c,
+                Err(e) => {
+                    write_error_response(
+                        &mut client,
+                        "FATAL",
+                        "08006",
+                        &format!("could not connect to primary: {e}"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            },
+        );
 
         // Forward startup and pipe the auth exchange.
         {
@@ -127,19 +130,13 @@ impl ProxyConnection {
                 .write_all(&startup_bytes)
                 .await
                 .context("forward startup")?;
-            auth_passthrough(&mut client, &mut *bstream).await?;
+            auth_passthrough(&mut client, &mut bstream).await?;
         }
 
         // ── 4. Message routing loop ───────────────────────────────────────
-        // We keep auth_conn as the "current" backend if it returned T (in-txn).
-        // In typical cases the backend returns ReadyForQuery 'I' after auth,
-        // meaning auth_conn is idle and we release it.
-
-        // The auth passthrough already sent ReadyForQuery to the client.
-        // We do NOT know the txn status from the pass-through yet since we
-        // piped bytes without parsing.  Treat as Idle (auth path → always Idle).
-        // Release auth backend immediately; we'll re-acquire per-statement.
-        pool.release(&database, &user, &primary_addr, &primary_node_id, auth_conn)
+        // Inject the now-authenticated connection into the pool so it can be
+        // reused for subsequent query routing in this session (and others).
+        pool.inject(&database, &user, &primary_addr, &primary_node_id, auth_conn)
             .await;
 
         let mut current: Option<(Arc<BackendConnection>, String, String)> = None;
@@ -362,14 +359,18 @@ async fn forward_and_pipe(
         .context("forward message to backend")?;
     backend.flush().await.context("flush to backend")?;
 
-    pipe_until_ready_for_query(client, &mut *backend).await
+    pipe_until_ready_for_query(client, &mut backend).await
 }
 
 /// Pipe backend response messages to `client` until a `ReadyForQuery` is seen.
+///
+/// Uses an accumulating buffer so a `ReadyForQuery` that spans two TCP reads
+/// is still detected rather than causing an infinite read loop.
 async fn pipe_until_ready_for_query(
     client: &mut MaybeTlsStream,
     backend: &mut TcpStream,
 ) -> Result<u8> {
+    let mut acc: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 65536];
 
     loop {
@@ -388,25 +389,35 @@ async fn pipe_until_ready_for_query(
             .context("forward response to client")?;
         client.flush().await.context("flush to client")?;
 
-        // Scan the received chunk for a ReadyForQuery ('Z').
-        let data = &buf[..n];
+        acc.extend_from_slice(&buf[..n]);
+
+        // Scan acc for ReadyForQuery, properly advancing past complete messages.
         let mut pos = 0usize;
-        while pos + 5 <= data.len() {
-            let msg_type = data[pos];
+        let mut last_complete = 0usize;
+
+        while pos + 5 <= acc.len() {
+            let msg_type = acc[pos];
             let length =
-                u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+                u32::from_be_bytes([acc[pos + 1], acc[pos + 2], acc[pos + 3], acc[pos + 4]])
                     as usize;
 
-            if msg_type == b'Z' && length == 5 && pos + 6 <= data.len() {
-                return Ok(data[pos + 5]);
+            if msg_type == b'Z' && length == 5 && pos + 6 <= acc.len() {
+                return Ok(acc[pos + 5]);
             }
 
-            // Advance past this message: 1 byte type + `length` bytes.
             let next = pos + 1 + length;
-            if next <= pos {
-                break; // Malformed data: prevent infinite loop.
+            if next <= pos || next > acc.len() {
+                // Malformed or incomplete message — wait for more data.
+                break;
             }
+            last_complete = next;
             pos = next;
+        }
+
+        // Discard fully-scanned bytes; keep only the unscanned tail so the
+        // next iteration continues where we left off.
+        if last_complete > 0 {
+            acc.drain(0..last_complete);
         }
     }
 }
@@ -415,12 +426,14 @@ async fn pipe_until_ready_for_query(
 ///
 /// Reads from `backend`, writes to `client`, then reads any response from
 /// `client` and writes it back to `backend` — until the backend sends a
-/// `ReadyForQuery`.
+/// `ReadyForQuery`.  Uses an accumulating buffer so `ReadyForQuery` is
+/// detected even when it spans two TCP reads.
 async fn auth_passthrough(client: &mut MaybeTlsStream, backend: &mut TcpStream) -> Result<()> {
+    let mut acc: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 8192];
 
     loop {
-        // Read from backend
+        // Read from backend.
         let n = backend.read(&mut buf).await.context("read backend auth")?;
         if n == 0 {
             bail!("backend closed during auth");
@@ -432,36 +445,42 @@ async fn auth_passthrough(client: &mut MaybeTlsStream, backend: &mut TcpStream) 
             .context("forward auth to client")?;
         client.flush().await.context("flush auth to client")?;
 
-        // Check if ReadyForQuery was received.
-        let data = &buf[..n];
-        let mut done = false;
+        acc.extend_from_slice(&buf[..n]);
+
+        // Scan for ReadyForQuery across the accumulated buffer.
         let mut pos = 0usize;
-        while pos + 5 <= data.len() {
-            let msg_type = data[pos];
+        let mut last_complete = 0usize;
+        let mut rfq_found = false;
+
+        while pos + 5 <= acc.len() {
+            let msg_type = acc[pos];
             let length =
-                u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+                u32::from_be_bytes([acc[pos + 1], acc[pos + 2], acc[pos + 3], acc[pos + 4]])
                     as usize;
 
-            if msg_type == b'Z' && length == 5 {
-                done = true;
+            if msg_type == b'Z' && length == 5 && pos + 6 <= acc.len() {
+                rfq_found = true;
                 break;
             }
 
             let next = pos + 1 + length;
-            if next <= pos {
+            if next <= pos || next > acc.len() {
                 break;
             }
+            last_complete = next;
             pos = next;
         }
 
-        if done {
+        if rfq_found {
             return Ok(());
         }
 
-        // Check if client needs to respond (e.g., password challenge).
-        // Use try_read so we don't block if there's nothing to send.
+        if last_complete > 0 {
+            acc.drain(0..last_complete);
+        }
+
+        // Check if the client needs to respond (e.g., MD5 password challenge).
         let mut client_buf = vec![0u8; 8192];
-        // We can't use try_read on MaybeTlsStream easily, so we use a timeout.
         let read_result = tokio::time::timeout(
             std::time::Duration::from_millis(10),
             client.read(&mut client_buf),

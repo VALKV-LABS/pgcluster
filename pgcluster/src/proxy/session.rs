@@ -229,8 +229,10 @@ mod tests {
 
     #[test]
     fn backend_pin_cleared_on_idle() {
-        let mut s = SessionState::default();
-        s.pinned_backend = Some("pg1".to_string());
+        let mut s = SessionState {
+            pinned_backend: Some("pg1".to_string()),
+            ..Default::default()
+        };
         s.update_from_ready_for_query(b'I');
         assert!(s.pinned_backend.is_none());
     }

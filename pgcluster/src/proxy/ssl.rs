@@ -96,7 +96,7 @@ pub async fn handle_ssl_owned(
 ) -> Result<MaybeTlsStream> {
     // Peek at the first 8 bytes without consuming them.
     let mut peek_buf = [0u8; 8];
-    let peeked = peek_stream(&mut stream, &mut peek_buf).await?;
+    let peeked = peek_stream(&stream, &mut peek_buf).await?;
 
     if peeked == 8 && peek_buf == SSL_REQUEST_BYTES {
         // Consume the SSL request packet (8 bytes).

@@ -22,6 +22,13 @@ impl PgCtl {
             .context("pg_ctl stop -m fast failed")
     }
 
+    /// pg_ctl stop -D data_dir -m immediate  (used for self-fencing: no checkpoint)
+    pub async fn stop_immediate(&self) -> Result<()> {
+        self.run_pg_ctl(&["stop", "-D", &self.data_dir, "-m", "immediate"])
+            .await
+            .context("pg_ctl stop -m immediate failed")
+    }
+
     /// pg_ctl reload -D data_dir
     pub async fn reload(&self) -> Result<()> {
         self.run_pg_ctl(&["reload", "-D", &self.data_dir])

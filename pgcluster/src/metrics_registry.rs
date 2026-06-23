@@ -1,4 +1,6 @@
-use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry, TextEncoder};
+use prometheus::{
+    Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry, TextEncoder,
+};
 use std::sync::Arc;
 
 pub struct Metrics {
@@ -134,9 +136,7 @@ mod tests {
     fn replication_lag_gauge_updates_per_node() {
         let m = Metrics::new().unwrap();
         m.replica_lag_bytes.with_label_values(&["pg2"]).set(1024.0);
-        m.replica_lag_bytes
-            .with_label_values(&["pg3"])
-            .set(512.0);
+        m.replica_lag_bytes.with_label_values(&["pg3"]).set(512.0);
 
         let text = m.render().unwrap();
         assert!(

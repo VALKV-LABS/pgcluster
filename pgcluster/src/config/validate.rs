@@ -40,7 +40,12 @@ fn validate_raft(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     // Peer addresses must be valid host:port (hostnames allowed for Docker/k8s)
     for peer in &cfg.raft.peers {
         parse_host_port(&peer.addr).map_err(|e| {
-            anyhow::anyhow!("[raft] peer {} has invalid addr {:?}: {}", peer.id, peer.addr, e)
+            anyhow::anyhow!(
+                "[raft] peer {} has invalid addr {:?}: {}",
+                peer.id,
+                peer.addr,
+                e
+            )
         })?;
     }
     Ok(())
@@ -76,7 +81,12 @@ fn validate_addresses(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     // Connect addresses accept hostnames (Docker service names, DNS, etc.)
     for node in &cfg.nodes.node {
         parse_host_port(&node.postgres_addr).map_err(|e| {
-            anyhow::anyhow!("node {:?} postgres_addr {:?}: {}", node.id, node.postgres_addr, e)
+            anyhow::anyhow!(
+                "node {:?} postgres_addr {:?}: {}",
+                node.id,
+                node.postgres_addr,
+                e
+            )
         })?;
         parse_host_port(&node.agent_addr).map_err(|e| {
             anyhow::anyhow!("node {:?} agent_addr {:?}: {}", node.id, node.agent_addr, e)
@@ -119,9 +129,18 @@ mod tests {
             raft: RaftConfig {
                 node_id: 1,
                 peers: vec![
-                    RaftPeer { id: 1, addr: "127.0.0.1:7000".into() },
-                    RaftPeer { id: 2, addr: "127.0.0.1:7001".into() },
-                    RaftPeer { id: 3, addr: "127.0.0.1:7002".into() },
+                    RaftPeer {
+                        id: 1,
+                        addr: "127.0.0.1:7000".into(),
+                    },
+                    RaftPeer {
+                        id: 2,
+                        addr: "127.0.0.1:7001".into(),
+                    },
+                    RaftPeer {
+                        id: 3,
+                        addr: "127.0.0.1:7002".into(),
+                    },
                 ],
                 heartbeat_interval_ms: 150,
                 election_timeout_ms: 500,
@@ -169,7 +188,10 @@ mod tests {
         cfg.raft.peers[0].addr = "pgcluster-1:7000".into();
         cfg.raft.peers[1].addr = "pgcluster-2:7000".into();
         cfg.raft.peers[2].addr = "pgcluster-3:7000".into();
-        assert!(validate(&cfg).is_ok(), "Docker hostnames should be valid connect addresses");
+        assert!(
+            validate(&cfg).is_ok(),
+            "Docker hostnames should be valid connect addresses"
+        );
     }
 
     #[test]

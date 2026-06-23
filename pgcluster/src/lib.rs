@@ -41,7 +41,6 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     if cfg.raft.bootstrap && !cfg.nodes.node.is_empty() {
         let seed_raft = raft_node.clone();
         let seed_nodes = cfg.nodes.node.clone();
-        let single_node = seed_nodes.len() == 1;
         tokio::spawn(async move {
             // Wait until this instance is the Raft leader (fast in single-node bootstrap).
             for _ in 0..50u32 {
@@ -63,10 +62,10 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                     tracing::warn!(node_id = node.id, err = %e, "bootstrap seed: AddNode failed");
                 }
             }
-            // Single-node cluster: set the only node as primary immediately.
-            if single_node {
+            // Set the highest-priority node as the initial primary.
+            if let Some(primary_node) = seed_nodes.iter().max_by_key(|n| n.priority) {
                 let cmd = raft::commands::TopologyCommand::SetPrimary {
-                    node_id: seed_nodes[0].id.clone(),
+                    node_id: primary_node.id.clone(),
                     at_lsn: 0,
                     new_timeline: 1,
                 };
@@ -99,13 +98,19 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
     let raft_grpc = raft::RaftGrpcServer::new(raft_node.raft.clone());
     let (raft_svc, topo_svc) = raft_grpc.into_services();
-    let raft_grpc_addr = cfg
+    let raft_peer_addr = cfg
         .raft
         .peers
         .iter()
         .find(|p| p.id == cfg.raft.node_id)
         .map(|p| p.addr.clone())
         .unwrap_or_else(|| "0.0.0.0:7000".into());
+    // Peer addrs use hostnames (e.g. "pgcluster-1:7000"); extract port to bind on all interfaces.
+    let raft_grpc_addr = raft_peer_addr
+        .rsplit(':')
+        .next()
+        .map(|port| format!("0.0.0.0:{port}"))
+        .unwrap_or_else(|| raft_peer_addr.clone());
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
@@ -151,9 +156,11 @@ pub async fn run_server(config_path: &str) -> Result<()> {
             let app = Router::new()
                 .route(
                     "/metrics",
-                    get(|State(m): State<Arc<metrics_registry::Metrics>>| async move {
-                        m.render().unwrap_or_else(|e| e.to_string())
-                    }),
+                    get(
+                        |State(m): State<Arc<metrics_registry::Metrics>>| async move {
+                            m.render().unwrap_or_else(|e| e.to_string())
+                        },
+                    ),
                 )
                 .with_state(metrics_clone);
             let addr: std::net::SocketAddr = match metrics_addr.parse() {
@@ -212,9 +219,19 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         let pool = pool.clone();
         let fcfg = cfg.failover.clone();
         let mon_metrics = metrics.clone();
+        let repl_user = cfg.replication.replication_user.clone();
+        let repl_password =
+            std::env::var(&cfg.replication.replication_password_env).unwrap_or_default();
         tasks.push(tokio::spawn(async move {
-            let mut monitor =
-                node_monitor::NodeMonitor::new(raft, topo, pool, fcfg, mon_metrics);
+            let mut monitor = node_monitor::NodeMonitor::new(
+                raft,
+                topo,
+                pool,
+                fcfg,
+                mon_metrics,
+                repl_user,
+                repl_password,
+            );
             monitor.run().await;
         }));
     }
