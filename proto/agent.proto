@@ -1,0 +1,108 @@
+syntax = "proto3";
+package pgcluster.agent;
+
+// AgentService is implemented by vk-agent running alongside each Postgres node.
+// The pgcluster Raft leader calls these RPCs to control and monitor Postgres.
+service AgentService {
+  // Promote this standby to primary (writes promote.signal)
+  rpc Promote(PromoteRequest) returns (PromoteResponse);
+  // Demote this node to a standby of a new primary (update auto.conf + restart)
+  rpc Demote(DemoteRequest) returns (DemoteResponse);
+  // Get current node status (role, LSNs, replication lag, connection count)
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+  // Heartbeat from pgcluster leader — keeps agent out of safe mode
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Gracefully stop Postgres (pg_ctl stop -m fast)
+  rpc StopPostgres(StopRequest) returns (StopResponse);
+  // Reload Postgres config (SIGHUP)
+  rpc ReloadConfig(ReloadRequest) returns (ReloadResponse);
+}
+
+// ── Promote ──────────────────────────────────────────────────────────────────
+
+message PromoteRequest {
+  // Sanity check: agent verifies its replay LSN is >= this before promoting.
+  // Pass 0 to skip the check.
+  uint64 expected_lsn = 1;
+}
+
+message PromoteResponse {
+  bool   success         = 1;
+  string error           = 2;
+  // LSN at which the new primary began (pg_current_wal_lsn() after promotion)
+  uint64 promoted_at_lsn = 3;
+  uint32 new_timeline    = 4;
+}
+
+// ── Demote ───────────────────────────────────────────────────────────────────
+
+message DemoteRequest {
+  // primary_conninfo value to write to postgresql.auto.conf
+  string new_primary_conninfo = 1;
+  // Replication slot name to use (primary_slot_name)
+  string slot_name            = 2;
+}
+
+message DemoteResponse {
+  bool   success = 1;
+  string error   = 2;
+}
+
+// ── GetStatus ────────────────────────────────────────────────────────────────
+
+message StatusRequest {}
+
+message StatusResponse {
+  bool   is_in_recovery     = 1;
+  uint64 received_lsn       = 2;   // pg_last_wal_receive_lsn (standby)
+  uint64 replayed_lsn       = 3;   // pg_last_wal_replay_lsn (standby)
+  uint64 sent_lsn           = 4;   // pg_current_wal_lsn (primary)
+  uint32 timeline           = 5;
+  string postgres_version   = 6;
+  uint32 active_connections = 7;
+  bool   postgres_running   = 8;
+  // Populated on primary: rows from pg_stat_replication
+  repeated ReplicaStatus replicas = 9;
+}
+
+message ReplicaStatus {
+  string application_name = 1;
+  uint64 flush_lsn        = 2;
+  uint64 replay_lsn       = 3;
+  // replay lag in microseconds (from EXTRACT(EPOCH FROM replay_lag) * 1e6)
+  int64  replay_lag_us    = 4;
+  string state            = 5;  // "streaming" | "catchup" | "backup" | "offline"
+}
+
+// ── Heartbeat ────────────────────────────────────────────────────────────────
+
+message HeartbeatRequest {
+  // Monotonically increasing sequence number from the pgcluster leader
+  uint64 seq = 1;
+}
+
+message HeartbeatResponse {
+  bool   in_safe_mode = 1;
+  uint64 seq          = 2;
+}
+
+// ── StopPostgres ─────────────────────────────────────────────────────────────
+
+message StopRequest {
+  // "fast" (default) | "immediate" | "smart"
+  string mode = 1;
+}
+
+message StopResponse {
+  bool   success = 1;
+  string error   = 2;
+}
+
+// ── ReloadConfig ─────────────────────────────────────────────────────────────
+
+message ReloadRequest {}
+
+message ReloadResponse {
+  bool   success = 1;
+  string error   = 2;
+}

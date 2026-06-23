@@ -1,0 +1,52 @@
+[package]
+name    = "vk-agent"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "vk-agent"
+path = "src/main.rs"
+
+[lib]
+name = "vk_agent"
+path = "src/lib.rs"
+
+[dependencies]
+# Workspace
+tokio.workspace      = true
+futures.workspace    = true
+tonic.workspace      = true
+prost.workspace      = true
+serde.workspace      = true
+serde_json.workspace = true
+toml.workspace       = true
+anyhow.workspace     = true
+thiserror.workspace  = true
+tracing.workspace    = true
+tracing-subscriber.workspace = true
+bytes.workspace      = true
+chrono.workspace     = true
+
+# TLS (gRPC server)
+rustls           = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1"
+tokio-rustls     = "0.26"
+rustls-pemfile   = "2"
+
+# Postgres
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Signal handling (Unix only)
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.27", features = ["signal", "process"] }
+
+[build-dependencies]
+tonic-build = "0.11"
+
+[dev-dependencies]
+tokio    = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+toml     = "0.8"

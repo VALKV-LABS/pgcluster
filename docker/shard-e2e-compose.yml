@@ -1,0 +1,172 @@
+# Multi-Shard E2E stack — used by `make shard-start` / `make shard-stop`
+#
+# Topology:
+#   1 coordinator pgcluster cluster (3 nodes, BM-7)
+#   shard-0: 1 pgcluster + 1 Postgres  (key range [0, 10000))
+#   shard-1: 1 pgcluster + 1 Postgres  (key range [10000, 20000))
+#
+# For E2E purposes each shard runs a single pgcluster + single Postgres.
+# Per-shard HA depth (3 nodes) is already validated by the e2e-compose.yml stack.
+# This stack focuses on coordinator routing, shard map, and connection-hint proxy.
+#
+# Port map (all exposed to host):
+#   coordinator proxy     → localhost:5400   (connection-hint entry point)
+#   coordinator API       → localhost:8400
+#   coordinator metrics   → localhost:9400
+#   shard-0 pgcluster     → localhost:5401
+#   shard-0 API           → localhost:8401
+#   shard-0 Postgres      → localhost:5481   (direct, bypass pgcluster)
+#   shard-1 pgcluster     → localhost:5402
+#   shard-1 API           → localhost:8402
+#   shard-1 Postgres      → localhost:5482   (direct, bypass pgcluster)
+#
+# Quick validation after `make shard-start`:
+#   curl http://localhost:8400/api/v1/shards | jq .
+#   curl "http://localhost:8400/api/v1/shards/resolve?key=5000" | jq .
+#   curl "http://localhost:8400/api/v1/shards/resolve?key=15000" | jq .
+#   psql postgres://postgres:test@localhost:5400/postgres
+#     SET pgcluster.shard_key = 5000;   -- routes to shard-0
+#     SELECT current_setting('server_version');
+
+services:
+
+  # ── Shard-0 Postgres ────────────────────────────────────────────────────────
+
+  pg-shard-0:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: postgres
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=5
+        -c max_replication_slots=5
+        -c listen_addresses='*'
+    ports:
+      - "5481:5432"
+    volumes:
+      - pg-shard-0-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  # ── Shard-1 Postgres ────────────────────────────────────────────────────────
+
+  pg-shard-1:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: postgres
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=5
+        -c max_replication_slots=5
+        -c listen_addresses='*'
+    ports:
+      - "5482:5432"
+    volumes:
+      - pg-shard-1-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  # ── vk-agent for shard-0 ────────────────────────────────────────────────────
+  # BM-7 (BM-2 prerequisite): uncomment once vk-agent binary is built
+
+  # vk-agent-shard-0:
+  #   build: { context: .., dockerfile: docker/vk-agent.Dockerfile }
+  #   depends_on: { pg-shard-0: { condition: service_healthy } }
+  #   environment:
+  #     AGENT_LISTEN: "0.0.0.0:7001"
+  #     PG_HOST: pg-shard-0
+  #     PG_USER: postgres
+  #     PG_PASSWORD: test
+  #     PGDATA: /var/lib/postgresql/data
+
+  # ── vk-agent for shard-1 ────────────────────────────────────────────────────
+
+  # vk-agent-shard-1:
+  #   build: { context: .., dockerfile: docker/vk-agent.Dockerfile }
+  #   depends_on: { pg-shard-1: { condition: service_healthy } }
+  #   environment:
+  #     AGENT_LISTEN: "0.0.0.0:7001"
+  #     PG_HOST: pg-shard-1
+  #     PG_USER: postgres
+  #     PG_PASSWORD: test
+  #     PGDATA: /var/lib/postgresql/data
+
+  # ── pgcluster for shard-0 ───────────────────────────────────────────────────
+  # BM-7 (BM-5 prerequisite): uncomment once pgcluster proxy + raft is built
+
+  # pgcluster-shard-0:
+  #   build: { context: .., dockerfile: docker/pgcluster.Dockerfile }
+  #   depends_on: [vk-agent-shard-0]
+  #   volumes:
+  #     - ./configs/shard-0.toml:/etc/pgcluster/pgcluster.toml:ro
+  #     - pgcluster-shard-0-data:/var/lib/pgcluster
+  #   ports:
+  #     - "5401:5432"
+  #     - "8401:8009"
+
+  # ── pgcluster for shard-1 ───────────────────────────────────────────────────
+
+  # pgcluster-shard-1:
+  #   build: { context: .., dockerfile: docker/pgcluster.Dockerfile }
+  #   depends_on: [vk-agent-shard-1]
+  #   volumes:
+  #     - ./configs/shard-1.toml:/etc/pgcluster/pgcluster.toml:ro
+  #     - pgcluster-shard-1-data:/var/lib/pgcluster
+  #   ports:
+  #     - "5402:5432"
+  #     - "8402:8009"
+
+  # ── Coordinator (3 nodes for HA of the coordinator itself) ──────────────────
+  # BM-7: uncomment once coordinator mode is implemented
+
+  # pgcluster-coord-1:
+  #   build: { context: .., dockerfile: docker/pgcluster.Dockerfile }
+  #   depends_on: [pgcluster-shard-0, pgcluster-shard-1]
+  #   volumes:
+  #     - ./configs/coordinator-1.toml:/etc/pgcluster/pgcluster.toml:ro
+  #     - pgcluster-coord-1-data:/var/lib/pgcluster
+  #   ports:
+  #     - "5400:5432"    # connection-hint proxy
+  #     - "8400:8009"    # coordinator REST API
+  #     - "9400:9190"    # Prometheus metrics
+
+  # pgcluster-coord-2:
+  #   build: { context: .., dockerfile: docker/pgcluster.Dockerfile }
+  #   depends_on: [pgcluster-coord-1]
+  #   volumes:
+  #     - ./configs/coordinator-2.toml:/etc/pgcluster/pgcluster.toml:ro
+  #     - pgcluster-coord-2-data:/var/lib/pgcluster
+  #   ports:
+  #     - "15400:5432"
+  #     - "18400:8009"
+
+  # pgcluster-coord-3:
+  #   build: { context: .., dockerfile: docker/pgcluster.Dockerfile }
+  #   depends_on: [pgcluster-coord-1]
+  #   volumes:
+  #     - ./configs/coordinator-3.toml:/etc/pgcluster/pgcluster.toml:ro
+  #     - pgcluster-coord-3-data:/var/lib/pgcluster
+  #   ports:
+  #     - "25400:5432"
+  #     - "28400:8009"
+
+volumes:
+  pg-shard-0-data:
+  pg-shard-1-data:
+  # pgcluster-shard-0-data:
+  # pgcluster-shard-1-data:
+  # pgcluster-coord-1-data:
+  # pgcluster-coord-2-data:
+  # pgcluster-coord-3-data:

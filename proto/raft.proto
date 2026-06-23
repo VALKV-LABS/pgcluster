@@ -1,0 +1,71 @@
+syntax = "proto3";
+package pgcluster.raft;
+
+// RaftService is the transport layer for the openraft consensus protocol.
+// Each pgcluster instance implements this service and calls peers via it.
+service RaftService {
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc RequestVote(VoteRequest)            returns (VoteResponse);
+  rpc InstallSnapshot(SnapshotRequest)    returns (SnapshotResponse);
+}
+
+// ── AppendEntries ─────────────────────────────────────────────────────────────
+// Carries log entries from leader to followers (and heartbeats when entries=[]).
+
+message AppendEntriesRequest {
+  // Serialized openraft AppendEntriesRequest<TypeConfig> as JSON
+  // We use JSON for simplicity; bincode would be faster for production.
+  bytes payload = 1;
+}
+
+message AppendEntriesResponse {
+  bytes payload = 1;
+}
+
+// ── RequestVote ───────────────────────────────────────────────────────────────
+// Sent by a candidate to gather votes during election.
+
+message VoteRequest {
+  bytes payload = 1;
+}
+
+message VoteResponse {
+  bytes payload = 1;
+}
+
+// ── InstallSnapshot ───────────────────────────────────────────────────────────
+// Sent by the leader to catch up a lagging follower.
+
+message SnapshotRequest {
+  bytes payload = 1;
+}
+
+message SnapshotResponse {
+  bytes payload = 1;
+}
+
+// ── Topology Proposal ─────────────────────────────────────────────────────────
+// Follower forwards a client write to the leader.
+
+service TopologyService {
+  rpc Propose(ProposeRequest) returns (ProposeResponse);
+  rpc GetLeader(GetLeaderRequest) returns (GetLeaderResponse);
+}
+
+message ProposeRequest {
+  // Serialized TopologyCommand as JSON
+  bytes command_json = 1;
+}
+
+message ProposeResponse {
+  bool   success = 1;
+  string error   = 2;
+}
+
+message GetLeaderRequest {}
+
+message GetLeaderResponse {
+  uint64 leader_id   = 1;
+  string leader_addr = 2;  // e.g. "10.0.0.1:7000"
+  bool   has_leader  = 3;
+}

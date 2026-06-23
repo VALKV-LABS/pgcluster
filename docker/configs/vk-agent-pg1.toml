@@ -1,0 +1,9 @@
+listen_addr               = "0.0.0.0:7001"
+data_dir                  = "/var/lib/postgresql/data"
+postgres_host             = "pg-primary"
+postgres_port             = 5432
+postgres_user             = "postgres"
+postgres_password         = "test"
+postgres_dbname           = "postgres"
+heartbeat_timeout_seconds = 10
+pg_ctl_path               = "pg_ctl"

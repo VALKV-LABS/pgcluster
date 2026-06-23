@@ -1,0 +1,137 @@
+name: Release
+
+# Triggered by version tags: v1.2.3
+# Requires two repository secrets:
+#   DOCKERHUB_USERNAME — Docker Hub username (valkvlabs)
+#   DOCKERHUB_TOKEN    — Docker Hub access token (create at hub.docker.com → Account Settings → Security)
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Gate: all CI checks must pass before pushing images ──────────────────────
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  # ── pgcluster image ───────────────────────────────────────────────────────────
+  docker-pgcluster:
+    name: Push pgcluster image
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (ARM emulation)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: valkvlabs/pgcluster
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push pgcluster
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/pgcluster.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=pgcluster
+          cache-to: type=gha,mode=max,scope=pgcluster
+
+  # ── vk-agent image ────────────────────────────────────────────────────────────
+  docker-vk-agent:
+    name: Push vk-agent image
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (ARM emulation)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: valkvlabs/vk-agent
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push vk-agent
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/vk-agent.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=vk-agent
+          cache-to: type=gha,mode=max,scope=vk-agent
+
+  # ── GitHub Release note ───────────────────────────────────────────────────────
+  github-release:
+    name: Create GitHub Release
+    needs: [docker-pgcluster, docker-vk-agent]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Docker images
+
+            ```
+            docker pull valkvlabs/pgcluster:${{ github.ref_name }}
+            docker pull valkvlabs/vk-agent:${{ github.ref_name }}
+            ```
+
+            See [AGENT_CONTEXT.md](AGENT_CONTEXT.md) for quick-start instructions.

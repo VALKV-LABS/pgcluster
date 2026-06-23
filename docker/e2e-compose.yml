@@ -1,0 +1,199 @@
+# E2E stack — used by `make start` / `make stop`
+#
+# Provides: full 3-node pgcluster cluster (3 Postgres + 3 vk-agents + 3 pgcluster nodes)
+# Purpose:  end-to-end user testing and validation of the full HA cluster
+#
+# Port map (all ports exposed to host):
+#   pgcluster-1 proxy  → localhost:5432   (primary proxy entry point)
+#   pgcluster-2 proxy  → localhost:15432
+#   pgcluster-3 proxy  → localhost:25432
+#   pgcluster-1 API    → localhost:8009
+#   pgcluster-2 API    → localhost:18009
+#   pgcluster-3 API    → localhost:28009
+#   pgcluster-1 metrics→ localhost:9190
+#   pgcluster-1 health → localhost:8008
+#   pg-primary direct  → localhost:5490   (bypass proxy for debugging)
+#   pg-replica-1 direct→ localhost:5491
+#   pg-replica-2 direct→ localhost:5492
+#
+# Quick start:
+#   make start
+#   psql postgres://postgres:test@localhost:5432/postgres -c "SELECT version();"
+#   curl http://localhost:8009/api/status | jq .
+#   curl http://localhost:9190/metrics | grep pgcluster_raft_is_leader
+
+services:
+
+  # ── Postgres nodes ──────────────────────────────────────────────────────────
+
+  pg-primary:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: postgres
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=10
+        -c max_replication_slots=10
+        -c hot_standby=on
+        -c listen_addresses='*'
+    ports:
+      - "5490:5432"
+    volumes:
+      - pg-primary-data:/var/lib/postgresql/data
+      - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  pg-replica-1:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: test
+      PGDATA: /var/lib/postgresql/data
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    ports:
+      - "5491:5432"
+    volumes:
+      - pg-replica-1-data:/var/lib/postgresql/data
+      - ./init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh:ro
+    entrypoint: ["/docker-entrypoint-initdb.d/init-replica.sh", "pg-primary"]
+
+  pg-replica-2:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: test
+      PGDATA: /var/lib/postgresql/data
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    ports:
+      - "5492:5432"
+    volumes:
+      - pg-replica-2-data:/var/lib/postgresql/data
+      - ./init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh:ro
+    entrypoint: ["/docker-entrypoint-initdb.d/init-replica.sh", "pg-primary"]
+
+  # ── vk-agent sidecars ───────────────────────────────────────────────────────
+
+  vk-agent-1:
+    build:
+      context: ..
+      dockerfile: docker/vk-agent.Dockerfile
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    ports:
+      - "7001:7001"
+    volumes:
+      - pg-primary-data:/var/lib/postgresql/data
+      - ./configs/vk-agent-pg1.toml:/etc/vk-agent/config.toml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "grpc_health_probe -addr=:7001 || exit 0"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  vk-agent-2:
+    build:
+      context: ..
+      dockerfile: docker/vk-agent.Dockerfile
+    depends_on:
+      pg-replica-1:
+        condition: service_started
+    ports:
+      - "17001:7001"
+    volumes:
+      - pg-replica-1-data:/var/lib/postgresql/data
+      - ./configs/vk-agent-pg2.toml:/etc/vk-agent/config.toml:ro
+
+  vk-agent-3:
+    build:
+      context: ..
+      dockerfile: docker/vk-agent.Dockerfile
+    depends_on:
+      pg-replica-2:
+        condition: service_started
+    ports:
+      - "27001:7001"
+    volumes:
+      - pg-replica-2-data:/var/lib/postgresql/data
+      - ./configs/vk-agent-pg3.toml:/etc/vk-agent/config.toml:ro
+
+  # ── pgcluster nodes ─────────────────────────────────────────────────────────
+
+  pgcluster-1:
+    build:
+      context: ..
+      dockerfile: docker/pgcluster.Dockerfile
+    depends_on:
+      vk-agent-1:
+        condition: service_started
+      vk-agent-2:
+        condition: service_started
+      vk-agent-3:
+        condition: service_started
+    volumes:
+      - ./configs/pgcluster-1.toml:/etc/pgcluster/config.toml:ro
+      - pgcluster-1-data:/var/lib/pgcluster
+    ports:
+      - "5432:5432"    # proxy
+      - "8009:8009"    # REST API
+      - "9190:9190"    # Prometheus metrics
+      - "8008:8008"    # health endpoint
+      - "7000:7000"    # Raft gRPC
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8008/health || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  pgcluster-2:
+    build:
+      context: ..
+      dockerfile: docker/pgcluster.Dockerfile
+    depends_on:
+      pgcluster-1:
+        condition: service_healthy
+    volumes:
+      - ./configs/pgcluster-2.toml:/etc/pgcluster/config.toml:ro
+      - pgcluster-2-data:/var/lib/pgcluster
+    ports:
+      - "15432:5432"
+      - "18009:8009"
+      - "19190:9190"
+      - "18008:8008"
+      - "17000:7000"
+
+  pgcluster-3:
+    build:
+      context: ..
+      dockerfile: docker/pgcluster.Dockerfile
+    depends_on:
+      pgcluster-1:
+        condition: service_healthy
+    volumes:
+      - ./configs/pgcluster-3.toml:/etc/pgcluster/config.toml:ro
+      - pgcluster-3-data:/var/lib/pgcluster
+    ports:
+      - "25432:5432"
+      - "28009:8009"
+      - "29190:9190"
+      - "28008:8008"
+      - "27000:7000"
+
+volumes:
+  pg-primary-data:
+  pg-replica-1-data:
+  pg-replica-2-data:
+  pgcluster-1-data:
+  pgcluster-2-data:
+  pgcluster-3-data:

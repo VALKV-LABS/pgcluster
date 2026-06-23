@@ -1,0 +1,92 @@
+# Integration test stack — used by `make integ-up` / `make test-integ`
+#
+# Services:
+#   postgres    — single Postgres primary with WAL enabled
+#   vk-agent    — single agent under test
+#   pgcluster   — single-node Raft leader (bootstrap) with REST API on :8009
+#   test-runner — runs `cargo test --workspace` inside Docker
+#
+# Usage:
+#   make integ-up      → build + run tests (services stay up after)
+#   make test-integ    → build + run tests + tear down
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB:       postgres
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=5
+        -c max_replication_slots=5
+        -c listen_addresses='*'
+    ports:
+      - "5490:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  vk-agent:
+    build:
+      context: ..
+      dockerfile: docker/vk-agent.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "7001:7001"
+    volumes:
+      - ./configs/vk-agent-integ.toml:/etc/vk-agent/config.toml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/7001' 2>/dev/null"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  pgcluster:
+    build:
+      context: ..
+      dockerfile: docker/pgcluster.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vk-agent:
+        condition: service_healthy
+    ports:
+      - "8009:8009"
+      - "9190:9190"
+    volumes:
+      - ./configs/pgcluster-integ.toml:/etc/pgcluster/config.toml:ro
+    environment:
+      PGPASSWORD: test
+      RUST_LOG: "info"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8009' 2>/dev/null"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  test-runner:
+    build:
+      context: ..
+      dockerfile: docker/test-runner.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vk-agent:
+        condition: service_healthy
+      pgcluster:
+        condition: service_healthy
+    environment:
+      PG_TEST_URL:         "postgres://postgres:test@postgres:5432/postgres"
+      AGENT_TEST_ADDR:     "vk-agent:7001"
+      PGCLUSTER_API_URL:   "http://pgcluster:8009"
+      PGCLUSTER_METRICS_URL: "http://pgcluster:9190"
+      RUST_LOG:            "info"
+    profiles:
+      - test

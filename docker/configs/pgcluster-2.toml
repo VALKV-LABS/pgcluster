@@ -1,0 +1,69 @@
+[cluster]
+name     = "pgcluster-e2e"
+data_dir = "/var/lib/pgcluster/node2"
+
+[raft]
+node_id   = 2
+bootstrap = false
+
+[[raft.peers]]
+id   = 1
+addr = "pgcluster-1:7000"
+
+[[raft.peers]]
+id   = 2
+addr = "pgcluster-2:7000"
+
+[[raft.peers]]
+id   = 3
+addr = "pgcluster-3:7000"
+
+[[nodes.node]]
+id            = "pg1"
+agent_addr    = "vk-agent-1:7001"
+postgres_addr = "pg-primary:5432"
+priority      = 100
+
+[[nodes.node]]
+id            = "pg2"
+agent_addr    = "vk-agent-2:7001"
+postgres_addr = "pg-replica-1:5432"
+priority      = 90
+
+[[nodes.node]]
+id            = "pg3"
+agent_addr    = "vk-agent-3:7001"
+postgres_addr = "pg-replica-2:5432"
+priority      = 80
+
+[replication]
+replication_user         = "replicator"
+replication_password_env = "PG_REPLICATION_PASSWORD"
+slot_prefix              = "pgcluster_"
+
+[proxy]
+listen_addr        = "0.0.0.0:5432"
+admin_listen_addr  = "0.0.0.0:5433"
+health_listen_addr = "0.0.0.0:8008"
+
+[proxy.pool]
+max_connections_per_db_user = 25
+idle_timeout_seconds        = 600
+
+[proxy.read_routing]
+enabled               = true
+max_replica_lag_bytes = 10485760
+
+[failover]
+health_check_interval_ms              = 500
+health_check_failures_before_failover = 3
+agent_heartbeat_timeout_seconds       = 10
+
+[tls]
+auto_generate = false
+
+[metrics]
+listen_addr = "0.0.0.0:9190"
+
+[api]
+listen_addr = "0.0.0.0:8009"

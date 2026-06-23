@@ -1,0 +1,79 @@
+[package]
+name    = "pgcluster"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "pgcluster"
+path = "src/main.rs"
+
+[lib]
+name = "pgcluster"
+path = "src/lib.rs"
+
+[dependencies]
+# Workspace
+tokio.workspace       = true
+futures.workspace     = true
+tonic.workspace       = true
+prost.workspace       = true
+prost-types.workspace = true
+serde.workspace       = true
+serde_json.workspace  = true
+toml.workspace        = true
+bincode.workspace     = true
+anyhow.workspace      = true
+thiserror.workspace   = true
+tracing.workspace     = true
+tracing-subscriber.workspace = true
+bytes.workspace       = true
+tokio-util.workspace  = true
+reqwest.workspace     = true
+uuid.workspace        = true
+chrono.workspace      = true
+hex.workspace         = true
+
+# Raft
+openraft    = { version = "0.9", features = ["serde"] }
+async-trait = "0.1"
+
+# Storage (Raft log)
+sled = "0.34"
+
+# TLS
+rustls              = { version = "0.23", features = ["ring"] }
+rustls-pki-types    = "1"
+rcgen               = { version = "0.13", features = ["pem"] }
+tokio-rustls        = "0.26"
+rustls-pemfile      = "2"
+
+# HTTP / REST API
+axum            = { version = "0.7", features = ["macros"] }
+tower           = "0.4"
+tower-http      = { version = "0.5", features = ["cors", "trace"] }
+http            = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Metrics
+prometheus = { version = "0.13", features = ["process"] }
+
+# SQL (for replication slot management on primary)
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "chrono"] }
+
+# Utils
+parking_lot = "0.12"
+dashmap     = "5"
+murmur3     = "0.5"
+
+[build-dependencies]
+tonic-build = "0.11"
+
+[dev-dependencies]
+tokio           = { version = "1", features = ["full", "test-util"] }
+reqwest         = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+tempfile        = "3"
+toml            = "0.8"
+tokio-postgres  = { version = "0.7", features = ["with-serde_json-1"] }
+serde_json      = "1"

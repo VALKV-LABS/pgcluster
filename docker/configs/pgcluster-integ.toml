@@ -1,0 +1,42 @@
+# Single-node pgcluster config used by the integ test stack.
+# Bootstrap = true so it immediately becomes leader with no peers needed.
+
+[cluster]
+name     = "integ"
+data_dir = "/tmp/pgcluster-integ"
+
+[raft]
+node_id   = 1
+bootstrap = true
+
+[[raft.peers]]
+id   = 1
+addr = "0.0.0.0:7000"
+
+[[nodes.node]]
+id            = "pg1"
+agent_addr    = "vk-agent:7001"
+postgres_addr = "postgres:5432"
+priority      = 100
+
+[replication]
+replication_user         = "postgres"
+replication_password_env = "PGPASSWORD"
+
+[proxy]
+listen_addr        = "0.0.0.0:5435"
+admin_listen_addr  = "0.0.0.0:5436"
+health_listen_addr = "0.0.0.0:8008"
+
+[failover]
+health_check_interval_ms              = 500
+health_check_failures_before_failover = 3
+agent_heartbeat_timeout_seconds       = 10
+
+[metrics]
+listen_addr = "0.0.0.0:9190"
+
+[api]
+listen_addr            = "0.0.0.0:8009"
+api_keys               = []
+public_read_endpoints  = true

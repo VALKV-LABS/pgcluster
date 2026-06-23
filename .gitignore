@@ -1,0 +1,30 @@
+# Build artifacts
+/target/
+**/target/
+
+# Cargo lock is committed for binaries; ignore nothing here by default
+# but exclude local override files
+.cargo/
+
+# Spec and planning docs (not part of the shipped codebase)
+spec.md
+BUILD*.md
+AGENT_CONTEXT.md
+
+# Sled database files (Raft log storage)
+*.sled/
+raft-log/
+
+# Config files with secrets
+*.local.toml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docker build cache
+.dockerignore
