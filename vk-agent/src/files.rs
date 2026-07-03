@@ -111,14 +111,18 @@ mod tests {
     #[tokio::test]
     async fn write_promote_signal_creates_file() {
         let dir = TempDir::new().unwrap();
-        write_signal_file(dir.path(), "promote.signal").await.unwrap();
+        write_signal_file(dir.path(), "promote.signal")
+            .await
+            .unwrap();
         assert!(dir.path().join("promote.signal").exists());
     }
 
     #[tokio::test]
     async fn update_auto_conf_writes_key_value() {
         let dir = TempDir::new().unwrap();
-        update_auto_conf(dir.path(), "primary_conninfo", "host=pg1").await.unwrap();
+        update_auto_conf(dir.path(), "primary_conninfo", "host=pg1")
+            .await
+            .unwrap();
         let content = read_conf(dir.path()).await;
         assert!(content.contains("primary_conninfo = 'host=pg1'"));
     }
@@ -126,8 +130,12 @@ mod tests {
     #[tokio::test]
     async fn update_auto_conf_overwrites_existing_key() {
         let dir = TempDir::new().unwrap();
-        update_auto_conf(dir.path(), "primary_conninfo", "host=old").await.unwrap();
-        update_auto_conf(dir.path(), "primary_conninfo", "host=new").await.unwrap();
+        update_auto_conf(dir.path(), "primary_conninfo", "host=old")
+            .await
+            .unwrap();
+        update_auto_conf(dir.path(), "primary_conninfo", "host=new")
+            .await
+            .unwrap();
         let content = read_conf(dir.path()).await;
         assert!(content.contains("primary_conninfo = 'host=new'"));
         assert!(!content.contains("host=old"), "old value must be replaced");

@@ -58,8 +58,18 @@ mod tests {
     #[test]
     fn node_table_formats_correctly() {
         let rows = vec![
-            vec!["pg1".into(), "primary".into(), "127.0.0.1:5432".into(), "0".into()],
-            vec!["pg2".into(), "replica".into(), "127.0.0.1:5433".into(), "1024".into()],
+            vec![
+                "pg1".into(),
+                "primary".into(),
+                "127.0.0.1:5432".into(),
+                "0".into(),
+            ],
+            vec![
+                "pg2".into(),
+                "replica".into(),
+                "127.0.0.1:5433".into(),
+                "1024".into(),
+            ],
         ];
         // No panic = pass
         output::print_table(&["NODE_ID", "ROLE", "POSTGRES_ADDR", "LAG_BYTES"], &rows);
@@ -73,6 +83,9 @@ mod tests {
             json: false,
         };
         let result = super::run(args).await;
-        assert!(result.is_err(), "should return Err when server is unreachable");
+        assert!(
+            result.is_err(),
+            "should return Err when server is unreachable"
+        );
     }
 }

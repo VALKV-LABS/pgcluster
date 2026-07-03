@@ -1,4 +1,3 @@
-use pgcluster::raft::commands::TopologyCommand;
 /// Unit-level integration tests for ClusterTopology logic.
 /// No Docker required.
 use pgcluster::raft::topology::{ClusterTopology, NodeConfig, NodeRole};
@@ -54,8 +53,10 @@ fn best_failover_candidate_priority_breaks_tie() {
 
 #[test]
 fn replica_addrs_within_lag_excludes_lagged() {
-    let mut t = ClusterTopology::default();
-    t.primary_node_id = "pg1".into();
+    let mut t = ClusterTopology {
+        primary_node_id: "pg1".into(),
+        ..Default::default()
+    };
     t.node_configs.insert("pg1".into(), make_node("pg1", 100));
     t.node_configs.insert("pg2".into(), make_node("pg2", 90));
     t.node_configs.insert("pg3".into(), make_node("pg3", 80));

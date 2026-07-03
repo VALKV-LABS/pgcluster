@@ -31,6 +31,8 @@ pub async fn trigger_failover(
     failed_primary: &str,
     pool: &Arc<AgentClientPool>,
     metrics: &Arc<Metrics>,
+    repl_user: &str,
+    repl_password: &str,
 ) {
     let started = Instant::now();
     info!(failed_primary, "starting automatic failover");
@@ -108,11 +110,19 @@ pub async fn trigger_failover(
         .await;
 
     // ── 5. Repoint remaining replicas ────────────────────────────────────────
+    // Include Replica AND Unknown nodes: a node may be Unknown right after
+    // bootstrap or after a Docker restart cycle. If the agent is reachable,
+    // demote will succeed; if not, repoint_replicas logs a warning and moves on.
     let replicas: Vec<(String, String)> = topology
         .node_configs
         .iter()
         .filter(|(id, _)| *id != failed_primary && **id != candidate)
-        .filter(|(id, _)| topology.node_roles.get(*id) == Some(&NodeRole::Replica))
+        .filter(|(id, _)| {
+            matches!(
+                topology.node_roles.get(*id),
+                Some(&NodeRole::Replica) | Some(&NodeRole::Unknown) | None
+            )
+        })
         .map(|(id, cfg)| (id.clone(), cfg.agent_addr.clone()))
         .collect();
 
@@ -122,7 +132,10 @@ pub async fn trigger_failover(
             .split(':')
             .next()
             .unwrap_or(&candidate_cfg.postgres_addr);
-        let conninfo = format!("host={} port=5432 user=replicator", new_host);
+        let conninfo = format!(
+            "host={} port=5432 user={} password={}",
+            new_host, repl_user, repl_password
+        );
         let errs = repoint::repoint_replicas(&replicas, &conninfo, "pgcluster_", pool).await;
         for (id, e) in errs {
             warn!(node_id = id, err = %e, "failed to repoint replica after failover");
@@ -132,7 +145,9 @@ pub async fn trigger_failover(
     let elapsed = started.elapsed();
     metrics.failover_total.inc();
     metrics.primary_changes_total.inc();
-    metrics.failover_duration_seconds.observe(elapsed.as_secs_f64());
+    metrics
+        .failover_duration_seconds
+        .observe(elapsed.as_secs_f64());
 
     info!(
         old_primary  = failed_primary,

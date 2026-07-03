@@ -27,6 +27,7 @@ fn postgres_url_tcp() {
         postgres_password: None,
         postgres_dbname: "postgres".into(),
         heartbeat_timeout_seconds: 10,
+        fence_timeout_seconds: None,
         tls: Default::default(),
         pg_ctl_path: "pg_ctl".into(),
     };
@@ -47,6 +48,7 @@ fn postgres_url_with_password() {
         postgres_password: Some("s3cr3t".into()),
         postgres_dbname: "postgres".into(),
         heartbeat_timeout_seconds: 10,
+        fence_timeout_seconds: None,
         tls: Default::default(),
         pg_ctl_path: "pg_ctl".into(),
     };
@@ -90,7 +92,9 @@ async fn get_status_returns_reasonable_values() {
         eprintln!("skipping: PG_TEST_URL not set");
         return;
     };
-    let pg = vk_agent::postgres::LocalPostgres::connect(&url).await.unwrap();
+    let pg = vk_agent::postgres::LocalPostgres::connect(&url)
+        .await
+        .unwrap();
     let version = pg.get_postgres_version().await.unwrap();
     assert!(
         version.starts_with("PostgreSQL"),

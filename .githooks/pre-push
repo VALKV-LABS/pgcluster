@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Pre-push hook: enforce cargo fmt and clippy before any push.
+# Install once with: make setup-hooks  (sets core.hooksPath = .githooks)
+set -eo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# When running in Git Bash on Windows, cargo lives in WSL.
+# Detect: Git Bash paths look like /c/Users/... (single-letter drive prefix).
+run_in_wsl() {
+    local wsl_root="$REPO_ROOT"
+    if [[ "$REPO_ROOT" =~ ^/([a-zA-Z])(/.*)?$ ]]; then
+        local drive="${BASH_REMATCH[1],,}"
+        wsl_root="/mnt/${drive}${BASH_REMATCH[2]}"
+    fi
+    wsl bash -lc "cd '$wsl_root' && $1"
+}
+
+if command -v cargo &>/dev/null; then
+    cd "$REPO_ROOT"
+    CARGO=cargo
+    run() { $CARGO "$@"; }
+elif command -v wsl &>/dev/null; then
+    run() { run_in_wsl "cargo $*"; }
+else
+    echo "WARNING: cargo not found and wsl unavailable — skipping pre-push checks."
+    echo "Install Rust (https://rustup.rs) or use WSL."
+    exit 0
+fi
+
+echo "pre-push: cargo fmt --check"
+if ! run fmt --all -- --check; then
+    echo ""
+    echo "  FAIL: formatting issues detected. Fix with: make fmt"
+    exit 1
+fi
+
+echo "pre-push: cargo clippy"
+if ! run clippy --workspace --all-targets -- -D warnings; then
+    echo ""
+    echo "  FAIL: clippy errors detected. Fix with: make check"
+    exit 1
+fi
+
+echo "pre-push: all checks passed."

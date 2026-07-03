@@ -35,16 +35,26 @@ else
     export PGPASSFILE
   fi
 
-  pg_basebackup \
-    --host="${PRIMARY_HOST}" \
-    --port="${PRIMARY_PORT}" \
-    --username="${PGUSER}" \
-    --pgdata="${PGDATA}" \
-    --wal-method=stream \
-    --checkpoint=fast \
-    --no-password \
-    --progress \
-    --verbose
+  # Retry pg_basebackup up to 5 times: two replicas starting simultaneously can
+  # race and hit "WAL segment already removed" if the other replica's stream
+  # causes a checkpoint between slot creation and WAL streaming.
+  for attempt in 1 2 3 4 5; do
+    if pg_basebackup \
+        --host="${PRIMARY_HOST}" \
+        --port="${PRIMARY_PORT}" \
+        --username="${PGUSER}" \
+        --pgdata="${PGDATA}" \
+        --wal-method=stream \
+        --checkpoint=fast \
+        --no-password \
+        --progress \
+        --verbose; then
+      break
+    fi
+    echo "[init-replica] pg_basebackup failed (attempt ${attempt}/5), retrying in 3s ..."
+    rm -rf "${PGDATA:?}"/*
+    sleep 3
+  done
 
   # Write standby.signal so Postgres starts as a hot standby
   touch "${PGDATA}/standby.signal"
@@ -53,12 +63,29 @@ else
   cat >> "${PGDATA}/postgresql.auto.conf" <<EOF
 
 # Added by init-replica.sh
-primary_conninfo = 'host=${PRIMARY_HOST} port=${PRIMARY_PORT} user=${PGUSER}'
+primary_conninfo = 'host=${PRIMARY_HOST} port=${PRIMARY_PORT} user=${PGUSER} password=${POSTGRES_PASSWORD}'
 hot_standby = on
 EOF
 
   echo "[init-replica] pg_basebackup complete. Standby mode configured."
 fi
 
+# Ensure data dir is owned by the postgres user with correct permissions.
+chown -R postgres:postgres "${PGDATA}"
+chmod 700 "${PGDATA}"
+
 echo "[init-replica] Starting Postgres in standby mode ..."
-exec postgres -D "${PGDATA}" "$@"
+# Do NOT pass "$@" — script args are <primary-host> [port], not postgres flags.
+# Use the same hba_file as pg-primary so that after promotion replication is allowed from all nodes.
+HBA_FILE="/etc/postgresql/pg_hba.conf"
+if [ -f "${HBA_FILE}" ]; then
+  exec gosu postgres postgres -D "${PGDATA}" \
+    -c hba_file="${HBA_FILE}" \
+    -c wal_level=replica \
+    -c max_wal_senders=10 \
+    -c max_replication_slots=10 \
+    -c hot_standby=on \
+    -c listen_addresses='*'
+else
+  exec gosu postgres postgres -D "${PGDATA}"
+fi

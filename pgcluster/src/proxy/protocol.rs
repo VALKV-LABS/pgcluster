@@ -157,13 +157,13 @@ pub async fn read_startup_message(
     match code {
         SSL_REQUEST_CODE => {
             // The entire message is exactly 8 bytes (\x00\x00\x00\x08 + code)
-            return Ok(FrontendMessage::SslRequest);
+            Ok(FrontendMessage::SslRequest)
         }
 
         CANCEL_REQUEST_CODE => {
             let pid = stream.read_u32().await.context("read cancel pid")?;
             let secret = stream.read_u32().await.context("read cancel secret")?;
-            return Ok(FrontendMessage::CancelRequest { pid, secret });
+            Ok(FrontendMessage::CancelRequest { pid, secret })
         }
 
         PROTOCOL_V3 => {

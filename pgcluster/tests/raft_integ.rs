@@ -1,12 +1,10 @@
 /// Raft layer integration tests.
 /// Tests that don't need Docker run directly; Docker-requiring tests are #[ignore].
-use pgcluster::raft::commands::TopologyCommand;
 use pgcluster::raft::state_machine::TopologyStateMachine;
-use pgcluster::raft::topology::{ClusterTopology, NodeRole};
 
 #[test]
 fn state_machine_apply_set_primary() {
-    let (mut sm, _rx) = TopologyStateMachine::new();
+    let (sm, _rx) = TopologyStateMachine::new();
     let t = sm.current_topology();
     assert!(t.primary_node_id.is_empty());
 }
@@ -88,7 +86,11 @@ async fn topology_replicates_to_all_followers() {
             primary_ids.insert(id.to_string());
         }
     }
-    assert_eq!(primary_ids.len(), 1, "all nodes should agree on the primary");
+    assert_eq!(
+        primary_ids.len(),
+        1,
+        "all nodes should agree on the primary"
+    );
 }
 
 #[tokio::test]

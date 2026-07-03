@@ -45,36 +45,33 @@ impl AgentServiceImpl {
 
 #[tonic::async_trait]
 impl AgentService for AgentServiceImpl {
-    /// Promote this standby to primary by writing `promote.signal`
-    /// and removing `standby.signal`.
+    /// Promote this standby to primary via `SELECT pg_promote()`.
+    ///
+    /// Using the SQL function is more reliable than writing `promote.signal`
+    /// because it works over an existing authenticated connection and does not
+    /// require the agent to have write access to PGDATA.
     async fn promote(
         &self,
         _request: Request<PromoteRequest>,
     ) -> Result<Response<PromoteResponse>, Status> {
-        if self.heartbeat.is_safe_mode() {
-            return Err(Status::failed_precondition("safe mode: heartbeat lost"));
-        }
-
-        let data_dir = Path::new(&self.config.data_dir);
-
-        if let Err(e) = write_signal_file(data_dir, "promote.signal").await {
-            return Ok(Response::new(PromoteResponse {
+        // pg_promote(wait, wait_seconds) — wait up to 30 s for promotion to complete.
+        match sqlx::query("SELECT pg_promote(true, 30)")
+            .execute(self.pg.pool())
+            .await
+        {
+            Ok(_) => Ok(Response::new(PromoteResponse {
+                success: true,
+                error: String::new(),
+                promoted_at_lsn: 0,
+                new_timeline: 0,
+            })),
+            Err(e) => Ok(Response::new(PromoteResponse {
                 success: false,
                 error: e.to_string(),
                 promoted_at_lsn: 0,
                 new_timeline: 0,
-            }));
+            })),
         }
-
-        // Remove standby.signal if present; ignore errors (may not exist).
-        let _ = tokio::fs::remove_file(data_dir.join("standby.signal")).await;
-
-        Ok(Response::new(PromoteResponse {
-            success: true,
-            error: String::new(),
-            promoted_at_lsn: 0,
-            new_timeline: 0,
-        }))
     }
 
     /// Demote this node to a standby by writing `standby.signal`,

@@ -82,18 +82,36 @@ mod tests {
         t.node_roles.insert("pg3".into(), NodeRole::Replica);
         t.last_flush_lsns.insert("pg2".into(), 100);
         t.last_flush_lsns.insert("pg3".into(), 100); // tied
-        t.node_configs.insert("pg1".into(), NodeConfig {
-            node_id: "pg1".into(), agent_addr: "x".into(), postgres_addr: "y".into(),
-            priority: 100, tags: Default::default(),
-        });
-        t.node_configs.insert("pg2".into(), NodeConfig {
-            node_id: "pg2".into(), agent_addr: "x".into(), postgres_addr: "y".into(),
-            priority: 80, tags: Default::default(),
-        });
-        t.node_configs.insert("pg3".into(), NodeConfig {
-            node_id: "pg3".into(), agent_addr: "x".into(), postgres_addr: "y".into(),
-            priority: 120, tags: Default::default(), // higher priority wins tie
-        });
+        t.node_configs.insert(
+            "pg1".into(),
+            NodeConfig {
+                node_id: "pg1".into(),
+                agent_addr: "x".into(),
+                postgres_addr: "y".into(),
+                priority: 100,
+                tags: Default::default(),
+            },
+        );
+        t.node_configs.insert(
+            "pg2".into(),
+            NodeConfig {
+                node_id: "pg2".into(),
+                agent_addr: "x".into(),
+                postgres_addr: "y".into(),
+                priority: 80,
+                tags: Default::default(),
+            },
+        );
+        t.node_configs.insert(
+            "pg3".into(),
+            NodeConfig {
+                node_id: "pg3".into(),
+                agent_addr: "x".into(),
+                postgres_addr: "y".into(),
+                priority: 120,
+                tags: Default::default(), // higher priority wins tie
+            },
+        );
         assert_eq!(pick_candidate(&t, "pg1").as_deref(), Some("pg3"));
     }
 

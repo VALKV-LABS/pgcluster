@@ -226,9 +226,7 @@ impl RaftService for RaftGrpcServer {
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
         let bytes =
             serde_json::to_vec(&resp).map_err(|e| tonic::Status::internal(e.to_string()))?;
-        Ok(tonic::Response::new(ProtoAEResp {
-            payload: bytes.into(),
-        }))
+        Ok(tonic::Response::new(ProtoAEResp { payload: bytes }))
     }
 
     async fn request_vote(
@@ -245,9 +243,7 @@ impl RaftService for RaftGrpcServer {
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
         let bytes =
             serde_json::to_vec(&resp).map_err(|e| tonic::Status::internal(e.to_string()))?;
-        Ok(tonic::Response::new(ProtoVoteResp {
-            payload: bytes.into(),
-        }))
+        Ok(tonic::Response::new(ProtoVoteResp { payload: bytes }))
     }
 
     async fn install_snapshot(
@@ -265,9 +261,7 @@ impl RaftService for RaftGrpcServer {
             .map_err(|e| tonic::Status::internal(e.to_string()))?;
         let bytes =
             serde_json::to_vec(&resp).map_err(|e| tonic::Status::internal(e.to_string()))?;
-        Ok(tonic::Response::new(ProtoSnapResp {
-            payload: bytes.into(),
-        }))
+        Ok(tonic::Response::new(ProtoSnapResp { payload: bytes }))
     }
 }
 

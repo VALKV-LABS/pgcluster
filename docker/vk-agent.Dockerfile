@@ -24,9 +24,9 @@ RUN cargo build --release --bin vk-agent
 # Stage 2: runtime
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates postgresql-client && rm -rf /var/lib/apt/lists/*
+    ca-certificates postgresql && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/vk-agent /usr/local/bin/vk-agent
-RUN useradd -r -s /bin/false postgres 2>/dev/null || true
+RUN groupmod -g 999 postgres && usermod -u 999 -g 999 postgres
 USER postgres
 EXPOSE 7001
 ENTRYPOINT ["/usr/local/bin/vk-agent"]

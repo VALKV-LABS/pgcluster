@@ -21,6 +21,19 @@
 #   psql postgres://postgres:test@localhost:5432/postgres -c "SELECT version();"
 #   curl http://localhost:8009/api/status | jq .
 #   curl http://localhost:9190/metrics | grep pgcluster_raft_is_leader
+#   psql postgres://postgres:test@localhost:5490/postgres
+#   psql postgres://postgres:test@localhost:5491/postgres
+
+# Create a DB and table
+# CREATE DATABASE myapp;
+# CREATE TABLE users (id serial PRIMARY KEY, name text);
+# INSERT INTO users (name) VALUES ('alice'), ('bob');
+#SELECT * FROM users;
+# Then verify replication by reading directly from each replica (bypassing the proxy):
+# Read from replica-1 directly
+#psql postgres://postgres:test@localhost:5491/myapp -c "SELECT * FROM users;"
+# Read from replica-2 directly
+# psql postgres://postgres:test@localhost:5492/myapp -c "SELECT * FROM users;"
 
 services:
 
@@ -28,6 +41,8 @@ services:
 
   pg-primary:
     image: postgres:16
+    init: true
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: test
@@ -39,6 +54,7 @@ services:
         -c max_replication_slots=10
         -c hot_standby=on
         -c listen_addresses='*'
+        -c hba_file=/etc/postgresql/pg_hba.conf
     ports:
       - "5490:5432"
     volumes:
@@ -52,6 +68,8 @@ services:
 
   pg-replica-1:
     image: postgres:16
+    init: true
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: test
@@ -64,10 +82,13 @@ services:
     volumes:
       - pg-replica-1-data:/var/lib/postgresql/data
       - ./init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh:ro
+      - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
     entrypoint: ["/docker-entrypoint-initdb.d/init-replica.sh", "pg-primary"]
 
   pg-replica-2:
     image: postgres:16
+    init: true
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: test
@@ -80,6 +101,7 @@ services:
     volumes:
       - pg-replica-2-data:/var/lib/postgresql/data
       - ./init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh:ro
+      - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
     entrypoint: ["/docker-entrypoint-initdb.d/init-replica.sh", "pg-primary"]
 
   # ── vk-agent sidecars ───────────────────────────────────────────────────────
@@ -88,6 +110,8 @@ services:
     build:
       context: ..
       dockerfile: docker/vk-agent.Dockerfile
+    pid: "service:pg-primary"
+    restart: unless-stopped
     depends_on:
       pg-primary:
         condition: service_healthy
@@ -106,6 +130,8 @@ services:
     build:
       context: ..
       dockerfile: docker/vk-agent.Dockerfile
+    pid: "service:pg-replica-1"
+    restart: unless-stopped
     depends_on:
       pg-replica-1:
         condition: service_started
@@ -119,6 +145,8 @@ services:
     build:
       context: ..
       dockerfile: docker/vk-agent.Dockerfile
+    pid: "service:pg-replica-2"
+    restart: unless-stopped
     depends_on:
       pg-replica-2:
         condition: service_started
@@ -134,6 +162,8 @@ services:
     build:
       context: ..
       dockerfile: docker/pgcluster.Dockerfile
+    environment:
+      POSTGRES_PASSWORD: test
     depends_on:
       vk-agent-1:
         condition: service_started
@@ -160,9 +190,11 @@ services:
     build:
       context: ..
       dockerfile: docker/pgcluster.Dockerfile
+    environment:
+      POSTGRES_PASSWORD: test
     depends_on:
       pgcluster-1:
-        condition: service_healthy
+        condition: service_started
     volumes:
       - ./configs/pgcluster-2.toml:/etc/pgcluster/config.toml:ro
       - pgcluster-2-data:/var/lib/pgcluster
@@ -172,14 +204,21 @@ services:
       - "19190:9190"
       - "18008:8008"
       - "17000:7000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8008/health || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
 
   pgcluster-3:
     build:
       context: ..
       dockerfile: docker/pgcluster.Dockerfile
+    environment:
+      POSTGRES_PASSWORD: test
     depends_on:
       pgcluster-1:
-        condition: service_healthy
+        condition: service_started
     volumes:
       - ./configs/pgcluster-3.toml:/etc/pgcluster/config.toml:ro
       - pgcluster-3-data:/var/lib/pgcluster
@@ -189,6 +228,11 @@ services:
       - "29190:9190"
       - "28008:8008"
       - "27000:7000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8008/health || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
 
 volumes:
   pg-primary-data:

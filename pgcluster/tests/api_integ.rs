@@ -88,7 +88,10 @@ async fn health_body_has_status_field() {
         .json()
         .await
         .expect("parse JSON");
-    assert!(body.get("status").is_some(), "body missing 'status': {body}");
+    assert!(
+        body.get("status").is_some(),
+        "body missing 'status': {body}"
+    );
 }
 
 #[tokio::test]
@@ -117,7 +120,10 @@ async fn status_topology_version_is_numeric() {
         .json()
         .await
         .expect("parse JSON");
-    assert!(body["topology_version"].is_number(), "topology_version not a number: {body}");
+    assert!(
+        body["topology_version"].is_number(),
+        "topology_version not a number: {body}"
+    );
 }
 
 #[tokio::test]
@@ -130,7 +136,10 @@ async fn topology_endpoint_returns_json_object() {
         .expect("GET /api/topology");
     assert_eq!(resp.status().as_u16(), 200);
     let body: serde_json::Value = resp.json().await.expect("parse JSON");
-    assert!(body.is_object(), "expected object from /api/topology: {body}");
+    assert!(
+        body.is_object(),
+        "expected object from /api/topology: {body}"
+    );
 }
 
 #[tokio::test]
@@ -173,7 +182,11 @@ async fn get_node_pg1_returns_200() {
         .expect("GET /api/nodes/pg1");
     assert_eq!(resp.status().as_u16(), 200);
     let body: serde_json::Value = resp.json().await.expect("parse JSON");
-    assert_eq!(body["node_id"].as_str(), Some("pg1"), "wrong node_id: {body}");
+    assert_eq!(
+        body["node_id"].as_str(),
+        Some("pg1"),
+        "wrong node_id: {body}"
+    );
 }
 
 #[tokio::test]
@@ -272,11 +285,23 @@ async fn post_switchover_executes_and_changes_primary() {
         return;
     };
     let c = reqwest::Client::new();
-    let before: serde_json::Value =
-        c.get(format!("{base}/api/status")).send().await.unwrap().json().await.unwrap();
+    let before: serde_json::Value = c
+        .get(format!("{base}/api/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let original_primary = before["primary_node_id"].as_str().unwrap().to_string();
-    let nodes: serde_json::Value =
-        c.get(format!("{base}/api/nodes")).send().await.unwrap().json().await.unwrap();
+    let nodes: serde_json::Value = c
+        .get(format!("{base}/api/nodes"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let target = nodes["nodes"]
         .as_array()
         .unwrap()
@@ -314,9 +339,18 @@ async fn get_metrics_returns_prometheus_format() {
         .expect("connect to metrics endpoint");
     assert!(resp.status().is_success());
     let body = resp.text().await.unwrap();
-    assert!(body.contains("pgcluster_failovers_total"), "missing metric: {body:.200}");
-    assert!(body.contains("pgcluster_raft_is_leader"), "missing metric: {body:.200}");
-    assert!(body.contains("pgcluster_replica_lag_bytes"), "missing metric: {body:.200}");
+    assert!(
+        body.contains("pgcluster_failovers_total"),
+        "missing metric: {body:.200}"
+    );
+    assert!(
+        body.contains("pgcluster_raft_is_leader"),
+        "missing metric: {body:.200}"
+    );
+    assert!(
+        body.contains("pgcluster_replica_lag_bytes"),
+        "missing metric: {body:.200}"
+    );
 }
 
 #[tokio::test]

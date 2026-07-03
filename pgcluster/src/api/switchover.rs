@@ -48,6 +48,11 @@ pub async fn trigger_switchover(
         );
     }
 
+    // Resolve replication credentials from config.
+    let repl_user = s.config.replication.replication_user.clone();
+    let repl_password =
+        std::env::var(&s.config.replication.replication_password_env).unwrap_or_default();
+
     // Spawn switchover in background — REST returns immediately
     let raft = s.raft.clone();
     let topology_rx = s.topology.clone();
@@ -55,14 +60,16 @@ pub async fn trigger_switchover(
     let pool = std::sync::Arc::new(crate::agent_clients::AgentClientPool::new());
     let target = req.target_node_id.clone();
     tokio::spawn(async move {
-        match crate::switchover::planned_switchover(
+        match crate::switchover::planned_switchover(crate::switchover::SwitchoverParams {
             raft,
             topology_rx,
-            &target,
+            new_primary_id: target.clone(),
             pool,
-            req.max_lag_bytes,
-            req.timeout_secs,
-        )
+            max_lag_bytes: req.max_lag_bytes,
+            sync_timeout_secs: req.timeout_secs,
+            replication_user: repl_user,
+            replication_password: repl_password,
+        })
         .await
         {
             Ok(()) => {
@@ -91,8 +98,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn topology_with_primary(primary: &str, replicas: &[&str]) -> ClusterTopology {
-        let mut t = ClusterTopology::default();
-        t.primary_node_id = primary.into();
+        let mut t = ClusterTopology {
+            primary_node_id: primary.into(),
+            ..Default::default()
+        };
         t.node_roles.insert(primary.into(), NodeRole::Primary);
         t.node_configs.insert(
             primary.into(),

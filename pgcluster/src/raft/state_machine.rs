@@ -93,7 +93,7 @@ impl TopologyStateMachine {
         ),
         StorageError<NodeId>,
     > {
-        let last = self.last_log.lock().unwrap().clone();
+        let last = *self.last_log.lock().unwrap();
         let mem = self.membership.lock().unwrap().clone();
         Ok((last, mem))
     }
@@ -113,7 +113,7 @@ impl TopologyStateMachine {
 
                 EntryPayload::Normal(cmd) => {
                     let mut topo = self.state.lock().unwrap();
-                    Self::apply_command(&mut *topo, cmd);
+                    Self::apply_command(&mut topo, cmd);
                     let snap = Arc::new(topo.clone());
                     drop(topo);
                     let _ = self.change_tx.send(snap);
@@ -140,7 +140,7 @@ impl TopologyStateMachine {
     ) -> Result<openraft::storage::Snapshot<RaftTypeConfig>, StorageError<NodeId>> {
         let topology = self.state.lock().unwrap().clone();
         let membership = self.membership.lock().unwrap().clone();
-        let last_log = self.last_log.lock().unwrap().clone();
+        let last_log = *self.last_log.lock().unwrap();
 
         let snap = StateMachineSnapshot {
             meta: membership.clone(),
@@ -194,7 +194,7 @@ impl TopologyStateMachine {
     pub async fn get_current_snapshot_data(
         &mut self,
     ) -> Result<Option<openraft::storage::Snapshot<RaftTypeConfig>>, StorageError<NodeId>> {
-        let last_log = self.last_log.lock().unwrap().clone();
+        let last_log = *self.last_log.lock().unwrap();
         let Some(last_log_id) = last_log else {
             return Ok(None);
         };
@@ -403,7 +403,9 @@ mod tests {
         );
         apply(
             &mut t,
-            TopologyCommand::MarkOffline { node_id: "pg2".into() },
+            TopologyCommand::MarkOffline {
+                node_id: "pg2".into(),
+            },
         );
         assert_eq!(t.node_roles.get("pg2"), Some(&NodeRole::Offline));
     }
@@ -453,7 +455,9 @@ mod tests {
         assert!(t.node_configs.contains_key("pg4"));
         apply(
             &mut t,
-            TopologyCommand::RemoveNode { node_id: "pg4".into() },
+            TopologyCommand::RemoveNode {
+                node_id: "pg4".into(),
+            },
         );
         assert!(!t.node_configs.contains_key("pg4"));
         assert!(!t.node_roles.contains_key("pg4"));

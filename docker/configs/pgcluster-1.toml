@@ -37,8 +37,8 @@ postgres_addr = "pg-replica-2:5432"
 priority      = 80
 
 [replication]
-replication_user         = "replicator"
-replication_password_env = "PG_REPLICATION_PASSWORD"
+replication_user         = "postgres"
+replication_password_env = "POSTGRES_PASSWORD"
 slot_prefix              = "pgcluster_"
 
 [proxy]

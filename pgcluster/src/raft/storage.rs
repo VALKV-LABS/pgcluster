@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use openraft::{
     storage::{RaftLogReader, RaftStorage, Snapshot},
-    AnyError, ErrorSubject, ErrorVerb, LogId, LogState, SnapshotMeta, StorageError,
-    StorageIOError, StoredMembership, Vote,
+    AnyError, ErrorSubject, ErrorVerb, LogId, LogState, SnapshotMeta, StorageError, StorageIOError,
+    StoredMembership, Vote,
 };
 use sled::Db;
 
@@ -41,6 +41,9 @@ pub struct SledLogStorage {
     db: Arc<Db>,
 }
 
+// The openraft RaftStorage trait dictates `Result<_, StorageError<NodeId>>` — we cannot
+// reduce the size of openraft's error type, so allow this lint for the whole impl.
+#[allow(clippy::result_large_err)]
 impl SledLogStorage {
     /// Open (or create) the sled database at `path`.
     pub fn open(path: &std::path::Path) -> anyhow::Result<Self> {
@@ -204,10 +207,7 @@ impl SledLogStorage {
         Ok(())
     }
 
-    pub async fn purge_upto(
-        &mut self,
-        log_id: LogId<NodeId>,
-    ) -> Result<(), StorageError<NodeId>> {
+    pub async fn purge_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let tree = self.logs_tree()?;
         let meta = self.meta_tree()?;
 
@@ -231,7 +231,7 @@ impl SledLogStorage {
     }
 }
 
-// openraft 0.9 uses native async traits — no #[async_trait].
+#[allow(clippy::result_large_err)]
 impl RaftLogReader<RaftTypeConfig> for SledLogStorage {
     async fn try_get_log_entries<RB>(
         &mut self,
@@ -263,7 +263,7 @@ impl PgClusterStorage {
     }
 }
 
-// openraft 0.9 uses native async traits — no #[async_trait].
+#[allow(clippy::result_large_err)]
 impl RaftLogReader<RaftTypeConfig> for PgClusterStorage {
     async fn try_get_log_entries<RB>(
         &mut self,
@@ -276,16 +276,14 @@ impl RaftLogReader<RaftTypeConfig> for PgClusterStorage {
     }
 }
 
-// openraft 0.9 uses native async traits — no #[async_trait].
+#[allow(clippy::result_large_err)]
 impl RaftStorage<RaftTypeConfig> for PgClusterStorage {
     // SledLogStorage is the log reader returned by get_log_reader().
     type LogReader = SledLogStorage;
     // TopologyStateMachine is the snapshot builder returned by get_snapshot_builder().
     type SnapshotBuilder = TopologyStateMachine;
 
-    async fn get_log_state(
-        &mut self,
-    ) -> Result<LogState<RaftTypeConfig>, StorageError<NodeId>> {
+    async fn get_log_state(&mut self) -> Result<LogState<RaftTypeConfig>, StorageError<NodeId>> {
         self.log.get_log_state().await
     }
 
@@ -316,10 +314,7 @@ impl RaftStorage<RaftTypeConfig> for PgClusterStorage {
         self.log.truncate_since(log_id).await
     }
 
-    async fn purge_logs_upto(
-        &mut self,
-        log_id: LogId<NodeId>,
-    ) -> Result<(), StorageError<NodeId>> {
+    async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         self.log.purge_upto(log_id).await
     }
 
@@ -383,8 +378,7 @@ mod tests {
             },
         };
         let encoded = serde_json::to_vec(&snap).expect("serialize");
-        let decoded: StateMachineSnapshot =
-            serde_json::from_slice(&encoded).expect("deserialize");
+        let decoded: StateMachineSnapshot = serde_json::from_slice(&encoded).expect("deserialize");
         assert_eq!(decoded.topology.primary_node_id, "pg1");
         assert_eq!(decoded.topology.version, 5);
     }
@@ -393,7 +387,10 @@ mod tests {
     async fn log_entry_survives_restart() {
         let dir = tempfile::TempDir::new().unwrap();
         let vote = Vote::<NodeId> {
-            leader_id: openraft::LeaderId { term: 2, node_id: 1 },
+            leader_id: openraft::LeaderId {
+                term: 2,
+                node_id: 1,
+            },
             committed: false,
         };
 

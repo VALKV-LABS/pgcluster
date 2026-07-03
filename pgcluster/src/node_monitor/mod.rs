@@ -25,6 +25,8 @@ pub struct NodeMonitor {
     pool: Arc<AgentClientPool>,
     config: FailoverConfig,
     metrics: Arc<Metrics>,
+    repl_user: String,
+    repl_password: String,
 }
 
 impl NodeMonitor {
@@ -34,6 +36,8 @@ impl NodeMonitor {
         pool: Arc<AgentClientPool>,
         config: FailoverConfig,
         metrics: Arc<Metrics>,
+        repl_user: String,
+        repl_password: String,
     ) -> Self {
         Self {
             raft,
@@ -41,6 +45,8 @@ impl NodeMonitor {
             pool,
             config,
             metrics,
+            repl_user,
+            repl_password,
         }
     }
 
@@ -77,7 +83,7 @@ impl NodeMonitor {
             }
 
             let topology = self.topology_rx.current();
-            self.poll_all_nodes(&*topology, &mut tracker).await;
+            self.poll_all_nodes(&topology, &mut tracker).await;
 
             // Update topology_version metric
             self.metrics.topology_version.set(topology.version as i64);
@@ -96,6 +102,26 @@ impl NodeMonitor {
 
             if result.reachable && result.pg_running {
                 tracker.record_success(node_id);
+
+                // If the node has no effective role (Unknown or Offline) but is healthy,
+                // promote it to Replica. This handles both recovery from failure and the
+                // initial bootstrap period where AddNode sets all roles to Unknown.
+                let current_role = topology.node_roles.get(node_id);
+                if matches!(
+                    current_role,
+                    Some(&NodeRole::Offline) | Some(&NodeRole::Unknown)
+                ) && node_id != &topology.primary_node_id
+                {
+                    info!(node_id, role = ?current_role, "healthy node has non-replica role, marking as replica");
+                    let _ = self
+                        .raft
+                        .raft
+                        .client_write(TopologyCommand::MarkReplica {
+                            node_id: node_id.clone(),
+                            flush_lsn: result.flush_lsn,
+                        })
+                        .await;
+                }
 
                 // Update replication lag metric for replicas
                 if node_id != &topology.primary_node_id {
@@ -146,6 +172,8 @@ impl NodeMonitor {
                             node_id,
                             &self.pool,
                             &self.metrics,
+                            &self.repl_user,
+                            &self.repl_password,
                         )
                         .await;
                         // Reset tracker so we don't re-trigger on the same node.
