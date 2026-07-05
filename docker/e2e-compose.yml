@@ -111,7 +111,10 @@ services:
       context: ..
       dockerfile: docker/vk-agent.Dockerfile
     pid: "service:pg-primary"
-    restart: unless-stopped
+    # restart: on-failure ensures that when pg-primary restarts (and its PID
+    # namespace changes), Docker also restarts vk-agent-1 to re-attach to the
+    # new namespace. "unless-stopped" would suppress this auto-restart.
+    restart: on-failure
     depends_on:
       pg-primary:
         condition: service_healthy
@@ -131,7 +134,7 @@ services:
       context: ..
       dockerfile: docker/vk-agent.Dockerfile
     pid: "service:pg-replica-1"
-    restart: unless-stopped
+    restart: on-failure
     depends_on:
       pg-replica-1:
         condition: service_started
@@ -146,7 +149,7 @@ services:
       context: ..
       dockerfile: docker/vk-agent.Dockerfile
     pid: "service:pg-replica-2"
-    restart: unless-stopped
+    restart: on-failure
     depends_on:
       pg-replica-2:
         condition: service_started

@@ -14,8 +14,9 @@
 | `connection_pool` | [connection_pool.md](connection_pool.md) | Per-(db, user, backend) connection pools; transaction-mode multiplexing |
 | `config_manager` | [config_manager.md](config_manager.md) | `pgcluster.toml` load, validate, hot-reload |
 | `tls_manager` | [tls_manager.md](tls_manager.md) | TLS for Raft, agent gRPC, proxy; auto cert generation for dev |
-| `rest_api` | [rest_api.md](rest_api.md) | HTTP API: status, switchover, failover, node management |
+| `rest_api` | [rest_api.md](rest_api.md) | HTTP API: status, switchover, failover, node management, backups |
 | `cli` | [cli.md](cli.md) | `pgcluster` binary: server mode + operator CLI subcommands |
+| `backup_coordinator` | [backup_coordinator.md](backup_coordinator.md) | Policy-scheduled base backups (daily/weekly/monthly); S3 upload; manifest tracking; retention |
 
 ## Milestone 5 — Horizontal Sharding (Cluster-of-Clusters)
 
@@ -30,9 +31,7 @@ SQL-aware router with full SQL parsing and scatter-gather — see `coordinator.m
 
 ## Milestone 2 — Production Hardening
 
-| Component | Doc | Purpose |
-|-----------|-----|---------|
-| `backup_coordinator` | [backup_coordinator.md](backup_coordinator.md) | Base backup via replica; manifest tracking; object storage upload; PITR restore |
+*All hardening work has been merged into Milestone 1. This milestone is complete.*
 
 ## Milestone 3 — pgrust Native
 
@@ -51,6 +50,7 @@ pgcluster Raft leader
   └── [node_monitor] ──polls──► [vk_agent] ──queries──► Postgres
   └── [failover_engine] ─────► [vk_agent] Promote RPC
   └── [switchover_engine] ────► [vk_agent] Promote + Demote RPCs
+  └── [backup_coordinator] ───► pg_basebackup → S3 (hourly schedule check)
   └── [raft_consensus] ────────► [topology_store] (replicated to all instances)
 
 [proxy_layer] reads [topology_store] locally (no network hop) for every routing decision

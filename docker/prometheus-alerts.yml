@@ -1,0 +1,107 @@
+groups:
+  - name: pgcluster
+    rules:
+      # ── Failover ──────────────────────────────────────────────────────────────
+      - alert: PgClusterFailoverTriggered
+        expr: increase(pgcluster_failovers_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pgcluster automatic failover triggered"
+          description: >-
+            An automatic failover occurred in the last 5 minutes.
+            Check pgcluster logs and verify the new primary is healthy.
+
+      - alert: PgClusterFrequentFailovers
+        expr: increase(pgcluster_failovers_total[1h]) >= 3
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "pgcluster has failed over 3+ times in 1 hour"
+          description: >-
+            The cluster has experienced {{ $value }} failover(s) in the last hour.
+            Investigate the primary node for recurring instability.
+
+      # ── Raft leadership ───────────────────────────────────────────────────────
+      - alert: PgClusterNoRaftLeader
+        expr: sum(pgcluster_raft_is_leader) == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "no pgcluster Raft leader elected"
+          description: >-
+            No pgcluster instance reports being the Raft leader.
+            The cluster cannot coordinate failover or accept topology changes.
+
+      - alert: PgClusterMultipleRaftLeaders
+        expr: sum(pgcluster_raft_is_leader) > 1
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "multiple pgcluster Raft leaders detected"
+          description: >-
+            More than one pgcluster instance claims to be the Raft leader.
+            This indicates a split-brain condition and requires immediate intervention.
+
+      # ── Replica lag ───────────────────────────────────────────────────────────
+      - alert: PgClusterReplicaLagHigh
+        expr: pgcluster_replica_lag_bytes > 104857600   # 100 MiB
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pgcluster replica {{ $labels.node_id }} lag exceeds 100 MiB"
+          description: >-
+            Replica {{ $labels.node_id }} is {{ $value | humanize1024 }}B behind
+            the primary and has been lagging for more than 2 minutes.
+
+      - alert: PgClusterReplicaLagCritical
+        expr: pgcluster_replica_lag_bytes > 1073741824   # 1 GiB
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "pgcluster replica {{ $labels.node_id }} lag exceeds 1 GiB"
+          description: >-
+            Replica {{ $labels.node_id }} is {{ $value | humanize1024 }}B behind
+            the primary.  Failover to this node will result in significant data loss.
+
+      # ── vk-agent health checks ────────────────────────────────────────────────
+      - alert: PgClusterNodeUnreachable
+        expr: increase(pgcluster_health_check_failures_total[1m]) > 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pgcluster node {{ $labels.node_id }} is failing health checks"
+          description: >-
+            Node {{ $labels.node_id }} failed more than 3 health checks in the
+            last minute.  Automatic failover will trigger if this continues.
+
+      # ── Primary availability ──────────────────────────────────────────────────
+      - alert: PgClusterNoPrimary
+        expr: pgcluster_primary_info == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "pgcluster has no primary postgres node"
+          description: >-
+            The cluster has no primary node.  All writes are blocked.
+            Check the failover log and node status.
+
+      # ── Switchover / operations ───────────────────────────────────────────────
+      - alert: PgClusterSwitchoverSlow
+        expr: pgcluster_failover_duration_seconds > 30
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pgcluster failover or switchover took more than 30 seconds"
+          description: >-
+            The last failover/switchover completed in {{ $value }}s.
+            This may indicate network latency or replica lag issues.

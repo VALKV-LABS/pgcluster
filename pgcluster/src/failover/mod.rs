@@ -5,7 +5,7 @@ pub mod repoint;
 pub mod slots;
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use crate::agent_clients::AgentClientPool;
@@ -25,6 +25,7 @@ use crate::raft::RaftNode;
 /// 3. Propose `SetPrimary` to Raft so all cluster members update their view.
 /// 4. Record the failover event in Raft history.
 /// 5. Send Demote to all remaining replicas so they repoint to the new primary.
+#[allow(clippy::too_many_arguments)]
 pub async fn trigger_failover(
     raft: &Arc<RaftNode>,
     topology: &ClusterTopology,
@@ -33,6 +34,7 @@ pub async fn trigger_failover(
     metrics: &Arc<Metrics>,
     repl_user: &str,
     repl_password: &str,
+    slot_prefix: &str,
 ) {
     let started = Instant::now();
     info!(failed_primary, "starting automatic failover");
@@ -66,6 +68,25 @@ pub async fn trigger_failover(
             candidate,
             err = %e,
             "promote RPC failed — aborting failover"
+        );
+        return;
+    }
+
+    // ── 2b. Verify promotion succeeded ───────────────────────────────────────
+    // Poll GetStatus until is_in_recovery == false (up to 3 times, 500 ms apart).
+    if let Err(e) = promote::verify_promotion(
+        &candidate,
+        &candidate_cfg.agent_addr,
+        pool,
+        3,
+        Duration::from_millis(500),
+    )
+    .await
+    {
+        error!(
+            candidate,
+            err = %e,
+            "post-promotion health check failed — aborting failover"
         );
         return;
     }
@@ -136,7 +157,18 @@ pub async fn trigger_failover(
             "host={} port=5432 user={} password={}",
             new_host, repl_user, repl_password
         );
-        let errs = repoint::repoint_replicas(&replicas, &conninfo, "pgcluster_", pool).await;
+
+        // Ensure the new primary has a WAL slot for every replica that will
+        // connect to it.  Stale slots from the old primary are unreachable;
+        // they'll be cleaned up by the node_monitor orphan-slot audit.
+        let replica_ids: Vec<String> = replicas.iter().map(|(id, _)| id.clone()).collect();
+        let primary_url = format!(
+            "postgres://{}:{}@{}/postgres",
+            repl_user, repl_password, candidate_cfg.postgres_addr
+        );
+        slots::ensure_slots_for_replicas(&primary_url, &replica_ids, slot_prefix).await;
+
+        let errs = repoint::repoint_replicas(&replicas, &conninfo, slot_prefix, pool).await;
         for (id, e) in errs {
             warn!(node_id = id, err = %e, "failed to repoint replica after failover");
         }

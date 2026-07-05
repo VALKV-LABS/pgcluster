@@ -8,6 +8,7 @@ pub fn validate(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     validate_raft(cfg)?;
     validate_nodes(cfg)?;
     validate_addresses(cfg)?;
+    validate_backup(cfg)?;
     Ok(())
 }
 
@@ -47,6 +48,18 @@ fn validate_raft(cfg: &PgClusterConfig) -> anyhow::Result<()> {
                 e
             )
         })?;
+    }
+    // election_timeout_ms must be at least 2× heartbeat_interval_ms.
+    // A tighter ratio means followers expire before seeing even two heartbeats,
+    // causing spurious elections under normal network jitter.
+    let min_election = cfg.raft.heartbeat_interval_ms * 2;
+    if cfg.raft.election_timeout_ms < min_election {
+        anyhow::bail!(
+            "[raft] election_timeout_ms ({}) must be >= 2 × heartbeat_interval_ms ({} × 2 = {})",
+            cfg.raft.election_timeout_ms,
+            cfg.raft.heartbeat_interval_ms,
+            min_election,
+        );
     }
     Ok(())
 }
@@ -91,6 +104,27 @@ fn validate_addresses(cfg: &PgClusterConfig) -> anyhow::Result<()> {
         parse_host_port(&node.agent_addr).map_err(|e| {
             anyhow::anyhow!("node {:?} agent_addr {:?}: {}", node.id, node.agent_addr, e)
         })?;
+    }
+    Ok(())
+}
+
+fn validate_backup(cfg: &PgClusterConfig) -> anyhow::Result<()> {
+    let Some(backup) = &cfg.backup else {
+        return Ok(());
+    };
+    if backup.s3.bucket.is_empty() {
+        anyhow::bail!("[backup.s3] bucket must not be empty");
+    }
+    if backup.schedule.is_empty() {
+        anyhow::bail!("[backup] schedule must have at least one [[backup.schedule]] entry");
+    }
+    for entry in &backup.schedule {
+        if entry.retain == 0 {
+            anyhow::bail!(
+                "[backup] schedule retain must be >= 1 (frequency: {})",
+                entry.frequency
+            );
+        }
     }
     Ok(())
 }
@@ -172,6 +206,7 @@ mod tests {
             tls: TlsConfig::default(),
             metrics: MetricsConfig::default(),
             api: ApiConfig::default(),
+            backup: None,
         }
     }
 
@@ -240,5 +275,33 @@ mod tests {
         let mut cfg = minimal();
         cfg.nodes.node[0].postgres_addr = "postgres:notaport".into();
         assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn election_timeout_too_small_fails() {
+        let mut cfg = minimal();
+        cfg.raft.heartbeat_interval_ms = 150;
+        cfg.raft.election_timeout_ms = 200; // < 2×150 = 300
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("election_timeout_ms"),
+            "error should mention election_timeout_ms: {err}"
+        );
+    }
+
+    #[test]
+    fn election_timeout_exactly_2x_passes() {
+        let mut cfg = minimal();
+        cfg.raft.heartbeat_interval_ms = 150;
+        cfg.raft.election_timeout_ms = 300; // exactly 2×150
+        assert!(validate(&cfg).is_ok(), "2× ratio should pass validation");
+    }
+
+    #[test]
+    fn election_timeout_well_above_2x_passes() {
+        let mut cfg = minimal();
+        cfg.raft.heartbeat_interval_ms = 150;
+        cfg.raft.election_timeout_ms = 750; // 5× — well above minimum
+        assert!(validate(&cfg).is_ok());
     }
 }

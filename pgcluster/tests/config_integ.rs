@@ -173,6 +173,189 @@ listen_addr = "0.0.0.0:8080"
     assert!(cfg.proxy.pool.max_connections_per_db_user > 0);
 }
 
+// ── Backup config tests ───────────────────────────────────────────────────────
+
+/// Base minimal TOML without a backup section (reused across backup tests).
+fn base_config_toml() -> &'static str {
+    r#"
+[cluster]
+name     = "test"
+data_dir = "/tmp"
+
+[raft]
+node_id = 1
+
+[[raft.peers]]
+id   = 1
+addr = "127.0.0.1:7000"
+
+[[raft.peers]]
+id   = 2
+addr = "127.0.0.1:7001"
+
+[[raft.peers]]
+id   = 3
+addr = "127.0.0.1:7002"
+
+[[nodes.node]]
+id            = "pg1"
+agent_addr    = "127.0.0.1:7010"
+postgres_addr = "127.0.0.1:5432"
+priority      = 100
+
+[replication]
+replication_user         = "replicator"
+replication_password_env = "PG_REPLICATION_PASSWORD"
+
+[proxy]
+listen_addr        = "0.0.0.0:5432"
+admin_listen_addr  = "0.0.0.0:5433"
+health_listen_addr = "0.0.0.0:8008"
+
+[metrics]
+listen_addr = "0.0.0.0:9090"
+
+[api]
+listen_addr = "0.0.0.0:8080"
+"#
+}
+
+#[test]
+fn backup_config_valid_passes_validation() {
+    let toml = format!(
+        "{}\n{}",
+        base_config_toml(),
+        r#"
+[backup]
+enabled        = true
+prefer_replica = true
+
+[backup.s3]
+bucket = "my-backups"
+region = "us-east-1"
+
+[[backup.schedule]]
+frequency = "daily"
+retain    = 7
+
+[[backup.schedule]]
+frequency = "weekly"
+retain    = 4
+"#
+    );
+    let cfg: pgcluster::config::PgClusterConfig = toml::from_str(&toml).unwrap();
+    assert!(
+        pgcluster::config::validate::validate(&cfg).is_ok(),
+        "valid backup config should pass validation"
+    );
+    let backup = cfg.backup.unwrap();
+    assert_eq!(backup.s3.bucket, "my-backups");
+    assert_eq!(backup.schedule.len(), 2);
+}
+
+#[test]
+fn backup_config_without_s3_section_fails_toml_parse() {
+    let toml = format!(
+        "{}\n{}",
+        base_config_toml(),
+        r#"
+[backup]
+enabled = true
+
+[[backup.schedule]]
+frequency = "daily"
+retain    = 7
+"#
+    );
+    // `s3` is a required (non-Option) field, so parsing must fail.
+    let result: Result<pgcluster::config::PgClusterConfig, _> = toml::from_str(&toml);
+    assert!(
+        result.is_err(),
+        "[backup] without [backup.s3] must fail TOML parsing"
+    );
+}
+
+#[test]
+fn backup_config_empty_bucket_fails_validation() {
+    let toml = format!(
+        "{}\n{}",
+        base_config_toml(),
+        r#"
+[backup]
+enabled = true
+
+[backup.s3]
+bucket = ""
+
+[[backup.schedule]]
+frequency = "daily"
+retain    = 7
+"#
+    );
+    let cfg: pgcluster::config::PgClusterConfig = toml::from_str(&toml).unwrap();
+    let err = pgcluster::config::validate::validate(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("bucket"),
+        "error should mention 'bucket': {err}"
+    );
+}
+
+#[test]
+fn backup_config_empty_schedule_fails_validation() {
+    // `schedule = []` parses successfully (empty vec) but must fail validation.
+    let toml = format!(
+        "{}\n{}",
+        base_config_toml(),
+        r#"
+[backup]
+enabled   = true
+schedule  = []
+
+[backup.s3]
+bucket = "my-backups"
+"#
+    );
+    let cfg: pgcluster::config::PgClusterConfig = toml::from_str(&toml).unwrap();
+    let err = pgcluster::config::validate::validate(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("schedule"),
+        "error should mention 'schedule': {err}"
+    );
+}
+
+#[test]
+fn backup_config_retain_zero_fails_validation() {
+    let toml = format!(
+        "{}\n{}",
+        base_config_toml(),
+        r#"
+[backup]
+enabled = true
+
+[backup.s3]
+bucket = "my-backups"
+
+[[backup.schedule]]
+frequency = "daily"
+retain    = 0
+"#
+    );
+    let cfg: pgcluster::config::PgClusterConfig = toml::from_str(&toml).unwrap();
+    let err = pgcluster::config::validate::validate(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("retain"),
+        "error should mention 'retain': {err}"
+    );
+}
+
+#[test]
+fn no_backup_section_is_valid() {
+    // Omitting [backup] entirely must not affect validation.
+    let cfg: pgcluster::config::PgClusterConfig = toml::from_str(base_config_toml()).unwrap();
+    assert!(cfg.backup.is_none());
+    assert!(pgcluster::config::validate::validate(&cfg).is_ok());
+}
+
 /// BM-1: Spawn the server binary with a valid config, let it start, then kill it.
 /// Requires the binary to be built and examples/cluster.toml to exist.
 #[tokio::test]

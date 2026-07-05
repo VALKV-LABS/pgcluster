@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::time::Duration;
 
 /// Simple HTTP client for talking to the pgcluster REST API.
 pub struct ApiClient {
@@ -8,9 +9,14 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new(api_addr: &str) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("build HTTP client");
         Self {
             base_url: format!("http://{}", api_addr),
-            client: reqwest::Client::new(),
+            client,
         }
     }
 

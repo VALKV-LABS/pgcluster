@@ -95,12 +95,29 @@ async fn main() -> Result<()> {
     let svc = AgentServiceImpl::new(Arc::new(config.clone()), heartbeat, Arc::new(pg), pg_ctl);
 
     let addr: SocketAddr = config.listen_addr.parse()?;
-    info!(%addr, "gRPC server listening");
 
-    Server::builder()
-        .add_service(AgentServiceServer::new(svc))
-        .serve(addr)
-        .await?;
+    // Build tonic server — optionally wrapped with TLS.
+    let tls_cfg = &config.tls;
+    let needs_tls = tls_cfg.auto_generate || tls_cfg.cert.is_some();
+
+    if needs_tls {
+        let data_dir = std::path::Path::new(&config.data_dir);
+        let (_ca, cert_pem, key_pem) = vk_agent::tls::load_or_generate(data_dir, tls_cfg)?;
+        let identity = tonic::transport::Identity::from_pem(&cert_pem, &key_pem);
+        let tls_config = tonic::transport::ServerTlsConfig::new().identity(identity);
+        info!(%addr, "gRPC server listening (TLS)");
+        Server::builder()
+            .tls_config(tls_config)?
+            .add_service(AgentServiceServer::new(svc))
+            .serve(addr)
+            .await?;
+    } else {
+        info!(%addr, "gRPC server listening (plaintext)");
+        Server::builder()
+            .add_service(AgentServiceServer::new(svc))
+            .serve(addr)
+            .await?;
+    }
 
     Ok(())
 }

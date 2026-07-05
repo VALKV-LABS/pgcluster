@@ -25,6 +25,7 @@ pub async fn repoint_replicas(
         let mut client = match pool.get_or_connect(node_id, agent_addr).await {
             Ok(c) => c,
             Err(e) => {
+                pool.remove(node_id);
                 errors.push((node_id.clone(), e));
                 continue;
             }
@@ -42,6 +43,8 @@ pub async fn repoint_replicas(
                 ));
             }
             Err(e) => {
+                // Evict the broken channel so the next caller doesn't reuse it.
+                pool.remove(node_id);
                 errors.push((node_id.clone(), e));
             }
         }

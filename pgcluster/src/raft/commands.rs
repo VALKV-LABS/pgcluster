@@ -1,4 +1,4 @@
-use super::topology::NodeConfig;
+use super::topology::{BackupManifest, NodeConfig};
 use serde::{Deserialize, Serialize};
 
 /// Every topology change is a Raft log entry with one of these variants.
@@ -40,6 +40,10 @@ pub enum TopologyCommand {
     },
     /// Update the replication slot name for a replica
     SetReplicationSlot { node_id: String, slot_name: String },
+    /// Record a completed (or failed) backup in cluster state
+    AddBackupManifest(BackupManifest),
+    /// Remove a backup manifest (after pruning or operator delete)
+    RemoveBackupManifest { backup_id: String },
 }
 
 impl TopologyCommand {

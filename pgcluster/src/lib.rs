@@ -4,6 +4,7 @@
 
 pub mod agent_clients;
 pub mod api;
+pub mod backup;
 pub mod cli;
 pub mod config;
 pub mod failover;
@@ -32,7 +33,19 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     logging::init();
     info!(cluster = %cfg.cluster.name, node_id = cfg.raft.node_id, "pgcluster starting");
 
-    let raft_node = Arc::new(raft::RaftNode::start(&cfg).await?);
+    // Build TLS manager before Raft so we can share the CA cert for peer connections.
+    let tls_mgr: Option<Arc<tls::TlsManager>> = if cfg.tls.auto_generate || cfg.tls.cert.is_some() {
+        Some(Arc::new(tls::TlsManager::new(
+            &cfg.tls,
+            cfg.raft.node_id,
+            std::path::Path::new(&cfg.cluster.data_dir),
+        )?))
+    } else {
+        None
+    };
+
+    let raft_ca_pem = tls_mgr.as_ref().map(|t| t.ca_cert_pem().to_vec());
+    let raft_node = Arc::new(raft::RaftNode::start(&cfg, raft_ca_pem).await?);
     let topology_rx = raft_node.topology_rx.clone();
 
     // On bootstrap, seed the Raft topology from the TOML [[nodes.node]] list.
@@ -77,24 +90,33 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         });
     }
     let metrics = metrics_registry::Metrics::new()?;
-    let pool = Arc::new(agent_clients::AgentClientPool::new());
 
-    let tls_mgr: Option<Arc<tls::TlsManager>> = if cfg.tls.auto_generate || cfg.tls.cert.is_some() {
-        Some(Arc::new(tls::TlsManager::new(
-            &cfg.tls,
-            cfg.raft.node_id,
-            std::path::Path::new(&cfg.cluster.data_dir),
-        )?))
-    } else {
-        None
-    };
+    // Use TLS-verified connections to vk-agents when a CA cert is available.
+    let pool = Arc::new(match tls_mgr.as_ref() {
+        Some(t) => agent_clients::AgentClientPool::new_with_ca(t.ca_cert_pem().to_vec()),
+        None => agent_clients::AgentClientPool::new(),
+    });
 
-    let api_state = api::ApiState {
-        raft: raft_node.clone(),
-        topology: topology_rx.clone(),
-        metrics: metrics.clone(),
-        config: cfg.clone(),
-    };
+    // Build the proxy Router early so it can be shared between the ProxyServer
+    // (which uses it for routing) and ApiState (which uses it for drain control).
+    let proxy_router = Arc::new(proxy::Router::new(
+        topology_rx.clone(),
+        cfg.proxy.read_routing.clone(),
+    ));
+
+    // Shared op_in_progress flag: prevents concurrent automatic failover (node_monitor)
+    // and operator-initiated failover/switchover (API handlers) from running simultaneously.
+    let op_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let api_state = api::ApiState::new(
+        raft_node.clone(),
+        topology_rx.clone(),
+        metrics.clone(),
+        cfg.clone(),
+        Some(proxy_router.clone()),
+        pool.clone(),
+        op_in_progress.clone(),
+    );
 
     let raft_grpc = raft::RaftGrpcServer::new(raft_node.raft.clone());
     let (raft_svc, topo_svc) = raft_grpc.into_services();
@@ -117,6 +139,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     // Raft gRPC peer server
     {
         let addr_str = raft_grpc_addr.clone();
+        let raft_tls = tls_mgr.as_ref().map(|t| t.tonic_server_tls_config());
         tasks.push(tokio::spawn(async move {
             let addr: std::net::SocketAddr = match addr_str.parse() {
                 Ok(a) => a,
@@ -125,7 +148,17 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                     return;
                 }
             };
-            if let Err(e) = tonic::transport::Server::builder()
+            let mut builder = tonic::transport::Server::builder();
+            if let Some(tls_cfg) = raft_tls {
+                builder = match builder.tls_config(tls_cfg) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!(err = %e, "Raft gRPC TLS config failed");
+                        return;
+                    }
+                };
+            }
+            if let Err(e) = builder
                 .add_service(raft_svc)
                 .add_service(topo_svc)
                 .serve(addr)
@@ -188,11 +221,10 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     {
         let proxy_cfg = cfg.proxy.clone();
         let proxy_tls = tls_mgr.clone();
-        let proxy_topo = topology_rx.clone();
         let proxy_metrics = metrics.clone();
         let srv = Arc::new(proxy::ProxyServer::new(
             proxy_cfg,
-            proxy_topo,
+            proxy_router.clone(),
             proxy_tls,
             proxy_metrics,
         ));
@@ -222,6 +254,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         let repl_user = cfg.replication.replication_user.clone();
         let repl_password =
             std::env::var(&cfg.replication.replication_password_env).unwrap_or_default();
+        let slot_prefix = cfg.replication.slot_prefix.clone();
         tasks.push(tokio::spawn(async move {
             let mut monitor = node_monitor::NodeMonitor::new(
                 raft,
@@ -231,8 +264,27 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                 mon_metrics,
                 repl_user,
                 repl_password,
+                slot_prefix,
+                op_in_progress.clone(),
             );
             monitor.run().await;
+        }));
+    }
+
+    // Backup scheduler (only started when [backup] section is present in config)
+    if let Some(backup_cfg) = cfg.backup.clone() {
+        let raft = raft_node.clone();
+        let topo = topology_rx.clone();
+        let repl_user = cfg.replication.replication_user.clone();
+        let repl_password =
+            std::env::var(&cfg.replication.replication_password_env).unwrap_or_default();
+        tasks.push(tokio::spawn(async move {
+            match backup::BackupScheduler::new(raft, topo, backup_cfg, repl_user, repl_password) {
+                Ok(mut scheduler) => scheduler.run().await,
+                Err(e) => {
+                    error!(err = %e, "backup scheduler failed to initialize (check S3 config)")
+                }
+            }
         }));
     }
 
