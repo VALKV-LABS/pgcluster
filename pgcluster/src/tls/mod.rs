@@ -106,8 +106,7 @@ impl TlsManager {
 
     /// Build a tonic `ServerTlsConfig` using the stored cert+key PEM.
     pub fn tonic_server_tls_config(&self) -> tonic::transport::ServerTlsConfig {
-        let identity =
-            tonic::transport::Identity::from_pem(&self.cert_pem, &self.key_pem);
+        let identity = tonic::transport::Identity::from_pem(&self.cert_pem, &self.key_pem);
         tonic::transport::ServerTlsConfig::new().identity(identity)
     }
 

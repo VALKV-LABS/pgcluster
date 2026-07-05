@@ -20,16 +20,17 @@ use crate::config::AgentTlsConfig;
 ///
 /// Returns `(ca_cert_pem, cert_pem, key_pem)`.  The CA cert is the one that
 /// pgcluster should use to verify this agent's certificate.
-pub fn load_or_generate(data_dir: &Path, cfg: &AgentTlsConfig) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+pub fn load_or_generate(
+    data_dir: &Path,
+    cfg: &AgentTlsConfig,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     if let (Some(cert_path), Some(key_path)) = (&cfg.cert, &cfg.key) {
         // Load explicitly configured files.
-        let cert = std::fs::read(cert_path)
-            .with_context(|| format!("read cert file {cert_path}"))?;
-        let key = std::fs::read(key_path)
-            .with_context(|| format!("read key file {key_path}"))?;
+        let cert =
+            std::fs::read(cert_path).with_context(|| format!("read cert file {cert_path}"))?;
+        let key = std::fs::read(key_path).with_context(|| format!("read key file {key_path}"))?;
         let ca = if let Some(ca_path) = &cfg.ca_cert {
-            std::fs::read(ca_path)
-                .with_context(|| format!("read CA cert file {ca_path}"))?
+            std::fs::read(ca_path).with_context(|| format!("read CA cert file {ca_path}"))?
         } else {
             cert.clone() // self-signed: use the cert itself as CA
         };
@@ -58,23 +59,29 @@ pub fn load_or_generate(data_dir: &Path, cfg: &AgentTlsConfig) -> Result<(Vec<u8
     std::fs::create_dir_all(&certs_dir)
         .with_context(|| format!("create certs dir {}", certs_dir.display()))?;
 
-    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-        .context("generate CA keypair")?;
+    let ca_key =
+        KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).context("generate CA keypair")?;
     let mut ca_params =
         CertificateParams::new(vec!["vk-agent-ca".to_string()]).context("CA params")?;
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.distinguished_name.push(DnType::CommonName, "vk-agent-ca");
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "vk-agent-ca");
     let ca_cert = ca_params.self_signed(&ca_key).context("self-sign CA")?;
     let ca_pem = ca_cert.pem().into_bytes();
 
-    let node_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-        .context("generate node keypair")?;
+    let node_key =
+        KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).context("generate node keypair")?;
     let dns_names = vec!["localhost".to_string(), "vk-agent".to_string()];
     let mut node_params = CertificateParams::new(dns_names).context("node cert params")?;
-    node_params.distinguished_name.push(DnType::CommonName, "vk-agent");
+    node_params
+        .distinguished_name
+        .push(DnType::CommonName, "vk-agent");
     node_params
         .subject_alt_names
-        .push(SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
+        .push(SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        )));
     let node_cert = node_params
         .signed_by(&node_key, &ca_cert, &ca_key)
         .context("sign node cert")?;
@@ -118,7 +125,10 @@ mod tests {
     #[test]
     fn auto_generate_creates_cert_files() {
         let dir = TempDir::new().unwrap();
-        let cfg = AgentTlsConfig { auto_generate: true, ..Default::default() };
+        let cfg = AgentTlsConfig {
+            auto_generate: true,
+            ..Default::default()
+        };
         let (ca, cert, key) = load_or_generate(dir.path(), &cfg).unwrap();
         assert!(!ca.is_empty());
         assert!(!cert.is_empty());
@@ -132,7 +142,10 @@ mod tests {
     #[test]
     fn auto_generate_reuses_existing_files() {
         let dir = TempDir::new().unwrap();
-        let cfg = AgentTlsConfig { auto_generate: true, ..Default::default() };
+        let cfg = AgentTlsConfig {
+            auto_generate: true,
+            ..Default::default()
+        };
         let (ca1, cert1, _) = load_or_generate(dir.path(), &cfg).unwrap();
         let (ca2, cert2, _) = load_or_generate(dir.path(), &cfg).unwrap();
         // Must return the same cert on second call.
@@ -153,7 +166,10 @@ mod tests {
         // rustls requires a CryptoProvider; ring is the only provider in vk-agent.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = TempDir::new().unwrap();
-        let cfg = AgentTlsConfig { auto_generate: true, ..Default::default() };
+        let cfg = AgentTlsConfig {
+            auto_generate: true,
+            ..Default::default()
+        };
         let (_ca, cert, key) = load_or_generate(dir.path(), &cfg).unwrap();
         build_server_config(&cert, &key).expect("server config should build from generated certs");
     }

@@ -26,6 +26,7 @@ use crate::raft::RaftNode;
 ///    *replica*, not a failing *primary*, preventing spurious automatic failover.
 /// 4. Stop the old primary so Docker restarts it in standby mode.
 /// 5. Repoint ALL other nodes to the new primary and restart them.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_switchover(
     raft: &Arc<RaftNode>,
     topology: &ClusterTopology,

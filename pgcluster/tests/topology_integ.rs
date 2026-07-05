@@ -87,7 +87,7 @@ fn lsn_parse_format_roundtrip() {
 
 #[test]
 fn failover_history_capped_at_max() {
-    use pgcluster::raft::topology::{FailoverEvent, ClusterTopology};
+    use pgcluster::raft::topology::{ClusterTopology, FailoverEvent};
     let cap = ClusterTopology::FAILOVER_HISTORY_MAX;
     let mut t = ClusterTopology::default();
     // Insert cap+5 events — only the most recent `cap` should be retained.

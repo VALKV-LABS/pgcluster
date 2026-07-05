@@ -281,7 +281,9 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         tasks.push(tokio::spawn(async move {
             match backup::BackupScheduler::new(raft, topo, backup_cfg, repl_user, repl_password) {
                 Ok(mut scheduler) => scheduler.run().await,
-                Err(e) => error!(err = %e, "backup scheduler failed to initialize (check S3 config)"),
+                Err(e) => {
+                    error!(err = %e, "backup scheduler failed to initialize (check S3 config)")
+                }
             }
         }));
     }

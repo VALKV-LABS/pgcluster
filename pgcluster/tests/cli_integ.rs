@@ -79,7 +79,12 @@ impl Recorder {
         self.bodies.lock().unwrap().push(v);
     }
     fn last(&self) -> serde_json::Value {
-        self.bodies.lock().unwrap().last().cloned().unwrap_or_default()
+        self.bodies
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -232,8 +237,7 @@ async fn cli_node_list_json_mode_returns_ok() {
 
 #[tokio::test]
 async fn cli_node_get_returns_ok() {
-    let router = Router::new()
-        .route("/api/nodes/:id", get(|| async { Json(node_json()) }));
+    let router = Router::new().route("/api/nodes/:id", get(|| async { Json(node_json()) }));
     let addr = spawn_mock(router).await;
 
     let args = pgcluster::cli::node::NodeArgs {
@@ -287,8 +291,10 @@ async fn cli_node_add_posts_correct_payload() {
 
 #[tokio::test]
 async fn cli_node_remove_sends_delete() {
-    let router = Router::new()
-        .route("/api/nodes/:id", delete(|| async { axum::http::StatusCode::NO_CONTENT }));
+    let router = Router::new().route(
+        "/api/nodes/:id",
+        delete(|| async { axum::http::StatusCode::NO_CONTENT }),
+    );
     let addr = spawn_mock(router).await;
 
     let args = pgcluster::cli::node::NodeArgs {
@@ -325,10 +331,7 @@ async fn cli_status_parses_all_fields_from_response() {
 #[tokio::test]
 async fn cli_switchover_propagates_server_error() {
     use axum::http::StatusCode;
-    let router = Router::new().route(
-        "/api/switchover",
-        post(|| async { StatusCode::CONFLICT }),
-    );
+    let router = Router::new().route("/api/switchover", post(|| async { StatusCode::CONFLICT }));
     let addr = spawn_mock(router).await;
 
     let args = pgcluster::cli::switchover::SwitchoverArgs {

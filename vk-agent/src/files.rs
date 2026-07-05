@@ -34,7 +34,7 @@ pub async fn update_auto_conf(data_dir: &Path, key: &str, value: &str) -> Result
     // PostgreSQL's guc-file.l lexer terminates quoted strings at the first
     // newline character, so an embedded newline produces a malformed file that
     // postgres rejects on reload.  Replace any newlines in the value with spaces.
-    let value = &value.replace('\n', " ").replace('\r', " ");
+    let value = &value.replace(['\n', '\r'], " ");
 
     // Read existing content, or start empty if the file does not exist yet.
     let existing = match fs::read_to_string(&conf_path).await {
@@ -272,11 +272,19 @@ mod tests {
     #[tokio::test]
     async fn write_pgpass_creates_correct_entry() {
         let dir = TempDir::new().unwrap();
-        write_pgpass(dir.path(), "pg-primary", "5432", "replication", "replicator", "s3cret")
+        write_pgpass(
+            dir.path(),
+            "pg-primary",
+            "5432",
+            "replication",
+            "replicator",
+            "s3cret",
+        )
+        .await
+        .unwrap();
+        let content = tokio::fs::read_to_string(dir.path().join(".pgpass"))
             .await
             .unwrap();
-        let content =
-            tokio::fs::read_to_string(dir.path().join(".pgpass")).await.unwrap();
         assert_eq!(content, "pg-primary:5432:replication:replicator:s3cret\n");
     }
 
@@ -284,11 +292,19 @@ mod tests {
     async fn write_pgpass_escapes_special_chars() {
         let dir = TempDir::new().unwrap();
         // Colons in the password must be escaped.
-        write_pgpass(dir.path(), "host", "5432", "replication", "user", "pa:ss\\word")
+        write_pgpass(
+            dir.path(),
+            "host",
+            "5432",
+            "replication",
+            "user",
+            "pa:ss\\word",
+        )
+        .await
+        .unwrap();
+        let content = tokio::fs::read_to_string(dir.path().join(".pgpass"))
             .await
             .unwrap();
-        let content =
-            tokio::fs::read_to_string(dir.path().join(".pgpass")).await.unwrap();
         assert_eq!(content, "host:5432:replication:user:pa\\:ss\\\\word\n");
     }
 

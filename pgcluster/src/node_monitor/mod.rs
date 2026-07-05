@@ -40,6 +40,7 @@ pub struct NodeMonitor {
 }
 
 impl NodeMonitor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         raft: Arc<RaftNode>,
         topology_rx: TopologyWatch,
@@ -106,7 +107,9 @@ impl NodeMonitor {
             self.metrics.topology_version.set(topology.version as i64);
 
             // Periodically audit the primary for orphaned WAL replication slots.
-            if tick_count % self.slot_audit_ticks == 0 && !topology.primary_node_id.is_empty() {
+            if tick_count.is_multiple_of(self.slot_audit_ticks)
+                && !topology.primary_node_id.is_empty()
+            {
                 self.audit_slots(&topology).await;
             }
         }
@@ -234,16 +237,20 @@ impl NodeMonitor {
                                 conninfo = %result.replication_conninfo,
                                 "recovered replica has stale primary_conninfo — repointing"
                             );
-                            if let Ok(mut client) = self.pool.get_or_connect(node_id, &cfg.agent_addr).await {
+                            if let Ok(mut client) =
+                                self.pool.get_or_connect(node_id, &cfg.agent_addr).await
+                            {
                                 let conninfo = format!(
                                     "host={} port=5432 user={} password={}",
                                     primary_host, self.repl_user, self.repl_password
                                 );
-                                let slot_name =
-                                    format!("{}{}", self.slot_prefix, node_id);
+                                let slot_name = format!("{}{}", self.slot_prefix, node_id);
                                 match client.demote(&conninfo, &slot_name).await {
                                     Ok(r) if r.success => {
-                                        info!(node_id, "recovered replica repointed to new primary");
+                                        info!(
+                                            node_id,
+                                            "recovered replica repointed to new primary"
+                                        );
                                     }
                                     Ok(r) => {
                                         warn!(node_id, err = %r.error, "repoint Demote RPC returned failure");
@@ -278,7 +285,10 @@ impl NodeMonitor {
             } else {
                 // Nodes in Maintenance mode are intentionally stopped; ignore health failures.
                 if topology.node_roles.get(node_id) == Some(&NodeRole::Maintenance) {
-                    debug!(node_id, "skipping health-check failure for node in maintenance mode");
+                    debug!(
+                        node_id,
+                        "skipping health-check failure for node in maintenance mode"
+                    );
                     continue;
                 }
 

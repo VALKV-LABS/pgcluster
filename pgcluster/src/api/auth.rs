@@ -100,14 +100,14 @@ mod tests {
 
     #[test]
     fn valid_key_matches() {
-        let keys = vec!["secret".to_string(), "other".to_string()];
+        let keys = ["secret".to_string(), "other".to_string()];
         let token = "secret";
         assert!(keys.iter().any(|k| constant_time_eq(k, token)));
     }
 
     #[test]
     fn invalid_key_rejected() {
-        let keys = vec!["secret".to_string()];
+        let keys = ["secret".to_string()];
         let token = "wrong";
         assert!(!keys.iter().any(|k| constant_time_eq(k, token)));
     }

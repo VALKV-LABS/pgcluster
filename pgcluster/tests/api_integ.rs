@@ -47,6 +47,99 @@ fn failover_request_deserializes() {
     assert_eq!(req.failed_node_id, "pg1");
 }
 
+// ── Backup API serialization tests ────────────────────────────────────────────
+
+#[test]
+fn backup_manifest_serializes_completed_status() {
+    use pgcluster::raft::topology::{BackupManifest, BackupStatus};
+    let m = BackupManifest {
+        backup_id: "abc-123".into(),
+        label: "daily-2026-07-04".into(),
+        frequency: "daily".into(),
+        source_node: "pg2".into(),
+        started_at: 1_000_000,
+        completed_at: 1_000_300,
+        size_bytes: 512 * 1024 * 1024,
+        s3_uri: "s3://bucket/prefix/daily/abc-123/".into(),
+        status: BackupStatus::Completed,
+    };
+    let json = serde_json::to_string(&m).unwrap();
+    assert!(json.contains("\"backup_id\":\"abc-123\""));
+    assert!(json.contains("\"frequency\":\"daily\""));
+    assert!(json.contains("\"status\":\"completed\""));
+    assert!(json.contains("\"source_node\":\"pg2\""));
+
+    let roundtrip: BackupManifest = serde_json::from_str(&json).unwrap();
+    assert_eq!(roundtrip.backup_id, m.backup_id);
+    assert_eq!(roundtrip.status, BackupStatus::Completed);
+}
+
+#[test]
+fn backup_manifest_serializes_failed_status() {
+    use pgcluster::raft::topology::{BackupManifest, BackupStatus};
+    let m = BackupManifest {
+        backup_id: "xyz-456".into(),
+        label: "manual".into(),
+        frequency: "manual".into(),
+        source_node: "pg1".into(),
+        started_at: 2_000_000,
+        completed_at: 2_000_001,
+        size_bytes: 0,
+        s3_uri: "s3://bucket/prefix/manual/xyz-456/".into(),
+        status: BackupStatus::Failed,
+    };
+    let json = serde_json::to_string(&m).unwrap();
+    assert!(json.contains("\"status\":\"failed\""));
+
+    let roundtrip: BackupManifest = serde_json::from_str(&json).unwrap();
+    assert_eq!(roundtrip.status, BackupStatus::Failed);
+}
+
+#[test]
+fn backup_list_response_serializes() {
+    use pgcluster::api::backup::BackupListResponse;
+    use pgcluster::raft::topology::{BackupManifest, BackupStatus};
+    let resp = BackupListResponse {
+        backups: vec![BackupManifest {
+            backup_id: "id-1".into(),
+            label: "weekly-2026-07-01".into(),
+            frequency: "weekly".into(),
+            source_node: "pg2".into(),
+            started_at: 1_000,
+            completed_at: 1_100,
+            size_bytes: 1024,
+            s3_uri: "s3://b/p/weekly/id-1/".into(),
+            status: BackupStatus::Completed,
+        }],
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    assert!(json.contains("\"backups\""));
+    assert!(json.contains("\"id-1\""));
+    assert!(json.contains("\"weekly\""));
+    assert!(json.contains("\"status\":\"completed\""));
+
+    // BackupManifest is Serialize+Deserialize; verify the embedded manifest roundtrips.
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["backups"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed["backups"][0]["frequency"], "weekly");
+}
+
+#[test]
+fn backup_trigger_request_deserializes() {
+    use pgcluster::api::backup::TriggerBackupRequest;
+
+    // With both fields.
+    let json = r#"{"label":"pre-upgrade","frequency":"manual"}"#;
+    let req: TriggerBackupRequest = serde_json::from_str(json).unwrap();
+    assert_eq!(req.label.as_deref(), Some("pre-upgrade"));
+    assert_eq!(req.frequency.as_deref(), Some("manual"));
+
+    // With neither field (both optional).
+    let empty: TriggerBackupRequest = serde_json::from_str("{}").unwrap();
+    assert!(empty.label.is_none());
+    assert!(empty.frequency.is_none());
+}
+
 // ── Integ helpers ─────────────────────────────────────────────────────────────
 
 fn api_url() -> String {

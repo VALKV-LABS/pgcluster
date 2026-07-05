@@ -28,7 +28,9 @@ pub async fn trigger_failover(
             StatusCode::CONFLICT,
             Json(FailoverResponse {
                 triggered: false,
-                message: "a switchover or failover is already in progress — retry after it completes".into(),
+                message:
+                    "a switchover or failover is already in progress — retry after it completes"
+                        .into(),
             }),
         );
     }
@@ -167,7 +169,10 @@ mod tests {
             // flag still true while guard lives
         }
         // guard dropped — flag should now be false
-        assert!(!flag.load(Ordering::SeqCst), "OpGuard must release flag on drop");
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "OpGuard must release flag on drop"
+        );
     }
 
     #[test]

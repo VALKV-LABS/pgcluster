@@ -338,7 +338,9 @@ impl TopologyStateMachine {
 
             TopologyCommand::AddBackupManifest(manifest) => {
                 topology.backups.push(manifest.clone());
-                topology.backups.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
+                topology
+                    .backups
+                    .sort_by_key(|m| std::cmp::Reverse(m.completed_at));
                 topology.backups.truncate(1_000);
             }
 

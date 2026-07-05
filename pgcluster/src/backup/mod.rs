@@ -115,11 +115,7 @@ impl BackupScheduler {
                     continue;
                 };
 
-                let label = format!(
-                    "{}-{}",
-                    freq_str,
-                    chrono::Utc::now().format("%Y-%m-%d")
-                );
+                let label = format!("{}-{}", freq_str, chrono::Utc::now().format("%Y-%m-%d"));
 
                 info!(frequency = %freq_str, source_node, label, "starting scheduled backup");
 
@@ -166,7 +162,7 @@ impl BackupScheduler {
             .cloned()
             .collect();
         // Topology keeps backups sorted most-recent-first; stable.
-        completed.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
+        completed.sort_by_key(|m| std::cmp::Reverse(m.completed_at));
 
         if completed.len() <= retain {
             return;
@@ -197,6 +193,7 @@ impl BackupScheduler {
 ///
 /// Requires `pg_basebackup` to be available on the pgcluster host PATH
 /// (installed via the `postgresql-client` OS package).
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_backup(
     source_node: &str,
     source_addr: &str,
@@ -302,9 +299,9 @@ pub fn build_s3_store(cfg: &S3Config) -> Result<Arc<dyn ObjectStore>> {
         // Path-style addressing: required for MinIO and Ceph.
         builder = builder.with_virtual_hosted_style_request(false);
     }
-    Ok(Arc::new(
-        builder.build().map_err(|e| anyhow::anyhow!("S3 store init failed: {}", e))?,
-    ))
+    Ok(Arc::new(builder.build().map_err(|e| {
+        anyhow::anyhow!("S3 store init failed: {}", e)
+    })?))
 }
 
 /// Delete all objects under the backup's S3 prefix.
@@ -334,10 +331,7 @@ pub async fn delete_from_s3(store: &Arc<dyn ObjectStore>, bucket: &str, s3_uri: 
 /// Pick the best Postgres node to back up from.
 /// Prefers the replica with the smallest replication lag (fewest bytes behind);
 /// falls back to the primary when `prefer_replica` is false or no replica is healthy.
-pub fn select_source(
-    topology: &ClusterTopology,
-    prefer_replica: bool,
-) -> Option<(String, String)> {
+pub fn select_source(topology: &ClusterTopology, prefer_replica: bool) -> Option<(String, String)> {
     if prefer_replica {
         let best = topology
             .node_roles
@@ -416,12 +410,16 @@ fn parse_host_port(addr: &str) -> Result<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::topology::{BackupManifest, BackupStatus, ClusterTopology, NodeConfig, NodeRole};
+    use crate::raft::topology::{
+        BackupManifest, BackupStatus, ClusterTopology, NodeConfig, NodeRole,
+    };
     use std::collections::HashMap;
 
     fn make_topology_with_backups(backups: Vec<BackupManifest>) -> ClusterTopology {
-        let mut t = ClusterTopology::default();
-        t.primary_node_id = "pg1".into();
+        let mut t = ClusterTopology {
+            primary_node_id: "pg1".into(),
+            ..Default::default()
+        };
         t.node_roles.insert("pg1".into(), NodeRole::Primary);
         t.node_roles.insert("pg2".into(), NodeRole::Replica);
         t.node_roles.insert("pg3".into(), NodeRole::Replica);
@@ -473,8 +471,10 @@ mod tests {
 
     #[test]
     fn select_source_falls_back_to_primary_when_no_replicas() {
-        let mut t = ClusterTopology::default();
-        t.primary_node_id = "pg1".into();
+        let mut t = ClusterTopology {
+            primary_node_id: "pg1".into(),
+            ..Default::default()
+        };
         t.node_roles.insert("pg1".into(), NodeRole::Primary);
         t.node_configs.insert(
             "pg1".into(),
@@ -545,10 +545,7 @@ mod tests {
         let now = unix_now();
         let mut failed = completed_manifest("daily", now - 30);
         failed.status = BackupStatus::Failed;
-        let t = make_topology_with_backups(vec![
-            failed,
-            completed_manifest("daily", now - 100),
-        ]);
+        let t = make_topology_with_backups(vec![failed, completed_manifest("daily", now - 100)]);
         // The failed manifest (now - 30) must not count.
         assert_eq!(last_backup_ts(&t, "daily"), Some(now - 100));
     }

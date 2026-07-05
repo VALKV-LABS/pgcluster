@@ -25,6 +25,7 @@ use crate::raft::RaftNode;
 /// 3. Propose `SetPrimary` to Raft so all cluster members update their view.
 /// 4. Record the failover event in Raft history.
 /// 5. Send Demote to all remaining replicas so they repoint to the new primary.
+#[allow(clippy::too_many_arguments)]
 pub async fn trigger_failover(
     raft: &Arc<RaftNode>,
     topology: &ClusterTopology,

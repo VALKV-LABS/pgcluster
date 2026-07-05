@@ -42,7 +42,10 @@ pub async fn verify_promotion(
         let mut client = pool.get_or_connect(node_id, agent_addr).await?;
         match client.get_status().await {
             Ok(status) if !status.is_in_recovery && status.postgres_running => {
-                info!(node_id, attempt, "post-promotion health check passed: node is primary");
+                info!(
+                    node_id,
+                    attempt, "post-promotion health check passed: node is primary"
+                );
                 return Ok(());
             }
             Ok(status) => {

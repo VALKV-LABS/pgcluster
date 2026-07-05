@@ -83,12 +83,17 @@ pub fn router(state: ApiState) -> Router {
                 .route("/config", get(config::get_config))
                 .route(
                     "/maintenance/:node_id",
-                    post(maintenance::enter_maintenance)
-                        .delete(maintenance::exit_maintenance),
+                    post(maintenance::enter_maintenance).delete(maintenance::exit_maintenance),
                 )
                 .route("/pg-hba/reload", post(pg_hba::reload_pg_hba))
-                .route("/backups", get(backup::list_backups).post(backup::trigger_backup))
-                .route("/backups/:backup_id", axum::routing::delete(backup::delete_backup))
+                .route(
+                    "/backups",
+                    get(backup::list_backups).post(backup::trigger_backup),
+                )
+                .route(
+                    "/backups/:backup_id",
+                    axum::routing::delete(backup::delete_backup),
+                )
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     auth::require_auth,

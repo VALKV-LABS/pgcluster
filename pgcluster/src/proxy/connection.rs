@@ -181,9 +181,7 @@ impl ProxyConnection {
                     } else {
                         // Between transactions: disconnect if the proxy is draining
                         // so clients reconnect to the (new) primary after switchover.
-                        if router.is_draining()
-                            && matches!(target, RouteTarget::Primary)
-                        {
+                        if router.is_draining() && matches!(target, RouteTarget::Primary) {
                             write_error_response(
                                 &mut client,
                                 "FATAL",

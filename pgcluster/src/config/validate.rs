@@ -206,6 +206,7 @@ mod tests {
             tls: TlsConfig::default(),
             metrics: MetricsConfig::default(),
             api: ApiConfig::default(),
+            backup: None,
         }
     }
 

@@ -29,10 +29,10 @@ pub async fn list_backups(
     let mut backups: Vec<BackupManifest> = topology
         .backups
         .iter()
-        .filter(|b| q.frequency.as_deref().map_or(true, |f| b.frequency == f))
+        .filter(|b| q.frequency.as_deref().is_none_or(|f| b.frequency == f))
         .cloned()
         .collect();
-    backups.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
+    backups.sort_by_key(|m| std::cmp::Reverse(m.completed_at));
     Json(BackupListResponse { backups })
 }
 
@@ -75,9 +75,7 @@ pub async fn trigger_backup(
     };
 
     let backup_id = uuid::Uuid::new_v4().to_string();
-    let frequency = req
-        .frequency
-        .unwrap_or_else(|| "manual".to_string());
+    let frequency = req.frequency.unwrap_or_else(|| "manual".to_string());
     let label = req
         .label
         .unwrap_or_else(|| format!("manual-{}", &backup_id[..8]));
@@ -92,6 +90,7 @@ pub async fn trigger_backup(
     let bid = backup_id.clone();
     let freq = frequency.clone();
     let lbl = label.clone();
+    let source_node_msg = source_node.clone();
 
     tokio::spawn(async move {
         match execute_backup(
@@ -129,7 +128,7 @@ pub async fn trigger_backup(
             backup_id,
             message: format!(
                 "backup started: frequency={}, label={}, source={}",
-                frequency, label, source_node
+                frequency, label, source_node_msg
             ),
         }),
     ))
@@ -154,7 +153,12 @@ pub async fn delete_backup(
         .iter()
         .find(|b| b.backup_id == backup_id)
         .cloned()
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("backup {} not found", backup_id)))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("backup {} not found", backup_id),
+            )
+        })?;
 
     let store = build_s3_store(&backup_cfg.s3)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

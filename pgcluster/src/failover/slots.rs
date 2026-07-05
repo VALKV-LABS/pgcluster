@@ -77,7 +77,10 @@ pub async fn ensure_slots_for_replicas(
     for node_id in replica_node_ids {
         let slot_name = format!("{}{}", slot_prefix, node_id);
         match ensure_slot_with_pool(&pool, &slot_name).await {
-            Ok(()) => info!(node_id, slot_name, "ensured replication slot on new primary"),
+            Ok(()) => info!(
+                node_id,
+                slot_name, "ensured replication slot on new primary"
+            ),
             Err(e) => warn!(node_id, slot_name, err = %e, "failed to ensure slot on new primary"),
         }
     }

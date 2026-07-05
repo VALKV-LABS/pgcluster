@@ -1,220 +1,264 @@
-# Component: Backup Coordinator (`backup_coordinator`)
+# Component: Backup Coordinator (`backup`)
 
 ## High-Level Function
 
-The backup coordinator manages base backups across the cluster. Rather than running `pg_basebackup` against the primary (which adds load), it directs backup requests to a designated replica. It tracks backup state (in-progress, completed, failed), stores backup manifests, and can optionally stream backups to object storage (S3, GCS, Azure Blob).
+The backup coordinator manages automated, policy-driven base backups of the
+PostgreSQL cluster.  It runs as a background task on every pgcluster node, but
+is active only on the Raft leader to prevent duplicate uploads.
 
-This is a Milestone 2 component. Milestone 1 ships without it.
+Backups are driven by a **schedule policy** (daily / weekly / monthly with
+per-tier retention counts), consistent with how managed PostgreSQL services
+(AWS RDS, GCP Cloud SQL, Azure Database for PostgreSQL) handle automated
+backups.  An S3-compatible object store is **mandatory** — pgcluster refuses to
+start if `[backup]` is configured without a valid `[backup.s3]` section.
 
 ---
 
 ## Architecture
 
-### Backup Strategy
+### Execution Model
 
 ```
-Operator: pgcluster backup create --label "daily-2026-06-19"
+Raft leader (pgcluster)
   │
-  ▼
-1. Select backup source: prefer designated replica → fall back to primary
+  ├── BackupScheduler wakes every hour
+  │     └── checks each frequency tier (daily / weekly / monthly)
+  │           └── if due: select source node → run pg_basebackup → upload to S3
+  │                                           → AddBackupManifest to Raft
+  │                                           → prune old manifests (S3 + Raft)
   │
-  ▼
-2. Call vk-agent::StartBackup() on source node
-   vk-agent executes: pg_basebackup -h localhost -U replicator -F tar -z
-  │
-  ▼
-3. Stream tar output chunks via vk-agent gRPC streaming RPC
-   → pgcluster receives chunks → uploads to object storage OR writes locally
-  │
-  ▼
-4. On completion: store BackupManifest in topology_store (via Raft)
-  │
-  ▼
-5. Emit backup_complete event
+  └── REST API (any node, leader-forwarded)
+        POST /api/backups  → manual backup (returns 202 Accepted)
+        GET  /api/backups  → list manifests (all nodes read from local Raft state)
+        DELETE /api/backups/:id → delete backup (S3 objects + Raft manifest)
 ```
 
-### Backup Manifest
+### Backup Source Selection
+
+To minimise primary write load, pgcluster prefers running `pg_basebackup`
+against the replica with the smallest replication lag.  If no healthy replica
+is available, or `prefer_replica = false`, the primary is used as a fallback.
+
+```
+if prefer_replica:
+    pick replica with min(replica_lag_bytes)   → falls back to primary
+else:
+    primary
+```
+
+### Backup Execution
+
+pgcluster invokes `pg_basebackup` as a subprocess, connecting to the selected
+node's Postgres address over the standard replication protocol:
+
+```bash
+pg_basebackup \
+  -h <host> -p <port> -U <repl_user> \
+  -F tar -z --wal-method=stream \
+  -D <tmpdir> --no-password
+```
+
+`PGPASSWORD` is passed via the environment.  Output is:
+- `base.tar.gz`   — the PGDATA tar archive (compressed)
+- `pg_wal.tar.gz` — WAL segments needed for a consistent restore
+
+Both files are uploaded to S3 under:
+```
+s3://<bucket>/<prefix>/<frequency>/<backup-uuid>/base.tar.gz
+s3://<bucket>/<prefix>/<frequency>/<backup-uuid>/pg_wal.tar.gz
+```
+
+> **Requirement**: `pg_basebackup` must be installed on the pgcluster host
+> (available in the `postgresql-client` OS package).
+
+### Manifest Tracking
+
+Each completed backup produces a `BackupManifest` written to Raft via
+`TopologyCommand::AddBackupManifest`.  Because manifests live in Raft state,
+they survive leader re-elections without re-triggering backups.
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
-    pub backup_id: String,           // UUID
-    pub label: String,
-    pub source_node: String,
-    pub start_lsn: u64,
-    pub end_lsn: u64,
-    pub timeline: u32,
-    pub started_at: i64,
+    pub backup_id: String,      // UUID v4
+    pub label: String,          // "daily-2026-07-04" or operator label
+    pub frequency: String,      // "daily" | "weekly" | "monthly" | "manual"
+    pub source_node: String,    // node_id that served pg_basebackup
+    pub started_at: i64,        // Unix seconds
     pub completed_at: i64,
-    pub size_bytes: u64,
-    pub location: BackupLocation,    // Local path or object storage URI
-    pub sha256: String,              // Checksum of the tar archive
-    pub postgres_version: String,
-    pub status: BackupStatus,
+    pub size_bytes: u64,        // total bytes uploaded
+    pub s3_uri: String,         // "s3://bucket/prefix/frequency/backup-id/"
+    pub status: BackupStatus,   // Completed | Failed
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum BackupLocation {
-    Local { path: PathBuf },
-    S3 { bucket: String, key: String },
-    Gcs { bucket: String, object: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum BackupStatus { InProgress, Completed, Failed }
 ```
 
-### PITR Coordination
+### Retention / Pruning
 
-When a PITR restore is needed, the backup coordinator:
-1. Lists available backups via `pgcluster backup list`
-2. Selects the most recent backup before the target time
-3. Downloads it from object storage to the target node
-4. Configures `recovery_target_time` in `postgresql.auto.conf`
-5. Restores WAL segments from archive to cover the gap to target time
-6. Starts Postgres in recovery mode via vk-agent
+After each successful backup, the scheduler counts completed manifests for that
+frequency tier.  If the count exceeds `retain`, the oldest entries are pruned:
+S3 objects are deleted first, then the manifest is removed from Raft via
+`TopologyCommand::RemoveBackupManifest`.
 
 ---
 
-## Detailed Implementation Plan
+## Configuration
 
-### 1. Module Layout
+```toml
+[backup]
+enabled        = true           # set false to disable without removing config
+prefer_replica = true           # run pg_basebackup on a replica when possible
+
+[backup.s3]
+bucket   = "my-company-pgbackups"
+prefix   = "prod-cluster"       # all keys are under this prefix
+region   = "us-east-1"          # omit to read AWS_REGION env var
+# endpoint = "https://minio.internal"  # MinIO / Ceph / Cloudflare R2
+# path_style = true                     # required for MinIO
+
+[[backup.schedule]]
+frequency = "daily"
+retain    = 7       # keep the 7 most-recent daily backups
+
+[[backup.schedule]]
+frequency = "weekly"
+retain    = 4
+
+[[backup.schedule]]
+frequency = "monthly"
+retain    = 3
+```
+
+### S3 Credentials
+
+Credentials are **not** stored in the config file.  They are read from the
+environment at startup:
+
+| Env var | Purpose |
+|---|---|
+| `AWS_ACCESS_KEY_ID` | Access key (static credentials) |
+| `AWS_SECRET_ACCESS_KEY` | Secret key (static credentials) |
+| `AWS_SESSION_TOKEN` | Session token (temporary credentials) |
+| IAM instance role / IRSA | No env vars needed |
+
+### Schedule Timing
+
+The scheduler wakes every hour and checks whether each tier is due:
+
+| Frequency | Triggers when last backup was… |
+|---|---|
+| `daily` | > 23 hours ago (1-hour slack prevents drift) |
+| `weekly` | > 6 days 23 hours ago |
+| `monthly` | > 28 days ago |
+
+---
+
+## REST API
+
+All endpoints require API key authentication (same as other `/api/*` routes).
+
+### List backups
+
+```http
+GET /api/backups
+GET /api/backups?frequency=daily
+```
+
+Response:
+```json
+{
+  "backups": [
+    {
+      "backup_id": "550e8400-e29b-41d4-a716-446655440000",
+      "label": "daily-2026-07-04",
+      "frequency": "daily",
+      "source_node": "pg2",
+      "started_at": 1751673600,
+      "completed_at": 1751673900,
+      "size_bytes": 2147483648,
+      "s3_uri": "s3://my-bucket/prod-cluster/daily/550e8400-.../",
+      "status": "completed"
+    }
+  ]
+}
+```
+
+### Trigger a manual backup
+
+```http
+POST /api/backups
+Content-Type: application/json
+
+{
+  "label": "pre-upgrade-2026-07-04",
+  "frequency": "manual"
+}
+```
+
+Returns `202 Accepted` immediately; the backup runs in the background.
+
+```json
+{
+  "backup_id": "550e8400-...",
+  "message": "backup started: frequency=manual, label=pre-upgrade-2026-07-04, source=pg2"
+}
+```
+
+### Delete a backup
+
+```http
+DELETE /api/backups/550e8400-e29b-41d4-a716-446655440000
+```
+
+Deletes all S3 objects under the backup's prefix, then removes the manifest
+from Raft.  Returns `204 No Content` on success.
+
+---
+
+## S3 Key Layout
 
 ```
-src/
+<bucket>/
+  <prefix>/
+    daily/
+      <backup-uuid>/
+        base.tar.gz
+        pg_wal.tar.gz
+    weekly/
+      <backup-uuid>/
+        base.tar.gz
+        pg_wal.tar.gz
+    monthly/
+      ...
+    manual/
+      ...
+```
+
+---
+
+## PITR (Point-in-Time Recovery)
+
+PITR restore is a planned future enhancement.  The manifests already carry the
+`started_at` / `completed_at` timestamps needed to select the right base backup
+for a target recovery time.  WAL archiving (continuous WAL streaming to S3) and
+the restore orchestration (`recovery_target_time` config + vk-agent restart) are
+not yet implemented.
+
+---
+
+## Module Layout
+
+```
+pgcluster/src/
   backup/
-    mod.rs              # BackupCoordinator, create_backup(), list_backups()
-    source_selector.rs  # Pick best backup source (prefer replica)
-    stream.rs           # Stream pg_basebackup output via vk-agent gRPC
-    storage.rs          # Object storage upload (S3/GCS/Azure via object_store crate)
-    manifest.rs         # BackupManifest write/read, Raft storage
-    pitr.rs             # PITR restore coordination
+    mod.rs         — BackupScheduler, execute_backup(), S3 helpers, select_source()
+  api/
+    backup.rs      — REST handlers: list, trigger (manual), delete
 ```
 
-### 2. vk-agent Backup RPC Extensions
+Relevant Raft types:
 
-```protobuf
-// Added to agent.proto for Milestone 2:
-service AgentService {
-  // ... existing RPCs ...
-  rpc StartBackup(BackupRequest) returns (stream BackupChunk);
-  rpc AbortBackup(AbortBackupRequest) returns (AbortBackupResponse);
-}
-
-message BackupRequest {
-  string label = 1;
-  bool   fast_checkpoint = 2;
-  bool   compress = 3;
-}
-
-message BackupChunk {
-  bytes  data = 1;       // tar chunk bytes (up to 64KB per message)
-  uint64 bytes_sent = 2;
-  bool   is_final = 3;
-  uint64 start_lsn = 4;  // Set on first chunk
-  uint64 end_lsn = 5;    // Set on final chunk
-  uint32 timeline = 6;
-}
 ```
-
-### 3. BackupCoordinator
-
-```rust
-pub struct BackupCoordinator {
-    topology: Arc<TopologyStore>,
-    agents: Arc<AgentClients>,
-    storage: Arc<dyn BackupStorage>,
-    raft: Arc<PgClusterRaft>,
-    config: BackupConfig,
-}
-
-pub struct BackupConfig {
-    pub preferred_source: BackupSourcePreference,  // Replica | Primary | Any
-    pub compress: bool,
-    pub destination: BackupLocation,
-}
-
-impl BackupCoordinator {
-    pub async fn create_backup(&self, label: &str) -> Result<BackupManifest> {
-        // 1. Select source
-        let source = self.select_source().await?;
-        log::info!("Starting backup '{}' from node {}", label, source);
-
-        // 2. Start backup via vk-agent streaming RPC
-        let backup_id = uuid::Uuid::new_v4().to_string();
-        let mut stream = self.agents.start_backup(&source, label, self.config.compress).await?;
-
-        // 3. Stream to storage
-        let mut hasher = sha2::Sha256::new();
-        let mut size_bytes = 0u64;
-        let mut start_lsn = 0u64;
-        let mut end_lsn = 0u64;
-        let mut timeline = 0u32;
-
-        let writer = self.storage.begin_write(&backup_id).await?;
-        while let Some(chunk) = stream.message().await? {
-            if start_lsn == 0 { start_lsn = chunk.start_lsn; }
-            hasher.update(&chunk.data);
-            size_bytes += chunk.data.len() as u64;
-            writer.write_all(&chunk.data).await?;
-            if chunk.is_final {
-                end_lsn = chunk.end_lsn;
-                timeline = chunk.timeline;
-            }
-        }
-        writer.finish().await?;
-
-        let manifest = BackupManifest {
-            backup_id: backup_id.clone(),
-            label: label.to_string(),
-            source_node: source,
-            start_lsn, end_lsn, timeline,
-            started_at: /* earlier timestamp */,
-            completed_at: unix_now(),
-            size_bytes,
-            location: self.storage.location(&backup_id),
-            sha256: hex::encode(hasher.finalize()),
-            postgres_version: "15".into(),
-            status: BackupStatus::Completed,
-        };
-
-        // 4. Persist manifest via Raft
-        self.raft.propose(TopologyCommand::AddBackupManifest(manifest.clone())).await?;
-        log::info!("Backup '{}' complete: {} bytes, LSN {:#X}..{:#X}", label, size_bytes, start_lsn, end_lsn);
-        Ok(manifest)
-    }
-
-    fn select_source(&self) -> impl Future<Output = Result<String>> {
-        let topology = self.topology.clone();
-        async move {
-            match self.config.preferred_source {
-                BackupSourcePreference::Replica => {
-                    topology.replica_addrs_within_lag(u64::MAX).into_iter().next()
-                        .map(Ok)
-                        .unwrap_or(Ok(topology.current_primary_addr().unwrap()))
-                }
-                BackupSourcePreference::Primary => Ok(topology.current_primary_addr().unwrap()),
-                BackupSourcePreference::Any => Ok(topology.any_healthy_node()),
-            }
-        }
-    }
-}
+pgcluster/src/raft/
+  topology.rs      — BackupManifest, BackupStatus (in ClusterTopology.backups)
+  commands.rs      — AddBackupManifest, RemoveBackupManifest
+  state_machine.rs — apply_command() handles the two new commands
 ```
-
-### 4. CLI Extensions
-
-```bash
-pgcluster backup create --label "pre-upgrade"    # Create backup
-pgcluster backup list                             # List all backups with status
-pgcluster backup delete <backup-id>              # Delete backup + manifest
-pgcluster backup restore <backup-id> --target pg3 --pitr "2026-06-19 08:00:00"
-```
-
-### 5. Integration Points
-
-- `vk_agent` proto is extended with `StartBackup` streaming RPC (Milestone 2).
-- `topology_store` stores `BackupManifest` list (added as a field in `ClusterTopology`).
-- `raft_consensus` adds `TopologyCommand::AddBackupManifest` and `RemoveBackupManifest`.
-- `rest_api` exposes `GET/POST /api/v1/backups` endpoints.
-- `cli` adds `pgcluster backup` subcommand group.
-- Object storage via the `object_store` crate (supports S3, GCS, Azure, local filesystem uniformly).

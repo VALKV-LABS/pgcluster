@@ -1,8 +1,5 @@
 use super::ApiState;
-use crate::raft::{
-    commands::TopologyCommand,
-    topology::NodeRole,
-};
+use crate::raft::{commands::TopologyCommand, topology::NodeRole};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -39,7 +36,8 @@ pub async fn enter_maintenance(
             StatusCode::BAD_REQUEST,
             Json(MaintenanceResponse {
                 success: false,
-                message: "cannot put the current primary into maintenance — switchover first".into(),
+                message: "cannot put the current primary into maintenance — switchover first"
+                    .into(),
             }),
         );
     }
@@ -150,7 +148,10 @@ mod tests {
 
     #[test]
     fn primary_cannot_enter_maintenance() {
-        let t = topology_with_roles("pg1", &[("pg1", NodeRole::Primary), ("pg2", NodeRole::Replica)]);
+        let t = topology_with_roles(
+            "pg1",
+            &[("pg1", NodeRole::Primary), ("pg2", NodeRole::Replica)],
+        );
         // Simulate the guard: primary should be rejected
         assert_eq!(t.primary_node_id, "pg1");
     }
@@ -170,12 +171,19 @@ mod tests {
 
         // Only Replica nodes are candidates — pg3 in Maintenance is excluded
         let candidate = t.best_failover_candidate("pg1");
-        assert_eq!(candidate.as_deref(), Some("pg2"), "maintenance node should not be a failover candidate");
+        assert_eq!(
+            candidate.as_deref(),
+            Some("pg2"),
+            "maintenance node should not be a failover candidate"
+        );
     }
 
     #[test]
     fn exit_maintenance_requires_maintenance_role() {
-        let t = topology_with_roles("pg1", &[("pg1", NodeRole::Primary), ("pg2", NodeRole::Replica)]);
+        let t = topology_with_roles(
+            "pg1",
+            &[("pg1", NodeRole::Primary), ("pg2", NodeRole::Replica)],
+        );
         // pg2 is Replica, not Maintenance — exit_maintenance should reject
         assert_ne!(
             t.node_roles.get("pg2"),

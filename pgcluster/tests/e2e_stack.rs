@@ -121,8 +121,7 @@ async fn wait_for_new_primary(api: &str, old_primary: &str, timeout: Duration) -
 async fn e2e_switchover_and_failover() {
     let skip_build = std::env::var("E2E_SKIP_BUILD").as_deref() == Ok("1");
     let no_teardown = std::env::var("E2E_NO_TEARDOWN").as_deref() == Ok("1");
-    let api = std::env::var("E2E_API_URL")
-        .unwrap_or_else(|_| DEFAULT_API.to_string());
+    let api = std::env::var("E2E_API_URL").unwrap_or_else(|_| DEFAULT_API.to_string());
 
     // ── Step 1: Start the stack ───────────────────────────────────────────────
     eprintln!("==> Starting e2e stack...");
@@ -144,7 +143,10 @@ async fn e2e_switchover_and_failover() {
     eprintln!("==> Primary: {original_primary}  topology_version: {topo_version}");
 
     assert!(!original_primary.is_empty(), "primary_node_id is empty");
-    assert!(topo_version > 0, "topology_version should be > 0 after bootstrap");
+    assert!(
+        topo_version > 0,
+        "topology_version should be > 0 after bootstrap"
+    );
 
     // ── Step 3: Verify topology lists 3 nodes ────────────────────────────────
     let client = reqwest::Client::builder()
@@ -159,7 +161,9 @@ async fn e2e_switchover_and_failover() {
         .json()
         .await
         .expect("parse topology JSON");
-    let node_configs = topo["node_configs"].as_object().expect("node_configs must be an object");
+    let node_configs = topo["node_configs"]
+        .as_object()
+        .expect("node_configs must be an object");
     assert_eq!(
         node_configs.len(),
         3,
@@ -254,8 +258,7 @@ async fn e2e_switchover_and_failover() {
 
     // Wait for failover: a different primary must emerge.
     eprintln!("==> Waiting for automatic failover...");
-    let failover_primary =
-        wait_for_new_primary(&api, &new_primary, Duration::from_secs(90)).await;
+    let failover_primary = wait_for_new_primary(&api, &new_primary, Duration::from_secs(90)).await;
     assert_ne!(
         failover_primary, new_primary,
         "failover primary must differ from the killed node"
@@ -272,7 +275,10 @@ async fn e2e_switchover_and_failover() {
         .await
         .expect("parse failover history");
     let events = history.as_array().unwrap_or(&vec![]).len();
-    assert!(events > 0, "failover history should be non-empty after a failover");
+    assert!(
+        events > 0,
+        "failover history should be non-empty after a failover"
+    );
     eprintln!("==> Failover history has {events} event(s)");
 
     // ── Step 6: Teardown ─────────────────────────────────────────────────────
@@ -291,8 +297,7 @@ async fn e2e_switchover_and_failover() {
 #[ignore = "requires Docker daemon"]
 async fn e2e_cluster_forms_and_has_primary() {
     let skip_build = std::env::var("E2E_SKIP_BUILD").as_deref() == Ok("1");
-    let api = std::env::var("E2E_API_URL")
-        .unwrap_or_else(|_| DEFAULT_API.to_string());
+    let api = std::env::var("E2E_API_URL").unwrap_or_else(|_| DEFAULT_API.to_string());
 
     // Start the stack.
     if skip_build {
@@ -317,8 +322,7 @@ async fn e2e_cluster_forms_and_has_primary() {
 #[tokio::test]
 #[ignore = "requires Docker e2e stack (make start) with E2E_STACK_ADDR or localhost:8009"]
 async fn e2e_switchover_against_running_stack() {
-    let api = std::env::var("E2E_API_URL")
-        .unwrap_or_else(|_| DEFAULT_API.to_string());
+    let api = std::env::var("E2E_API_URL").unwrap_or_else(|_| DEFAULT_API.to_string());
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))

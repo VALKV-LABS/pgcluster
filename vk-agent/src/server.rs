@@ -60,7 +60,9 @@ impl AgentService for AgentServiceImpl {
             tracing::warn!("promote RPC rejected: agent is in safe mode (heartbeat lost)");
             return Ok(Response::new(PromoteResponse {
                 success: false,
-                error: "safe mode: pgcluster heartbeat lost — promote rejected to prevent split-brain".into(),
+                error:
+                    "safe mode: pgcluster heartbeat lost — promote rejected to prevent split-brain"
+                        .into(),
                 promoted_at_lsn: 0,
                 new_timeline: 0,
             }));
@@ -108,8 +110,7 @@ impl AgentService for AgentServiceImpl {
 
         // Write new primary_conninfo and slot_name to postgresql.auto.conf.
         if !req.new_primary_conninfo.is_empty() {
-            let (conninfo, maybe_password) =
-                extract_conninfo_password(&req.new_primary_conninfo);
+            let (conninfo, maybe_password) = extract_conninfo_password(&req.new_primary_conninfo);
 
             // If the conninfo carried a password, persist it to .pgpass and use
             // passfile= so the password is never stored in the config file.
@@ -121,9 +122,15 @@ impl AgentService for AgentServiceImpl {
                 let user = conninfo_value(&req.new_primary_conninfo, "user")
                     .unwrap_or_else(|| "*".to_string());
 
-                if let Err(e) =
-                    crate::files::write_pgpass(data_dir, &host, &port, "replication", &user, &password)
-                        .await
+                if let Err(e) = crate::files::write_pgpass(
+                    data_dir,
+                    &host,
+                    &port,
+                    "replication",
+                    &user,
+                    &password,
+                )
+                .await
                 {
                     return Ok(Response::new(DemoteResponse {
                         success: false,
@@ -336,7 +343,9 @@ fn extract_conninfo_password(conninfo: &str) -> (String, Option<String>) {
 fn conninfo_value(conninfo: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
     conninfo.split_whitespace().find_map(|token| {
-        token.strip_prefix(&prefix).map(|v| v.trim_matches('\'').to_string())
+        token
+            .strip_prefix(&prefix)
+            .map(|v| v.trim_matches('\'').to_string())
     })
 }
 
