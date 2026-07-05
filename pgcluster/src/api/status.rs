@@ -60,8 +60,49 @@ pub async fn cluster_status(State(s): State<ApiState>) -> Json<ClusterStatusResp
     })
 }
 
-pub async fn topology(State(s): State<ApiState>) -> Json<crate::raft::topology::ClusterTopology> {
-    Json(s.topology.borrow().clone())
+/// Format a Unix-seconds timestamp as RFC 3339 (UTC, no external deps).
+pub fn unix_to_rfc3339(secs: i64) -> String {
+    if secs < 0 {
+        return "1970-01-01T00:00:00Z".into();
+    }
+    let s = secs as u64;
+    let sec = s % 60;
+    let min = (s / 60) % 60;
+    let hour = (s / 3600) % 24;
+    let days = s / 86400;
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y:04}-{mo:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    (y, mo, d)
+}
+
+pub async fn topology(State(s): State<ApiState>) -> Json<serde_json::Value> {
+    let topo = s.topology.borrow().clone();
+    // Serialize topology to JSON, then rewrite failover_history timestamps to RFC 3339.
+    let mut json = serde_json::to_value(&topo).unwrap_or(serde_json::Value::Null);
+    if let Some(history) = json
+        .get_mut("failover_history")
+        .and_then(|h| h.as_array_mut())
+    {
+        for event in history.iter_mut() {
+            if let Some(ts) = event.get("triggered_at").and_then(|t| t.as_i64()) {
+                event["triggered_at"] = serde_json::Value::String(unix_to_rfc3339(ts));
+            }
+        }
+    }
+    Json(json)
 }
 
 #[cfg(test)]

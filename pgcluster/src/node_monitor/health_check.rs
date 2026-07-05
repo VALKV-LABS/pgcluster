@@ -18,6 +18,9 @@ pub struct HealthCheckResult {
     pub replay_lsn: u64,
     pub timeline: u32,
     pub pg_running: bool,
+    /// The `conninfo` string from `pg_stat_wal_receiver` (standby only; empty on primary).
+    /// Used to detect a stale `primary_conninfo` after failover.
+    pub replication_conninfo: String,
 }
 
 // ── check_node ────────────────────────────────────────────────────────────────
@@ -59,6 +62,7 @@ pub async fn check_node(
                 replay_lsn: status.replayed_lsn,
                 timeline: status.timeline,
                 pg_running: status.postgres_running,
+                replication_conninfo: status.replication_conninfo,
             }
         }
         Err(e) => {
@@ -79,5 +83,6 @@ fn unreachable_result(node_id: &str) -> HealthCheckResult {
         replay_lsn: 0,
         timeline: 0,
         pg_running: false,
+        replication_conninfo: String::new(),
     }
 }

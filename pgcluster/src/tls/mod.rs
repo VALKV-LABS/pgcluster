@@ -24,6 +24,10 @@ use crate::config::TlsConfig;
 pub struct TlsManager {
     client_tls: Arc<rustls::ClientConfig>,
     server_tls: Arc<rustls::ServerConfig>,
+    /// Raw PEM bytes kept so callers can build tonic/tokio-rustls handles.
+    ca_pem: Vec<u8>,
+    cert_pem: Vec<u8>,
+    key_pem: Vec<u8>,
 }
 
 impl TlsManager {
@@ -67,7 +71,15 @@ impl TlsManager {
         Ok(Self {
             client_tls: Arc::new(client_tls),
             server_tls: Arc::new(server_tls),
+            ca_pem: ca_cert_pem,
+            cert_pem,
+            key_pem,
         })
+    }
+
+    /// PEM-encoded CA certificate used to verify peer/client certificates.
+    pub fn ca_cert_pem(&self) -> &[u8] {
+        &self.ca_pem
     }
 
     /// Returns a `TlsAcceptor` for incoming client / peer connections.
@@ -80,6 +92,25 @@ impl TlsManager {
         TlsConnector::from(Arc::clone(&self.client_tls))
     }
 
+    /// Returns a clone of the underlying `rustls::ServerConfig` for use with
+    /// low-level rustls integrations.
+    pub fn server_rustls_config(&self) -> Arc<rustls::ServerConfig> {
+        Arc::clone(&self.server_tls)
+    }
+
+    /// Returns a clone of the underlying `rustls::ClientConfig` for use with
+    /// low-level rustls integrations.
+    pub fn client_rustls_config(&self) -> Arc<rustls::ClientConfig> {
+        Arc::clone(&self.client_tls)
+    }
+
+    /// Build a tonic `ServerTlsConfig` using the stored cert+key PEM.
+    pub fn tonic_server_tls_config(&self) -> tonic::transport::ServerTlsConfig {
+        let identity =
+            tonic::transport::Identity::from_pem(&self.cert_pem, &self.key_pem);
+        tonic::transport::ServerTlsConfig::new().identity(identity)
+    }
+
     /// Dev-mode: creates configs that skip certificate verification entirely.
     ///
     /// **Never use in production.**
@@ -89,6 +120,9 @@ impl TlsManager {
         Self {
             client_tls: Arc::new(client_tls),
             server_tls: Arc::new(server_tls),
+            ca_pem: Vec::new(),
+            cert_pem: Vec::new(),
+            key_pem: Vec::new(),
         }
     }
 }

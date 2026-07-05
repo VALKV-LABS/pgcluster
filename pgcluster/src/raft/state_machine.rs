@@ -335,6 +335,16 @@ impl TopologyStateMachine {
                     .replica_slots
                     .insert(node_id.clone(), slot_name.clone());
             }
+
+            TopologyCommand::AddBackupManifest(manifest) => {
+                topology.backups.push(manifest.clone());
+                topology.backups.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
+                topology.backups.truncate(1_000);
+            }
+
+            TopologyCommand::RemoveBackupManifest { backup_id } => {
+                topology.backups.retain(|b| &b.backup_id != backup_id);
+            }
         }
     }
 }

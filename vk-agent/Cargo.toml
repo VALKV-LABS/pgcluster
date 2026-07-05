@@ -32,6 +32,7 @@ rustls           = { version = "0.23", features = ["ring"] }
 rustls-pki-types = "1"
 tokio-rustls     = "0.26"
 rustls-pemfile   = "2"
+rcgen            = { version = "0.13", features = ["pem"] }
 
 # Postgres
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls"] }

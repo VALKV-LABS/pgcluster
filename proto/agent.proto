@@ -63,6 +63,10 @@ message StatusResponse {
   bool   postgres_running   = 8;
   // Populated on primary: rows from pg_stat_replication
   repeated ReplicaStatus replicas = 9;
+  // Standby only: conninfo string from pg_stat_wal_receiver.conninfo.
+  // Empty when this node is the primary or when WAL receiver is not running.
+  // Used by node_monitor to detect a stale primary_conninfo after failover.
+  string replication_conninfo = 10;
 }
 
 message ReplicaStatus {

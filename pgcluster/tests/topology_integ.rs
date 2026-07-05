@@ -86,10 +86,12 @@ fn lsn_parse_format_roundtrip() {
 }
 
 #[test]
-fn failover_history_capped_at_10() {
-    use pgcluster::raft::topology::FailoverEvent;
+fn failover_history_capped_at_max() {
+    use pgcluster::raft::topology::{FailoverEvent, ClusterTopology};
+    let cap = ClusterTopology::FAILOVER_HISTORY_MAX;
     let mut t = ClusterTopology::default();
-    for i in 0u32..15 {
+    // Insert cap+5 events — only the most recent `cap` should be retained.
+    for i in 0u32..(cap as u32 + 5) {
         t.record_failover(FailoverEvent {
             old_primary: "pg1".into(),
             new_primary: format!("pg{}", i + 2),
@@ -98,7 +100,12 @@ fn failover_history_capped_at_10() {
             reason: "test".into(),
         });
     }
-    assert_eq!(t.failover_history.len(), 10);
-    // Most recent should be the last inserted
-    assert_eq!(t.failover_history.back().unwrap().triggered_at, 14);
+    assert_eq!(t.failover_history.len(), cap);
+    // Most recent should be the last inserted.
+    assert_eq!(
+        t.failover_history.back().unwrap().triggered_at,
+        (cap as i64 + 4)
+    );
+    // Oldest should be entry number 5 (the first 5 were evicted).
+    assert_eq!(t.failover_history.front().unwrap().triggered_at, 5);
 }

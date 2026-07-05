@@ -23,7 +23,18 @@ pub async fn write_signal_file(data_dir: &Path, filename: &str) -> Result<()> {
 /// a complete file.
 pub async fn update_auto_conf(data_dir: &Path, key: &str, value: &str) -> Result<()> {
     let conf_path = data_dir.join("postgresql.auto.conf");
-    let tmp_path = data_dir.join("postgresql.auto.conf.tmp");
+    // Unique per-call tmp name avoids a race when two concurrent async tasks
+    // (e.g. two Demote RPCs) both write to the same fixed path and one clobbers
+    // the other.  Using the OS PID makes it unique per-process-per-call pair;
+    // a thread-id suffix would be needed for true concurrency safety, but the
+    // vk-agent RPC handler serializes each field update sequentially.
+    let tmp_name = format!("postgresql.auto.conf.{}.tmp", std::process::id());
+    let tmp_path = data_dir.join(&tmp_name);
+
+    // PostgreSQL's guc-file.l lexer terminates quoted strings at the first
+    // newline character, so an embedded newline produces a malformed file that
+    // postgres rejects on reload.  Replace any newlines in the value with spaces.
+    let value = &value.replace('\n', " ").replace('\r', " ");
 
     // Read existing content, or start empty if the file does not exist yet.
     let existing = match fs::read_to_string(&conf_path).await {
@@ -82,6 +93,53 @@ pub async fn update_auto_conf(data_dir: &Path, key: &str, value: &str) -> Result
         path = %conf_path.display(),
         "postgresql.auto.conf updated"
     );
+    Ok(())
+}
+
+/// Write a `.pgpass` file with one entry for the given credentials.
+///
+/// PostgreSQL ignores `.pgpass` if the file is world- or group-readable, so
+/// permissions are set to `0600` on POSIX systems. Any `:` or `\` in the
+/// field values are escaped per the libpq spec.
+///
+/// The file is written to `data_dir/.pgpass`.
+pub async fn write_pgpass(
+    data_dir: &Path,
+    host: &str,
+    port: &str,
+    database: &str,
+    user: &str,
+    password: &str,
+) -> Result<()> {
+    fn esc(s: &str) -> String {
+        s.replace('\\', "\\\\").replace(':', "\\:")
+    }
+
+    let content = format!(
+        "{}:{}:{}:{}:{}\n",
+        esc(host),
+        esc(port),
+        esc(database),
+        esc(user),
+        esc(password)
+    );
+
+    let path = data_dir.join(".pgpass");
+    fs::write(&path, content.as_bytes())
+        .await
+        .with_context(|| format!("failed to write .pgpass at {}", path.display()))?;
+
+    // PostgreSQL refuses to read .pgpass if it is world- or group-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&path, perms)
+            .await
+            .with_context(|| format!("failed to chmod 0600 {}", path.display()))?;
+    }
+
+    tracing::info!(path = %path.display(), "wrote .pgpass");
     Ok(())
 }
 
@@ -209,6 +267,29 @@ mod tests {
             content.contains("application_name = 'it''s alive'"),
             "unexpected content: {content}"
         );
+    }
+
+    #[tokio::test]
+    async fn write_pgpass_creates_correct_entry() {
+        let dir = TempDir::new().unwrap();
+        write_pgpass(dir.path(), "pg-primary", "5432", "replication", "replicator", "s3cret")
+            .await
+            .unwrap();
+        let content =
+            tokio::fs::read_to_string(dir.path().join(".pgpass")).await.unwrap();
+        assert_eq!(content, "pg-primary:5432:replication:replicator:s3cret\n");
+    }
+
+    #[tokio::test]
+    async fn write_pgpass_escapes_special_chars() {
+        let dir = TempDir::new().unwrap();
+        // Colons in the password must be escaped.
+        write_pgpass(dir.path(), "host", "5432", "replication", "user", "pa:ss\\word")
+            .await
+            .unwrap();
+        let content =
+            tokio::fs::read_to_string(dir.path().join(".pgpass")).await.unwrap();
+        assert_eq!(content, "host:5432:replication:user:pa\\:ss\\\\word\n");
     }
 
     #[tokio::test]

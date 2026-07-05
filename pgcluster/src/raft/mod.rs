@@ -96,7 +96,10 @@ pub struct RaftNode {
 impl RaftNode {
     /// Start the Raft node: open log store, build state machine, wire network,
     /// optionally bootstrap.
-    pub async fn start(cfg: &PgClusterConfig) -> Result<Self> {
+    ///
+    /// Pass a PEM-encoded CA certificate in `raft_ca_pem` to encrypt peer
+    /// gRPC connections with TLS. `None` → plaintext (dev/test default).
+    pub async fn start(cfg: &PgClusterConfig, raft_ca_pem: Option<Vec<u8>>) -> Result<Self> {
         let raft_config = Arc::new(
             OpenRaftConfig {
                 heartbeat_interval: cfg.raft.heartbeat_interval_ms,
@@ -142,7 +145,7 @@ impl RaftNode {
         let raft = openraft::Raft::new(
             cfg.raft.node_id,
             raft_config,
-            PgClusterNetworkFactory,
+            PgClusterNetworkFactory::new(raft_ca_pem),
             log_adaptor,
             sm_adaptor,
         )

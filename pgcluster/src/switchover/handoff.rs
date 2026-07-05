@@ -1,9 +1,11 @@
 use anyhow::Result;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
 use tracing::info;
 
 use crate::agent_clients::AgentClientPool;
+use crate::proxy::Router as ProxyRouter;
 use crate::raft::commands::TopologyCommand;
 use crate::raft::topology::ClusterTopology;
 use crate::raft::RaftNode;
@@ -31,7 +33,11 @@ pub async fn execute_switchover(
     pool: &Arc<AgentClientPool>,
     replication_user: &str,
     replication_password: &str,
+    proxy_drain: Option<&Arc<ProxyRouter>>,
+    drain_timeout: Duration,
+    slot_prefix: &str,
 ) -> Result<()> {
+    let started = Instant::now();
     let old_primary_id = &topology.primary_node_id;
 
     let old_cfg = topology
@@ -51,6 +57,18 @@ pub async fn execute_switchover(
         "starting planned switchover"
     );
 
+    // ── Step 0: Drain proxy connections ─────────────────────────────────────
+    // Signal the proxy to refuse new connections to the primary, then wait for
+    // in-flight transactions to complete before touching Postgres.
+    if let Some(r) = proxy_drain {
+        r.begin_drain();
+        info!(
+            secs = drain_timeout.as_secs_f32(),
+            "waiting for in-flight transactions to drain"
+        );
+        tokio::time::sleep(drain_timeout).await;
+    }
+
     let new_host = new_cfg
         .postgres_addr
         .split(':')
@@ -60,7 +78,6 @@ pub async fn execute_switchover(
         "host={} port=5432 user={} password={}",
         new_host, replication_user, replication_password
     );
-    let slot_prefix = "pgcluster_";
 
     // ── Step 1: Demote current primary ───────────────────────────────────────
     // Writes standby.signal + primary_conninfo to PGDATA.  The running postgres
@@ -98,9 +115,25 @@ pub async fn execute_switchover(
             );
         }
         info!(node_id = new_primary_id, "new primary promoted");
-        // Give postgres a moment to finish the promotion before we update Raft.
-        tokio::time::sleep(Duration::from_millis(600)).await;
     }
+
+    // ── Step 2b: Verify promotion completed ──────────────────────────────────
+    // Poll GetStatus until is_in_recovery == false (up to 3 times, 500 ms apart).
+    crate::failover::promote::verify_promotion(
+        new_primary_id,
+        &new_cfg.agent_addr,
+        pool,
+        3,
+        Duration::from_millis(500),
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "post-promotion health check failed for {}: {} — aborting switchover",
+            new_primary_id,
+            e
+        )
+    })?;
 
     // ── Step 3: Propose SetPrimary to Raft ───────────────────────────────────
     // Done BEFORE stopping the old primary so that if node_monitor sees the
@@ -120,6 +153,13 @@ pub async fn execute_switchover(
         .await
         .map_err(|e| anyhow::anyhow!("Raft propose SetPrimary: {e}"))?;
     info!(new = new_primary_id, "Raft topology updated");
+
+    // End drain after the topology update: new connections now route to the
+    // new primary. This must happen AFTER the Raft write so that the router's
+    // `primary_addr()` already returns the new primary's address.
+    if let Some(r) = proxy_drain {
+        r.end_drain();
+    }
 
     // ── Step 4: Stop old primary so Docker restarts it as a standby ──────────
     // Raft already records the new primary (step 3), so node_monitor will see
@@ -206,9 +246,28 @@ pub async fn execute_switchover(
         }
     }
 
+    // Record the switchover in Raft failover history so /api/failover/history
+    // shows operator-initiated role changes alongside automatic failovers.
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let triggered_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let _ = raft
+        .raft
+        .client_write(TopologyCommand::RecordFailover {
+            old_primary: old_primary_id.clone(),
+            new_primary: new_primary_id.to_string(),
+            triggered_at,
+            duration_ms,
+            reason: "planned_switchover".to_string(),
+        })
+        .await;
+
     info!(
         old = old_primary_id,
         new = new_primary_id,
+        duration_ms,
         "switchover complete"
     );
     Ok(())
