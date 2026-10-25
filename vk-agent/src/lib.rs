@@ -4,3 +4,4 @@ pub mod heartbeat;
 pub mod postgres;
 pub mod process;
 pub mod server;
+pub mod tls;

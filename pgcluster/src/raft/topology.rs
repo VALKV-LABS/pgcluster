@@ -35,6 +35,31 @@ pub struct NodeConfig {
     pub tags: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupStatus {
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupManifest {
+    pub backup_id: String,
+    /// Human-readable label, e.g. "daily-2026-07-04" or operator-provided.
+    pub label: String,
+    /// "daily" | "weekly" | "monthly" | "manual"
+    pub frequency: String,
+    /// Node ID of the postgres instance that served pg_basebackup.
+    pub source_node: String,
+    pub started_at: i64,
+    pub completed_at: i64,
+    /// Total bytes uploaded across all tar files.
+    pub size_bytes: u64,
+    /// S3 URI prefix for this backup, e.g. "s3://bucket/prefix/daily/backup-id/".
+    pub s3_uri: String,
+    pub status: BackupStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailoverEvent {
     pub old_primary: String,
@@ -66,6 +91,9 @@ pub struct ClusterTopology {
     pub node_configs: HashMap<String, NodeConfig>,
     /// Last 10 failover events
     pub failover_history: VecDeque<FailoverEvent>,
+    /// All known backup manifests, sorted most-recent first. Capped at 1 000.
+    #[serde(default)]
+    pub backups: Vec<BackupManifest>,
     /// Monotonically increasing version; incremented on every command
     pub version: u64,
     /// Unix seconds of last topology change
@@ -135,10 +163,13 @@ impl ClusterTopology {
         candidates.first().map(|(id, _)| (*id).clone())
     }
 
-    /// Append a failover event, keeping only the last 10.
+    /// Maximum number of failover events kept in history.
+    pub const FAILOVER_HISTORY_MAX: usize = 100;
+
+    /// Append a failover event, keeping only the last `FAILOVER_HISTORY_MAX`.
     pub fn record_failover(&mut self, event: FailoverEvent) {
         self.failover_history.push_back(event);
-        while self.failover_history.len() > 10 {
+        while self.failover_history.len() > Self::FAILOVER_HISTORY_MAX {
             self.failover_history.pop_front();
         }
     }

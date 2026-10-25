@@ -18,10 +18,10 @@ use axum::{
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use crate::{config::ProxyConfig, metrics_registry::Metrics, raft::TopologyWatch, tls::TlsManager};
+use crate::{config::ProxyConfig, metrics_registry::Metrics, tls::TlsManager};
 
 use pool::ConnectionPool;
-use router::Router;
+pub use router::Router;
 
 // ── ProxyServer ───────────────────────────────────────────────────────────────
 
@@ -35,14 +35,19 @@ pub struct ProxyServer {
 }
 
 impl ProxyServer {
+    /// Create a new proxy server using a pre-built (shared) `Router`.
+    ///
+    /// The `Router` is constructed in `lib.rs` so that the same instance can
+    /// be shared with `ApiState`, allowing the switchover code to call
+    /// `router.begin_drain()` / `router.end_drain()` without going through the
+    /// proxy server directly.
     pub fn new(
         config: ProxyConfig,
-        topology: TopologyWatch,
+        router: Arc<Router>,
         tls: Option<Arc<TlsManager>>,
         metrics: Arc<Metrics>,
     ) -> Self {
         let pool = Arc::new(ConnectionPool::new(config.pool.clone()));
-        let router = Arc::new(Router::new(topology, config.read_routing.clone()));
 
         Self {
             config,

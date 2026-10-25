@@ -3,8 +3,10 @@ name     = "pgcluster-e2e"
 data_dir = "/var/lib/pgcluster/node1"
 
 [raft]
-node_id   = 1
-bootstrap = true
+node_id               = 1
+bootstrap             = true
+heartbeat_interval_ms = 150
+election_timeout_ms   = 500
 
 [[raft.peers]]
 id   = 1

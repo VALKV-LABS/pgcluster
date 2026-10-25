@@ -51,9 +51,17 @@ pub struct AgentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentTlsConfig {
+    /// PEM-encoded CA certificate file path used to verify pgcluster client
+    /// certs (mTLS). Leave empty to skip client cert verification.
     pub ca_cert: Option<String>,
+    /// PEM-encoded server certificate file path.
     pub cert: Option<String>,
+    /// PEM-encoded server private key file path.
     pub key: Option<String>,
+    /// If `true`, generate a self-signed cert in `data_dir/certs/` on first
+    /// start (dev/test mode). Ignored when `cert` + `key` are set.
+    #[serde(default)]
+    pub auto_generate: bool,
 }
 
 fn default_listen() -> String {

@@ -24,11 +24,13 @@ pub struct AgentClient {
 impl AgentClient {
     /// Open a direct gRPC connection (bypasses the pool).
     pub async fn connect(_node_id: &str, addr: &str) -> Result<Self> {
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", addr))
-            .with_context(|| format!("invalid agent addr: {addr}"))?
-            .connect()
-            .await
-            .with_context(|| format!("connect to vk-agent at {addr}"))?;
+        let channel = make_channel(addr, None).await?;
+        Ok(Self::from_channel(addr, channel))
+    }
+
+    /// Open a direct TLS connection, verifying the server cert against `ca_pem`.
+    pub async fn connect_tls(_node_id: &str, addr: &str, ca_pem: &[u8]) -> Result<Self> {
+        let channel = make_channel(addr, Some(ca_pem)).await?;
         Ok(Self::from_channel(addr, channel))
     }
 
@@ -101,6 +103,15 @@ impl AgentClient {
             .with_context(|| format!("StopPostgres at {}", self.addr))
             .map(|r| r.into_inner())
     }
+
+    /// Reload the Postgres configuration on this node (SIGHUP / pg_ctl reload).
+    pub async fn reload_config(&mut self) -> Result<agent_proto::ReloadResponse> {
+        self.stub
+            .reload_config(tonic::Request::new(agent_proto::ReloadRequest {}))
+            .await
+            .with_context(|| format!("ReloadConfig at {}", self.addr))
+            .map(|r| r.into_inner())
+    }
 }
 
 // ── AgentClientPool ───────────────────────────────────────────────────────────
@@ -114,14 +125,30 @@ impl AgentClient {
 ///
 /// Interior mutability via [`dashmap::DashMap`] makes the pool `Sync` so it can
 /// be shared across tasks behind an `Arc`.
+///
+/// Optionally constructed with a PEM-encoded CA certificate to verify agent
+/// server certificates (TLS). When no CA is provided, connections are plaintext.
 pub struct AgentClientPool {
     channels: DashMap<String, tonic::transport::Channel>,
+    /// CA certificate PEM used to verify agent TLS certs.
+    /// `None` → plaintext connections (default).
+    ca_pem: Option<Vec<u8>>,
 }
 
 impl AgentClientPool {
+    /// Create a pool that connects to agents over plaintext (default).
     pub fn new() -> Self {
         Self {
             channels: DashMap::new(),
+            ca_pem: None,
+        }
+    }
+
+    /// Create a pool that uses TLS, verifying agent certs against `ca_pem`.
+    pub fn new_with_ca(ca_pem: Vec<u8>) -> Self {
+        Self {
+            channels: DashMap::new(),
+            ca_pem: Some(ca_pem),
         }
     }
 
@@ -134,11 +161,7 @@ impl AgentClientPool {
         if let Some(ch) = self.channels.get(node_id) {
             return Ok(AgentClient::from_channel(addr, ch.value().clone()));
         }
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://{}", addr))
-            .with_context(|| format!("invalid agent addr: {addr}"))?
-            .connect()
-            .await
-            .with_context(|| format!("connect to vk-agent {node_id} at {addr}"))?;
+        let channel = make_channel(addr, self.ca_pem.as_deref()).await?;
         self.channels.insert(node_id.to_string(), channel.clone());
         Ok(AgentClient::from_channel(addr, channel))
     }
@@ -155,4 +178,31 @@ impl Default for AgentClientPool {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── Channel builder ───────────────────────────────────────────────────────────
+
+async fn make_channel(addr: &str, ca_pem: Option<&[u8]>) -> Result<tonic::transport::Channel> {
+    let (scheme, tls_cfg) = if let Some(pem) = ca_pem {
+        let ca = tonic::transport::Certificate::from_pem(pem);
+        let cfg = tonic::transport::ClientTlsConfig::new().ca_certificate(ca);
+        ("https", Some(cfg))
+    } else {
+        ("http", None)
+    };
+
+    let url = format!("{scheme}://{addr}");
+    let mut endpoint = tonic::transport::Endpoint::from_shared(url)
+        .with_context(|| format!("invalid agent addr: {addr}"))?;
+
+    if let Some(cfg) = tls_cfg {
+        endpoint = endpoint
+            .tls_config(cfg)
+            .with_context(|| format!("set TLS config for {addr}"))?;
+    }
+
+    endpoint
+        .connect()
+        .await
+        .with_context(|| format!("connect to vk-agent at {addr}"))
 }

@@ -104,6 +104,11 @@ pub async fn remove_node(
     State(s): State<ApiState>,
     Path(node_id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // Evict the cached gRPC channel before the Raft write so that any
+    // concurrent task that calls get_or_connect after this point opens a
+    // fresh connection.  If the node is later re-added with the same ID but
+    // a different agent_addr, the pool won't return the stale channel.
+    s.pool.remove(&node_id);
     let cmd = TopologyCommand::RemoveNode { node_id };
     s.raft
         .raft

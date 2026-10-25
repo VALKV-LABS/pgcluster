@@ -93,6 +93,18 @@ impl ProxyConnection {
         };
 
         // ── 3. Auth pass-through to the primary ───────────────────────────
+        // Refuse new connections while the proxy is draining (switchover in progress).
+        if router.is_draining() {
+            write_error_response(
+                &mut client,
+                "FATAL",
+                "57P01",
+                "server is draining connections for a planned switchover; reconnect shortly",
+            )
+            .await?;
+            return Ok(());
+        }
+
         let (primary_node_id, primary_addr) =
             match router.primary_node_id().zip(router.primary_addr()) {
                 Some(pair) => pair,
@@ -167,6 +179,18 @@ impl ProxyConnection {
                         // Sticky to current backend while in a transaction.
                         (nid.clone(), addr.clone())
                     } else {
+                        // Between transactions: disconnect if the proxy is draining
+                        // so clients reconnect to the (new) primary after switchover.
+                        if router.is_draining() && matches!(target, RouteTarget::Primary) {
+                            write_error_response(
+                                &mut client,
+                                "FATAL",
+                                "57P01",
+                                "server is draining connections for a planned switchover; reconnect shortly",
+                            )
+                            .await?;
+                            break;
+                        }
                         match resolve_backend(&router, &target) {
                             Some(pair) => pair,
                             None => {

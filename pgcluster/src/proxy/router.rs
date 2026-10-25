@@ -3,6 +3,8 @@
 //! The [`Router`] reads the current [`ClusterTopology`] from a local
 //! [`TopologyWatch`] — no network hop.
 
+use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
+
 use crate::config::ReadRoutingConfig;
 use crate::raft::{NodeRole, TopologyWatch};
 
@@ -12,6 +14,9 @@ use crate::raft::{NodeRole, TopologyWatch};
 pub struct Router {
     topology: TopologyWatch,
     config: ReadRoutingConfig,
+    /// When `true`, new connections to the primary are refused so in-flight
+    /// transactions can complete before a switchover proceeds.
+    draining: Arc<AtomicBool>,
 }
 
 impl Router {
@@ -19,7 +24,25 @@ impl Router {
         Self {
             topology: watch,
             config,
+            draining: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Begin draining: refuse new primary connections. Call before switchover.
+    pub fn begin_drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+        tracing::info!("proxy drain started — new primary connections refused");
+    }
+
+    /// End draining: resume normal routing. Call after Raft topology is updated.
+    pub fn end_drain(&self) {
+        self.draining.store(false, Ordering::SeqCst);
+        tracing::info!("proxy drain ended — routing resumed");
+    }
+
+    /// Returns `true` while the proxy is draining before a switchover.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
     }
 
     /// Returns the Postgres address of the current primary, if known.
@@ -156,6 +179,17 @@ mod tests {
                 max_replica_lag_bytes: max_lag,
             },
         )
+    }
+
+    #[test]
+    fn drain_flag_begins_and_ends() {
+        let topo = make_topology("pg1", &[]);
+        let router = make_router(topo, 10_000_000);
+        assert!(!router.is_draining(), "starts not draining");
+        router.begin_drain();
+        assert!(router.is_draining(), "draining after begin_drain");
+        router.end_drain();
+        assert!(!router.is_draining(), "not draining after end_drain");
     }
 
     #[test]

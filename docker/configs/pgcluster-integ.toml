@@ -6,8 +6,10 @@ name     = "integ"
 data_dir = "/tmp/pgcluster-integ"
 
 [raft]
-node_id   = 1
-bootstrap = true
+node_id               = 1
+bootstrap             = true
+heartbeat_interval_ms = 150
+election_timeout_ms   = 500
 
 [[raft.peers]]
 id   = 1

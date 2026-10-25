@@ -26,12 +26,14 @@ if [ -f "${PGDATA}/PG_VERSION" ]; then
 else
   echo "[init-replica] Running pg_basebackup from ${PRIMARY_HOST}:${PRIMARY_PORT} ..."
 
-  # Write a temporary .pgpass so pg_basebackup can authenticate
+  # Write .pgpass into PGDATA so pg_basebackup can authenticate and the file
+  # persists for use by the standby's primary_conninfo (via passfile=).
   if [ -n "${POSTGRES_PASSWORD:-}" ]; then
-    PGPASSFILE=$(mktemp)
-    chmod 600 "${PGPASSFILE}"
+    mkdir -p "${PGDATA}"
+    PGPASSFILE="${PGDATA}/.pgpass"
     echo "${PRIMARY_HOST}:${PRIMARY_PORT}:replication:${PGUSER}:${POSTGRES_PASSWORD}" \
       > "${PGPASSFILE}"
+    chmod 600 "${PGPASSFILE}"
     export PGPASSFILE
   fi
 
@@ -59,11 +61,16 @@ else
   # Write standby.signal so Postgres starts as a hot standby
   touch "${PGDATA}/standby.signal"
 
-  # Append primary_conninfo to postgresql.auto.conf
+  # Append primary_conninfo to postgresql.auto.conf.
+  # Use passfile= so the password is not stored in plaintext in the config.
+  PASSFILE_ARG=""
+  if [ -n "${POSTGRES_PASSWORD:-}" ]; then
+    PASSFILE_ARG=" passfile=${PGDATA}/.pgpass"
+  fi
   cat >> "${PGDATA}/postgresql.auto.conf" <<EOF
 
 # Added by init-replica.sh
-primary_conninfo = 'host=${PRIMARY_HOST} port=${PRIMARY_PORT} user=${PGUSER} password=${POSTGRES_PASSWORD}'
+primary_conninfo = 'host=${PRIMARY_HOST} port=${PRIMARY_PORT} user=${PGUSER}${PASSFILE_ARG}'
 hot_standby = on
 EOF
 

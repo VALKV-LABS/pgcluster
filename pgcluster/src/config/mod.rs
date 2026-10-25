@@ -20,6 +20,9 @@ pub struct PgClusterConfig {
     #[serde(default)]
     pub metrics: MetricsConfig,
     pub api: ApiConfig,
+    /// Backup policy. When present, [backup.s3] is mandatory.
+    #[serde(default)]
+    pub backup: Option<BackupConfig>,
 }
 
 // ── [cluster] ─────────────────────────────────────────────────────────────────
@@ -314,6 +317,75 @@ fn default_api_listen() -> String {
 }
 fn default_public_read() -> bool {
     false
+}
+
+// ── [backup] ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupFrequency {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl std::fmt::Display for BackupFrequency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Daily => write!(f, "daily"),
+            Self::Weekly => write!(f, "weekly"),
+            Self::Monthly => write!(f, "monthly"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupScheduleEntry {
+    pub frequency: BackupFrequency,
+    /// Number of completed backups of this frequency to retain.
+    pub retain: u32,
+}
+
+/// S3-compatible object storage configuration.
+/// Credentials are read from the environment: AWS_ACCESS_KEY_ID,
+/// AWS_SECRET_ACCESS_KEY, and optionally AWS_SESSION_TOKEN.
+/// IAM instance roles are also supported (no env vars needed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3Config {
+    pub bucket: String,
+    /// Key prefix for all backups, e.g. "backups/my-cluster".
+    #[serde(default)]
+    pub prefix: String,
+    /// AWS region, e.g. "us-east-1". Reads AWS_REGION env var if absent.
+    pub region: Option<String>,
+    /// Custom endpoint for S3-compatible stores (MinIO, Ceph, Cloudflare R2).
+    pub endpoint: Option<String>,
+    /// Use path-style addressing instead of virtual-hosted-style.
+    /// Required for MinIO and other self-hosted S3-compatible stores.
+    #[serde(default)]
+    pub path_style: bool,
+}
+
+/// Backup policy configuration. When this section is present, [backup.s3]
+/// is mandatory — pgcluster refuses to start without a valid S3 destination.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupConfig {
+    #[serde(default = "default_backup_enabled")]
+    pub enabled: bool,
+    pub s3: S3Config,
+    /// Prefer running pg_basebackup against a replica (reduces primary load).
+    /// Falls back to the primary if no healthy replica is available.
+    #[serde(default = "default_prefer_replica")]
+    pub prefer_replica: bool,
+    /// One entry per frequency tier. At least one entry is required.
+    pub schedule: Vec<BackupScheduleEntry>,
+}
+
+fn default_backup_enabled() -> bool {
+    true
+}
+fn default_prefer_replica() -> bool {
+    true
 }
 
 // ── Load helper ───────────────────────────────────────────────────────────────

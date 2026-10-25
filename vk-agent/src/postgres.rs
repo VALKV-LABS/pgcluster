@@ -122,6 +122,17 @@ impl LocalPostgres {
         Ok(if short.is_empty() { row.0 } else { short })
     }
 
+    /// Returns the `conninfo` string from `pg_stat_wal_receiver` (standby only).
+    /// Returns an empty string when the WAL receiver is not running or this is a primary.
+    pub async fn get_wal_receiver_conninfo(&self) -> Result<String> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT conninfo FROM pg_stat_wal_receiver LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await
+                .context("get_wal_receiver_conninfo query failed")?;
+        Ok(row.map(|(s,)| s).unwrap_or_default())
+    }
+
     /// Returns `true` when the pool can still reach the database.
     /// A lightweight liveness check used by `GetStatus`.
     pub async fn is_running(&self) -> bool {
