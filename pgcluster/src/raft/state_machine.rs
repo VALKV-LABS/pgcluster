@@ -59,6 +59,8 @@ pub struct TopologyStateMachine {
     change_tx: Arc<tokio::sync::watch::Sender<Arc<ClusterTopology>>>,
 }
 
+// openraft's storage traits require `StorageError`, so boxing it here gains nothing.
+#[allow(clippy::result_large_err)]
 impl TopologyStateMachine {
     /// Create a new, empty state machine.
     ///
