@@ -5,7 +5,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![PostgreSQL](https://img.shields.io/badge/postgres-12%2B-336791.svg?logo=postgresql&logoColor=white)](https://www.postgresql.org)
-[![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg?logo=docker&logoColor=white)](https://hub.docker.com/r/valkv-labs/pgcluster)
+[![Docker](https://img.shields.io/badge/docker-ready-2496ED.svg?logo=docker&logoColor=white)](https://hub.docker.com/r/valkvlabs/pgcluster)
 
 > **Rust-native PostgreSQL HA — no etcd, no Patroni, no HAProxy.**
 
@@ -45,7 +45,7 @@ Clients (Postgres wire protocol)
 - **Planned switchover** — zero-data-loss handoff with write pause and lag-wait
 - **Built-in connection proxy** — Postgres-protocol proxy with per-user connection pooling and lag-aware read routing
 - **Thin agent** — `vk-agent` sidecar only executes commands; all decisions live in the Raft leader
-- **TLS everywhere** — mutual TLS between pgcluster peers and to vk-agent; auto-generated dev certs
+- **TLS** — encrypts Raft, vk-agent and client connections; auto-generated dev certs
 - **Prometheus metrics** — failover count, replication lag, leader status, connection pool saturation
 - **REST API** — cluster status, node management, manual failover/switchover
 - **Works with stock Postgres 12+** — no patches, no extensions required
@@ -214,8 +214,8 @@ cargo build --release --bin vk-agent
 ### Docker
 
 ```bash
-docker pull ghcr.io/valkv-labs/pgcluster:latest
-docker pull ghcr.io/valkv-labs/vk-agent:latest
+docker pull valkvlabs/pgcluster:0.1.3
+docker pull valkvlabs/vk-agent:0.1.3
 ```
 
 ---
