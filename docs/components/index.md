@@ -39,6 +39,10 @@ SQL-aware router with full SQL parsing and scatter-gather — see `coordinator.m
 |-----------|-----|---------|
 | `pgrust_native` | [pgrust_native.md](pgrust_native.md) | Agent-free control via pgrust's native binary port; event push; < 500ms failover |
 
+## Management Plane (proposed)
+
+Fleet management for many clusters, with `pgcluster-admin` and `pg-hostd`. Not built yet. See [management-plane.md](../management-plane.md).
+
 ## Data Flow Summary
 
 ```
