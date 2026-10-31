@@ -10,14 +10,14 @@ pgcluster manages one Postgres cluster well. Running many of them is still manua
 The management plane adds fleet management on top, using two new components:
 
 - **`pgcluster-admin`:** one service and one API for every cluster in a fleet.
-- **`pg-hostd`:** an agent on every host that does what `pgcluster-admin` asks.
+- **`vk-agent host`:** a new mode of the existing `vk-agent` binary. One runs on every host and does what `pgcluster-admin` asks.
 
 An operator enrols their hosts, calls `POST /v1/databases`, and gets a running Postgres endpoint with failover and point-in-time restore. Both components are open source and run on their own. They need one Postgres database, and no cloud account.
 
 ## 2. Principles
 
 1. **The data plane runs without the management plane.** Failover, proxying and backups keep working if `pgcluster-admin` is down. It never decides who is primary; each cluster's Raft group does.
-2. **Agents dial out.** `pg-hostd` opens every connection, so hosts behind NAT or a firewall work the same as any other. There is no SSH and no inbound access.
+2. **Agents dial out.** `vk-agent host` opens every connection, so hosts behind NAT or a firewall work the same as any other. There is no SSH and no inbound access.
 3. **One path to every host.** A VM, a bare-metal server and a cloud instance are all enrolled and managed the same way.
 4. **No access to user data.** `pgcluster-admin` runs no SQL against user tables and never holds a user's Postgres password.
 5. **Hosts come from you.** `pgcluster-admin` makes no cloud API calls. You bring the machines, by hand, with your own tooling, or with the optional AWS template (§12), which runs with your own credentials.
@@ -54,7 +54,7 @@ An operator enrols their hosts, calls `POST /v1/databases`, and gets a running P
         │  agent API, HTTPS with mTLS, opened by the host
         │
  ┌──────┴──────────── host ─────────────────────────┐
- │  pg-hostd        enrol, apply desired state, report │
+ │  vk-agent host   enrol, apply state, report      │
  │  ┌───────────── instance (one per node) ───────┐  │
  │  │  pgcluster   Raft, failover, proxy, pool    │  │
  │  │  vk-agent    executes pgcluster's commands  │  │
@@ -68,24 +68,44 @@ An operator enrols their hosts, calls `POST /v1/databases`, and gets a running P
 | Component | New? | Responsibility |
 |---|---|---|
 | `pgcluster-admin` | New | Admin API, agent API, desired state, reconciler, scheduler, operations |
-| `pg-hostd` | New | Enrolment, capacity reports, config rendering, process and storage management, certificate rotation |
+| `vk-agent host` | New mode | Enrolment, capacity reports, config rendering, process and storage management, certificate rotation |
 | `pgcluster`, `vk-agent` | Extended | See §10 |
 | Node image | New | Packer recipe with Postgres majors, extensions, pgBackRest and all binaries, pinned. Published as a public AMI with each release |
 | AWS template | New | Terraform that launches a test fleet in your own account (§12) |
+
+**One binary, two modes**
+
+`vk-agent` ships as one binary and runs as two kinds of process:
+
+| | `vk-agent` (instance mode) | `vk-agent host` (host mode) |
+|---|---|---|
+| Runs | One per Postgres instance | One per machine |
+| Starts | After its instance has been set up | Before any Postgres exists |
+| Network | Listens on a port for its cluster's nodes | Opens no port; dials out only |
+| Privileges | The `postgres` user | Enough to manage services, cgroups, disks and the firewall |
+| Takes orders from | The cluster's Raft leader | `pgcluster-admin` |
+
+They stay separate processes for three reasons:
+
+- Something has to start the first instance, and an instance's own agent cannot do that.
+- A process with host-level privileges should not sit behind a port that peers can reach.
+- On a shared host, capacity, ports and disk quotas belong to the machine, not to any one instance.
+
+Instance mode keeps its existing rule: it only executes commands and makes no decisions. The two modes share TLS, config and Postgres code, and release together.
 
 **Who owns what**
 
 | Fact | Owner |
 |---|---|
 | What a database should look like | `pgcluster-admin` |
-| What is running on a host right now | `pg-hostd`, reported to `pgcluster-admin` |
+| What is running on a host right now | `vk-agent host`, reported to `pgcluster-admin` |
 | Which node is primary, cluster membership | That cluster's Raft group |
 
 **Repository layout**
 
 ```
 pgcluster-admin/   service: admin API, agent API, reconciler
-pg-hostd/          host agent
+vk-agent/          instance mode and host mode
 openapi/           admin API and agent API contracts
 images/            node image recipe
 deploy/aws/        Terraform template for a test fleet
@@ -97,7 +117,7 @@ deploy/aws/        Terraform template for a test fleet
 
 | Term | Meaning |
 |---|---|
-| **Host** | A machine running `pg-hostd` |
+| **Host** | A machine running `vk-agent host` |
 | **Database** | A Postgres cluster of one or three nodes |
 | **Node** | One Postgres instance of a database, on one host |
 | **Instance** | The `pgcluster`, `vk-agent` and Postgres processes for one node |
@@ -196,7 +216,7 @@ The event feed reports state changes such as `node_offline`, `failover_completed
 
 ## 7. Agent API
 
-`pg-hostd` calls these endpoints; `pgcluster-admin` never calls a host.
+`vk-agent host` calls these endpoints; `pgcluster-admin` never calls a host.
 
 ```
 POST /agent/v1/enroll                  single-use token and a key pair → client certificate
@@ -231,20 +251,20 @@ POST /agent/v1/operations/{id}/log     step output
 }
 ```
 
-The agent API is a public contract. Anything that serves it can drive `pg-hostd`.
+The agent API is a public contract. Anything that serves it can drive `vk-agent host`.
 
 ## 8. How changes are applied
 
-Each database has a `spec` and a `generation`. `pg-hostd` long-polls for desired state, applies it, and reports `observed_generation` with health. An operation finishes when every node reports the new generation.
+Each database has a `spec` and a `generation`. `vk-agent host` long-polls for desired state, applies it, and reports `observed_generation` with health. An operation finishes when every node reports the new generation.
 
 - Applying the same state twice has no effect, so failures are retried safely.
 - Operations are stored steps, claimed with `FOR UPDATE SKIP LOCKED`. A restarted `pgcluster-admin` resumes from the last completed step.
-- `pg-hostd` keeps its last desired state on disk and keeps instances running if `pgcluster-admin` is unreachable.
+- `vk-agent host` keeps its last desired state on disk and keeps instances running if `pgcluster-admin` is unreachable.
 
 **Creating a database**
 
 1. Validate the request, choose hosts and allocate ports.
-2. Each `pg-hostd` picks up its instance from desired state.
+2. Each `vk-agent host` picks up its instance from desired state.
 3. Node 1 runs `initdb --data-checksums` and `pgbackrest stanza-create`. Other nodes seed from it.
 4. pgcluster forms the Raft group.
 5. Apply the replication mode, install extensions, create the owner role.
@@ -347,7 +367,7 @@ Enabling a preload extension needs a rolling restart.
 
 ### Several databases on one host
 
-- `pg-hostd` runs each instance as systemd units with cgroup v2 limits: `CPUQuota=`, `MemoryMax=` and `IOWeight=`. A plain process runner exists for development and tests.
+- `vk-agent host` runs each instance as systemd units with cgroup v2 limits: `CPUQuota=`, `MemoryMax=` and `IOWeight=`. A plain process runner exists for development and tests.
 - Each instance gets a disk quota. Disk is the likeliest noisy neighbour, and CPU and memory limits do nothing about it.
 - The scheduler refuses overcommit, reserves memory for page cache and the OS, and places HA nodes on different hosts and failure domains.
 - A shared host is not a security boundary between mutually untrusting users. Only share hosts between databases with the same owner.
@@ -372,7 +392,7 @@ The management plane depends on the data plane meeting these requirements:
 ## 11. Compatibility
 
 - Admin and agent APIs are versioned under `/v1`. Breaking changes need `/v2`.
-- `pgcluster-admin` supports `pg-hostd` versions from the current and previous minor release, so hosts can upgrade one at a time.
+- `pgcluster-admin` supports `vk-agent host` versions from the current and previous minor release, so hosts can upgrade one at a time.
 - Postgres 16, 17 and 18 are supported at first.
 
 ## 12. Trying it
@@ -410,7 +430,7 @@ Terraform prints the admin API URL and a generated API key. `terraform destroy` 
 
 | Stage | Scope | Done when |
 |---|---|---|
-| **1. One node** | `pgcluster-admin`, `pg-hostd`, agent API, node image and public AMI, CLI, AWS template, one-node databases | A host enrols and a one-node database is created through the API, locally and after one `terraform apply` on AWS |
+| **1. One node** | `pgcluster-admin`, `vk-agent host`, agent API, node image and public AMI, CLI, AWS template, one-node databases | A host enrols and a one-node database is created through the API, locally and after one `terraform apply` on AWS |
 | **2. High availability** | Three nodes, replication modes, node replacement, the §10 requirements except backups | A three-node database survives primary loss, a network partition and node replacement in all three modes, by automated test |
 | **3. Backups** | pgBackRest, repositories, restore | A point-in-time restore is verified by automated test |
 | **4. Shared hosts** | Scheduler, isolation, disk quotas, ports | Several databases share a host under load without one starving another |
