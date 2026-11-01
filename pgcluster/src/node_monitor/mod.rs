@@ -14,6 +14,7 @@ use crate::agent_clients::AgentClientPool;
 use crate::config::{FailoverConfig, ReplicationConfig};
 use crate::failover::seed::SeedPlan;
 use crate::metrics_registry::Metrics;
+use crate::proxy::auth::AuthRole;
 use crate::raft::commands::TopologyCommand;
 use crate::raft::lease::QuorumLease;
 use crate::raft::topology::{ClusterTopology, NodeRole};
@@ -47,6 +48,9 @@ pub struct NodeMonitor {
     sync_degrade_timeout_seconds: u64,
     max_slot_wal_keep_size_mb: u64,
     replication: ReplicationConfig,
+    /// The role the proxy reads verifiers with, and a version for its settings.
+    auth_role: AuthRole,
+    auth_version: String,
     /// The backup tool's settings and their version, when backups are on.
     backup_settings: Option<(HashMap<String, String>, String)>,
     /// How many health-check ticks between orphaned-slot audits on the primary.
@@ -63,6 +67,7 @@ impl NodeMonitor {
         config: FailoverConfig,
         metrics: Arc<Metrics>,
         replication: &ReplicationConfig,
+        auth_role: &AuthRole,
         backup_settings: Option<HashMap<String, String>>,
         repl_password: String,
         op_in_progress: Arc<AtomicBool>,
@@ -82,6 +87,11 @@ impl NodeMonitor {
             sync_degrade_timeout_seconds: replication.sync_degrade_timeout_seconds,
             max_slot_wal_keep_size_mb: replication.max_slot_wal_keep_size_mb,
             replication: replication.clone(),
+            auth_role: auth_role.clone(),
+            auth_version: crate::backup::walg::version(&HashMap::from([(
+                auth_role.user.clone(),
+                auth_role.password.clone(),
+            )])),
             backup_settings: backup_settings.map(|settings| {
                 let version = crate::backup::walg::version(&settings);
                 (settings, version)
@@ -608,6 +618,7 @@ mod tests {
             lost_slots: Vec::new(),
             has_data: true,
             backup_config_version: String::new(),
+            proxy_auth_version: String::new(),
         };
         let primary_host = "pg-replica-1"; // new primary after failover
         assert!(
@@ -633,6 +644,7 @@ mod tests {
             lost_slots: Vec::new(),
             has_data: true,
             backup_config_version: String::new(),
+            proxy_auth_version: String::new(),
         };
         let primary_host = "pg-replica-1";
         assert!(
@@ -658,6 +670,7 @@ mod tests {
             lost_slots: Vec::new(),
             has_data: true,
             backup_config_version: String::new(),
+            proxy_auth_version: String::new(),
         };
         let primary_host = "pg-replica-1";
         assert!(
@@ -683,6 +696,7 @@ mod tests {
             lost_slots: Vec::new(),
             has_data: true,
             backup_config_version: String::new(),
+            proxy_auth_version: String::new(),
         };
         let primary_host = ""; // no primary elected yet
         assert!(

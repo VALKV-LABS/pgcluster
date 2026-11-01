@@ -37,6 +37,8 @@ service AgentService {
   // Promote this external standby and leave the cluster: it stops expecting
   // heartbeats, following the primary and archiving to the cluster's repository.
   rpc Detach(DetachRequest) returns (SeedResponse);
+  // Create the role and function the proxy reads password verifiers with
+  rpc SetProxyAuth(SetProxyAuthRequest) returns (SeedResponse);
 }
 
 // ── Promote ──────────────────────────────────────────────────────────────────
@@ -100,6 +102,8 @@ message StatusResponse {
   bool has_data = 13;
   // The version from the last ConfigureBackups applied here.
   string backup_config_version = 14;
+  // The version from the last SetProxyAuth, kept in the database.
+  string proxy_auth_version = 15;
 }
 
 message ReplicaStatus {
@@ -229,3 +233,12 @@ message RestoreRequest {
 // ── Detach ───────────────────────────────────────────────────────────────────
 
 message DetachRequest {}
+
+// ── Proxy authentication ─────────────────────────────────────────────────────
+
+message SetProxyAuthRequest {
+  string user     = 1;
+  string password = 2;
+  // Identifies these settings, so pgcluster can tell when they are out of date.
+  string version  = 3;
+}

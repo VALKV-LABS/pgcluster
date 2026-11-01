@@ -34,6 +34,8 @@ pub struct HealthCheckResult {
     pub has_data: bool,
     /// The version of the backup settings this node last applied.
     pub backup_config_version: String,
+    /// The version of the proxy's auth role on this node.
+    pub proxy_auth_version: String,
 }
 
 // ── send_heartbeat ────────────────────────────────────────────────────────────
@@ -124,6 +126,7 @@ async fn query_node(node_id: &str, agent_addr: &str, pool: &AgentClientPool) -> 
                 lost_slots: status.lost_slots,
                 has_data: status.has_data,
                 backup_config_version: status.backup_config_version,
+                proxy_auth_version: status.proxy_auth_version,
             }
         }
         Err(e) => {
@@ -150,5 +153,6 @@ fn unreachable_result(node_id: &str) -> HealthCheckResult {
         lost_slots: Vec::new(),
         has_data: true,
         backup_config_version: String::new(),
+        proxy_auth_version: String::new(),
     }
 }

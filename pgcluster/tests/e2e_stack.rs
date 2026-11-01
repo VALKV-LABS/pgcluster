@@ -119,17 +119,12 @@ async fn wait_for_new_primary(api: &str, old_primary: &str, timeout: Duration) -
 #[tokio::test]
 #[ignore = "requires Docker daemon and sufficient system resources"]
 async fn e2e_switchover_and_failover() {
-    let skip_build = std::env::var("E2E_SKIP_BUILD").as_deref() == Ok("1");
     let no_teardown = std::env::var("E2E_NO_TEARDOWN").as_deref() == Ok("1");
     let api = std::env::var("E2E_API_URL").unwrap_or_else(|_| DEFAULT_API.to_string());
 
     // ── Step 1: Start the stack ───────────────────────────────────────────────
     eprintln!("==> Starting e2e stack...");
-    if skip_build {
-        compose(&["up", "-d", "--wait"]);
-    } else {
-        compose(&["up", "-d", "--build", "--wait"]);
-    }
+    start_stack();
     eprintln!("==> Stack started");
 
     // ── Step 2: Wait for cluster to form ─────────────────────────────────────
@@ -297,15 +292,10 @@ async fn e2e_switchover_and_failover() {
 #[tokio::test]
 #[ignore = "requires Docker daemon"]
 async fn e2e_cluster_forms_and_has_primary() {
-    let skip_build = std::env::var("E2E_SKIP_BUILD").as_deref() == Ok("1");
     let api = std::env::var("E2E_API_URL").unwrap_or_else(|_| DEFAULT_API.to_string());
 
     // Start the stack.
-    if skip_build {
-        compose(&["up", "-d", "--wait"]);
-    } else {
-        compose(&["up", "-d", "--build", "--wait"]);
-    }
+    start_stack();
 
     // Wait for a primary to be elected.
     let status = wait_for_primary(&api, Duration::from_secs(90)).await;
@@ -417,14 +407,9 @@ fn cut_off_from_default_network(service: &str) {
 #[tokio::test]
 #[ignore = "requires Docker daemon and sufficient system resources"]
 async fn e2e_partition_stops_writes_on_both_sides() {
-    let skip_build = std::env::var("E2E_SKIP_BUILD").as_deref() == Ok("1");
     let majority_api = "http://localhost:18009";
 
-    if skip_build {
-        compose(&["up", "-d", "--wait"]);
-    } else {
-        compose(&["up", "-d", "--build", "--wait"]);
-    }
+    start_stack();
     let status = wait_for_primary(DEFAULT_API, Duration::from_secs(90)).await;
     assert_eq!(
         status["primary_node_id"], "pg1",
@@ -516,11 +501,24 @@ async fn e2e_partition_stops_writes_on_both_sides() {
 
 // ── Replication modes ─────────────────────────────────────────────────────────
 
+/// Start the stack, and wait until the proxy can log clients in, which needs the
+/// leader to have set up its role on the primary.
 fn start_stack() {
     if std::env::var("E2E_SKIP_BUILD").as_deref() == Ok("1") {
         compose(&["up", "-d", "--wait"]);
     } else {
         compose(&["up", "-d", "--build", "--wait"]);
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !psql("pg-primary", "pgcluster-1", "SELECT 1")
+        .status
+        .success()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the proxy never accepted a login"
+        );
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -1480,6 +1478,19 @@ fn single(args: &[&str]) -> std::process::Output {
     out
 }
 
+/// Connect, allowing for the proxy's lease and login setup.
+async fn connect_with_retries(dsn: &str) -> tokio_postgres::Client {
+    for _ in 0..30 {
+        if let Ok((client, connection)) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await
+        {
+            tokio::spawn(connection);
+            return client;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("could not connect through the proxy");
+}
+
 /// One node has no failover: it recovers from its volume. Removing the
 /// containers and network stands for losing the VM, with its disk reattached.
 #[tokio::test]
@@ -1490,10 +1501,7 @@ async fn e2e_one_node_recovers_after_its_vm_is_replaced() {
 
     single(&["up", "-d", "--build", "--wait"]);
     wait_for_primary(api, Duration::from_secs(60)).await;
-    let (pg, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
-        .await
-        .expect("connect through the proxy");
-    tokio::spawn(connection);
+    let pg = connect_with_retries(dsn).await;
     pg.simple_query("CREATE TABLE survives (value int); INSERT INTO survives VALUES (1)")
         .await
         .expect("write before the replacement");
@@ -1505,18 +1513,7 @@ async fn e2e_one_node_recovers_after_its_vm_is_replaced() {
     let status = wait_for_primary(api, Duration::from_secs(60)).await;
     assert_eq!(status["primary_node_id"], "pg1");
 
-    // The proxy needs a moment for its lease, so allow for retries.
-    let mut session = None;
-    for _ in 0..30 {
-        if let Ok((client, connection)) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await
-        {
-            tokio::spawn(connection);
-            session = Some(client);
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    let pg = session.expect("connect after the replacement");
+    let pg = connect_with_retries(dsn).await;
     let rows = pg
         .simple_query("SELECT value FROM survives")
         .await
@@ -1531,6 +1528,157 @@ async fn e2e_one_node_recovers_after_its_vm_is_replaced() {
         .expect("write after the replacement");
 
     single(&["down", "-v", "--remove-orphans"]);
+}
+
+// ── Proxy login ───────────────────────────────────────────────────────────────
+
+fn psql_as(
+    user: &str,
+    password: &str,
+    proxy: &str,
+    sslmode: &str,
+    sql: &str,
+) -> std::process::Output {
+    let conninfo = format!("host={proxy} user={user} dbname=postgres sslmode={sslmode}");
+    Command::new("docker")
+        .args(["compose", "-f", COMPOSE_FILE, "exec", "-T"])
+        .args(["-e", &format!("PGPASSWORD={password}"), "pg-primary"])
+        .args(["psql", &conninfo, "-v", "ON_ERROR_STOP=1", "-Atc", sql])
+        .current_dir(project_root())
+        .output()
+        .expect("docker compose exec psql")
+}
+
+/// The proxy runs SCRAM itself and logs in to Postgres over verified TLS, for any
+/// role, any client TLS mode and both query protocols.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_proxy_authenticates_clients_and_uses_tls_to_postgres() {
+    start_stack();
+    create_mode_test_table().await;
+    exec_sql("pg-primary", "CREATE ROLE app LOGIN PASSWORD 'app-secret'");
+    exec_sql("pg-primary", "GRANT ALL ON mode_test TO app");
+
+    // A client that sees TLS sends a different SCRAM header, which is what
+    // broke passthrough. The link to Postgres must be encrypted either way.
+    for sslmode in ["disable", "prefer", "require"] {
+        let out = psql_as(
+            "app",
+            "app-secret",
+            "pgcluster-1",
+            sslmode,
+            "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+        );
+        assert!(
+            out.status.success(),
+            "sslmode={sslmode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "t",
+            "{sslmode}"
+        );
+    }
+
+    // Wrong passwords and unknown roles must look the same.
+    let wrong = psql_as("app", "nope", "pgcluster-1", "disable", "SELECT 1");
+    let unknown = psql_as("nobody", "nope", "pgcluster-1", "disable", "SELECT 1");
+    assert!(!wrong.status.success() && !unknown.status.success());
+    for (out, user) in [(&wrong, "app"), (&unknown, "nobody")] {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "password authentication failed for user \"{user}\""
+            )),
+            "{stderr}"
+        );
+    }
+
+    // The auth role reads verifiers through its one function, and no other way.
+    assert_eq!(
+        exec_sql(
+            "pg-primary",
+            "SELECT has_table_privilege('pgcluster_auth', 'pg_authid', 'SELECT'), \
+             has_function_privilege('public', 'pgcluster.get_auth(name)', 'EXECUTE')"
+        ),
+        "f|f"
+    );
+
+    // The extended protocol, as drivers use it.
+    let dsn = "host=localhost port=5432 user=app password=app-secret dbname=postgres";
+    let (pg, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect with the extended protocol");
+    tokio::spawn(connection);
+    let row = tokio::time::timeout(
+        Duration::from_secs(10),
+        pg.query_one("SELECT $1::int + 1", &[&41i32]),
+    )
+    .await
+    .expect("a prepared statement must not hang")
+    .expect("run a prepared statement");
+    assert_eq!(row.get::<_, i32>(0), 42);
+
+    // COPY waits on the client, so the proxy must not wait on the backend.
+    let copy = "printf '1\\n2\\n' | PGPASSWORD=test timeout 10 psql \
+        'host=pgcluster-1 user=postgres dbname=postgres sslmode=disable' \
+        -c 'COPY mode_test FROM STDIN'";
+    let out = Command::new("docker")
+        .args(["compose", "-f", COMPOSE_FILE, "exec", "-T", "pg-primary"])
+        .args(["sh", "-c", copy])
+        .current_dir(project_root())
+        .output()
+        .expect("docker compose exec");
+    assert!(
+        out.status.success(),
+        "COPY: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // pgcluster-3 has read routing on, so it logs in to a replica for the client.
+    let dsn = "host=localhost port=25432 user=app password=app-secret dbname=postgres";
+    let (pg, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect to the routing proxy");
+    tokio::spawn(connection);
+    let value = |rows: &[tokio_postgres::SimpleQueryMessage]| {
+        rows.iter().find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+    };
+    let rows = pg
+        .simple_query("SELECT pg_is_in_recovery()")
+        .await
+        .expect("read through the routing proxy");
+    assert_eq!(
+        value(&rows).as_deref(),
+        Some("t"),
+        "reads must reach a replica"
+    );
+    let rows = pg
+        .simple_query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+        .await
+        .expect("read TLS status");
+    assert_eq!(value(&rows).as_deref(), Some("t"), "replica links use TLS");
+    pg.simple_query("INSERT INTO mode_test VALUES (900)")
+        .await
+        .expect("writes go to the primary");
+    pg.simple_query("SET application_name = 'x'")
+        .await
+        .expect("SET");
+    let rows = pg
+        .simple_query("SELECT pg_is_in_recovery()")
+        .await
+        .expect("read after SET");
+    assert_eq!(
+        value(&rows).as_deref(),
+        Some("f"),
+        "SET pins a session to the primary"
+    );
+
+    compose(&["down", "-v", "--remove-orphans"]);
 }
 
 /// Runs switchover only — useful when the stack is already up (E2E_SKIP_BUILD=1).

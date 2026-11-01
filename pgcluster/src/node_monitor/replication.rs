@@ -122,6 +122,8 @@ impl NodeMonitor {
         primary: &HealthCheckResult,
         timer: &mut DegradeTimer,
     ) {
+        self.ensure_proxy_auth(topology, primary).await;
+
         let standby_streaming = primary
             .streaming_standbys
             .iter()
@@ -168,6 +170,38 @@ impl NodeMonitor {
         }
 
         self.track_reseeds(topology, primary).await;
+    }
+
+    /// Give the proxy its way to read verifiers. It lives in the database, so
+    /// this runs on the primary and reaches standbys through replication.
+    async fn ensure_proxy_auth(&self, topology: &ClusterTopology, primary: &HealthCheckResult) {
+        if primary.proxy_auth_version == self.auth_version {
+            return;
+        }
+        let Some(cfg) = topology.node_configs.get(&topology.primary_node_id) else {
+            return;
+        };
+        let result = match self
+            .pool
+            .get_or_connect(&topology.primary_node_id, &cfg.agent_addr)
+            .await
+        {
+            Ok(mut client) => {
+                client
+                    .set_proxy_auth(
+                        &self.auth_role.user,
+                        &self.auth_role.password,
+                        &self.auth_version,
+                    )
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(response) if response.success => info!("proxy authentication is set up"),
+            Ok(response) => warn!(err = %response.error, "could not set up proxy authentication"),
+            Err(e) => warn!(err = %e, "could not set up proxy authentication"),
+        }
     }
 
     async fn apply_parameters(

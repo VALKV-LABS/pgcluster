@@ -44,6 +44,7 @@ services:
       dockerfile: docker/pgcluster.Dockerfile
     environment:
       POSTGRES_PASSWORD: test
+      PGCLUSTER_AUTH_PASSWORD: dev-auth-password
     depends_on:
       pg:
         condition: service_healthy

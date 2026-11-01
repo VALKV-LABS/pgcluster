@@ -162,7 +162,7 @@ async fn write_routes_to_primary() {
 }
 
 #[tokio::test]
-#[ignore = "read routing is off until the proxy can authenticate to replicas (todo.md 2.3)"]
+#[ignore = "requires Docker e2e stack (make start) with E2E_STACK_ADDR set"]
 async fn read_only_txn_routes_to_replica() {
     let Some(dsn) = e2e_pg_dsn() else {
         eprintln!("skipping: E2E_STACK_ADDR not set");

@@ -138,6 +138,9 @@ fn validate_timing(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     let detection = failover.health_check_interval_ms
         * u64::from(failover.health_check_failures_before_failover);
 
+    if cfg.proxy.auth_user.is_empty() {
+        anyhow::bail!("[proxy] auth_user must not be empty");
+    }
     if lease < MIN_QUORUM_LEASE_MS {
         anyhow::bail!("[proxy] quorum_lease_ms ({lease}) must be >= {MIN_QUORUM_LEASE_MS}");
     }
@@ -168,9 +171,6 @@ fn validate_tls(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     if tls.insecure_plaintext {
         if files.iter().any(|f| f.is_some()) {
             anyhow::bail!("[tls] set either certificate files or insecure_plaintext, not both");
-        }
-        if cfg.proxy.backend_tls {
-            anyhow::bail!("[proxy] backend_tls needs [tls] certificate files");
         }
     } else if files.iter().any(|f| f.is_none()) {
         anyhow::bail!(
@@ -298,7 +298,8 @@ mod tests {
                 health_listen_addr: "0.0.0.0:8008".into(),
                 pool: Default::default(),
                 read_routing: Default::default(),
-                backend_tls: false,
+                auth_user: "pgcluster_auth".into(),
+                auth_password_env: "PGCLUSTER_AUTH_PASSWORD".into(),
                 quorum_lease_ms: 1000,
             },
             failover: FailoverConfig::default(),

@@ -44,6 +44,20 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         Some(Arc::new(tls::TlsManager::new(&cfg.tls)?))
     };
 
+    let auth_password = std::env::var(&cfg.proxy.auth_password_env).unwrap_or_default();
+    if auth_password.is_empty() {
+        anyhow::bail!(
+            "[proxy] set {} to the password for the {} role",
+            cfg.proxy.auth_password_env,
+            cfg.proxy.auth_user
+        );
+    }
+    let auth_role = proxy::auth::AuthRole {
+        user: cfg.proxy.auth_user.clone(),
+        password: auth_password,
+        ca_pem: tls_mgr.as_ref().map(|t| t.ca_cert_pem().to_vec()),
+    };
+
     let raft_tls = tls_mgr.as_ref().map(|t| t.tonic_client_tls_config());
     let raft_node = Arc::new(raft::RaftNode::start(&cfg, raft_tls).await?);
     let topology_rx = raft_node.topology_rx.clone();
@@ -231,6 +245,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
             proxy_router.clone(),
             proxy_tls,
             proxy_metrics,
+            Arc::new(proxy::auth::AuthQuery::new(auth_role.clone())),
         ));
 
         let srv2 = Arc::clone(&srv);
@@ -271,6 +286,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                 fcfg,
                 mon_metrics,
                 &replication,
+                &auth_role,
                 backup_settings,
                 repl_password,
                 op_in_progress.clone(),

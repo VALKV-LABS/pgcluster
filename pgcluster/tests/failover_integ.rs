@@ -8,8 +8,8 @@ use pgcluster::agent_clients::agent_proto::{
     BackupVerifyRequest, BackupVerifyResponse, ConfigureBackupsRequest, DemoteRequest,
     DemoteResponse, DetachRequest, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
     PromoteResponse, ReloadRequest, ReloadResponse, RestoreRequest, SeedRequest, SeedResponse,
-    SetParametersRequest, SetParametersResponse, StatusRequest, StatusResponse, StopRequest,
-    StopResponse,
+    SetParametersRequest, SetParametersResponse, SetProxyAuthRequest, StatusRequest,
+    StatusResponse, StopRequest, StopResponse,
 };
 use pgcluster::agent_clients::AgentClientPool;
 use pgcluster::failover::candidate::pick_live_candidate;
@@ -103,6 +103,9 @@ impl AgentService for FakeAgent {
     }
     async fn detach(&self, _: Request<DetachRequest>) -> RpcResult<SeedResponse> {
         Err(Status::unimplemented("detach"))
+    }
+    async fn set_proxy_auth(&self, _: Request<SetProxyAuthRequest>) -> RpcResult<SeedResponse> {
+        Err(Status::unimplemented("set_proxy_auth"))
     }
 }
 

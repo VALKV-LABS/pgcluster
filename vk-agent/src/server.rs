@@ -17,8 +17,8 @@ use agent::{
     BackupVerifyRequest, BackupVerifyResponse, ConfigureBackupsRequest, DemoteRequest,
     DemoteResponse, DetachRequest, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
     PromoteResponse, ReloadRequest, ReloadResponse, RestoreRequest, SeedRequest, SeedResponse,
-    SetParametersRequest, SetParametersResponse, StatusRequest, StatusResponse, StopRequest,
-    StopResponse,
+    SetParametersRequest, SetParametersResponse, SetProxyAuthRequest, StatusRequest,
+    StatusResponse, StopRequest, StopResponse,
 };
 
 use crate::config::AgentConfig;
@@ -329,6 +329,21 @@ impl AgentService for AgentServiceImpl {
         }))
     }
 
+    async fn set_proxy_auth(
+        &self,
+        request: Request<SetProxyAuthRequest>,
+    ) -> Result<Response<SeedResponse>, Status> {
+        let req = request.into_inner();
+        let result = self
+            .pg
+            .set_proxy_auth(&req.user, &req.password, &req.version)
+            .await;
+        Ok(Response::new(SeedResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        }))
+    }
+
     /// Return current node status: role, LSNs, timeline, version, connection
     /// count, and replication info.
     async fn get_status(
@@ -355,6 +370,7 @@ impl AgentService for AgentServiceImpl {
                 lost_slots: vec![],
                 has_data: self.has_data().await,
                 backup_config_version: self.walg.config_version().await,
+                proxy_auth_version: String::new(),
             }));
         }
 
@@ -378,6 +394,7 @@ impl AgentService for AgentServiceImpl {
                     lost_slots: vec![],
                     has_data: self.has_data().await,
                     backup_config_version: self.walg.config_version().await,
+                    proxy_auth_version: String::new(),
                 }));
             }
         };
@@ -434,6 +451,7 @@ impl AgentService for AgentServiceImpl {
             lost_slots,
             has_data: true,
             backup_config_version: self.walg.config_version().await,
+            proxy_auth_version: self.pg.get_proxy_auth_version().await.unwrap_or_default(),
         }))
     }
 

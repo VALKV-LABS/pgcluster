@@ -64,6 +64,7 @@ services:
       - ./configs/pgcluster-integ.toml:/etc/pgcluster/config.toml:ro
     environment:
       PGPASSWORD: test
+      PGCLUSTER_AUTH_PASSWORD: dev-auth-password
       RUST_LOG: "info"
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8009' 2>/dev/null"]

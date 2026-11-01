@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Breaking:** `[backup]` takes `interval_seconds`, `delta_steps`, `retain_full`, `encryption_key_env` and exactly one of `[backup.s3]` and `[backup.posix]`, replacing `[[backup.schedule]]`. Nodes need `archive_mode = on`.
 
 ### Security
+- The proxy authenticates clients with SCRAM itself, using verifiers read through a restricted role, and logs in to Postgres over verified TLS. It never sees passwords.
+- **Breaking:** `PGCLUSTER_AUTH_PASSWORD` is required, and Postgres must have `ssl = on` with a certificate from the cluster CA, unless `insecure_plaintext` is set. Roles need SCRAM passwords.
 - **Breaking:** self-fencing is on by default. `fence_timeout_seconds` defaults to 30, and 0 turns it off. It was previously off unless set, and 0 fenced immediately.
 - **Breaking:** `pgcluster server` refuses to start without `api_keys`. `insecure_no_auth = true` opts out, for local development only.
 - **Breaking:** Raft, topology and `vk-agent` gRPC require a client certificate from the cluster CA. `pgcluster` and `vk-agent` refuse to start without `ca_cert`, `cert` and `key`. `insecure_plaintext = true` opts out, for local development only.
@@ -23,8 +25,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Restarting the bootstrap node no longer repeats the bootstrap seed, which moved the primary back to the highest-priority node.
 - Failover chooses the candidate from the live position of reachable standbys, not the last position the health checks recorded, and aborts if none answers.
 - `pgcluster` now sends the heartbeats `vk-agent` expects. Without them every agent entered safe mode, and with `fence_timeout_seconds` set it stopped Postgres.
-- Logging in through the proxy no longer hangs when a client takes more than 10 ms to answer an authentication challenge, as SCRAM clients do.
-- The proxy routes reads to the primary. Sending them to a replica dropped the client's connection.
+- Read routing works: the proxy logs in to replicas for the client. Before, it sent queries on connections with no login, which dropped the client. It is now off by default, because a read after a write may miss it.
+- The proxy forwards extended protocol messages unchanged, and waits for a reply only at `Sync`. Before, re-encoding lost format codes and NULLs, so prepared statements with parameters failed.
+- `COPY FROM STDIN` no longer hangs through the proxy.
 - `make start` works on a fresh checkout. Replicas failed to seed because `docker/init-replica.sh` was not executable and wrote `.pgpass` into `PGDATA` before `pg_basebackup`, which needs an empty directory. The script now exits with an error if seeding fails.
 
 ### Changed
@@ -56,7 +59,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - A partition test in the end-to-end suite.
 - The CLI sends the key in `PGCLUSTER_API_KEY` to the REST API.
 - `pgcluster certs` generates a cluster CA and certificates.
-- `[proxy] backend_tls` encrypts and verifies the connection to Postgres.
 
 ## [0.1.3] - 2026-10-31
 

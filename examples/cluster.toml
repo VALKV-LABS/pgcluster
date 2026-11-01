@@ -69,9 +69,15 @@ max_connections_per_db_user = 25
 idle_timeout_seconds        = 600
 
 [proxy.read_routing]
-# Route SELECT statements to replicas when they are within lag threshold.
-enabled               = true
+# Route reads to replicas within the lag threshold. Off by default, because a
+# read that follows a write may then miss it.
+enabled = false
 max_replica_lag_bytes = 10485760   # 10 MiB
+
+# The role the proxy reads password verifiers with. pgcluster creates it. Set its
+# password in PGCLUSTER_AUTH_PASSWORD, the same on every instance.
+# auth_user         = "pgcluster_auth"
+# auth_password_env = "PGCLUSTER_AUTH_PASSWORD"
 
 # Stop routing this long after losing contact with the Raft majority. Must be
 # shorter than failover detection (interval × failures below).

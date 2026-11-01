@@ -204,6 +204,24 @@ impl AgentClient {
             .map(|r| r.into_inner())
     }
 
+    /// Create the role and function the proxy reads verifiers with.
+    pub async fn set_proxy_auth(
+        &mut self,
+        user: &str,
+        password: &str,
+        version: &str,
+    ) -> Result<agent_proto::SeedResponse> {
+        self.stub
+            .set_proxy_auth(tonic::Request::new(agent_proto::SetProxyAuthRequest {
+                user: user.to_string(),
+                password: password.to_string(),
+                version: version.to_string(),
+            }))
+            .await
+            .with_context(|| format!("SetProxyAuth at {}", self.addr))
+            .map(|r| r.into_inner())
+    }
+
     /// Apply settings pgcluster manages on this node.
     pub async fn set_parameters(
         &mut self,

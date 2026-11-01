@@ -19,8 +19,9 @@ Clients (Postgres wire protocol)
 │          pgcluster  (3 instances, any node)          │
 │  ┌──────────────┐   ┌────────────────────────────┐  │
 │  │  Raft Group  │   │  Proxy + Connection Pool   │  │
-│  │  (embedded)  │   │  routes to the primary     │  │
-│  │              │   │                            │  │
+│  │  (embedded)  │   │  writes → primary          │  │
+│  │              │   │  reads  → primary, or      │  │
+│  │              │   │           replicas if on   │  │
 │  └──────────────┘   └────────────────────────────┘  │
 │  ┌───────────────────────────────────────────────┐   │
 │  │  Node Monitor · Failover Engine · Switchover  │   │
@@ -43,7 +44,7 @@ Clients (Postgres wire protocol)
 - **No external DCS** — Raft consensus is embedded; no etcd, ZooKeeper, or Consul
 - **Automatic failover** — detects primary failure in < 5 s, promotes best replica, re-points all standbys
 - **Planned switchover** — zero-data-loss handoff with write pause and lag-wait
-- **Built-in connection proxy** — Postgres-protocol proxy with per-user connection pooling
+- **Built-in connection proxy** — Postgres-protocol proxy with per-user connection pooling, SCRAM authentication and optional read routing
 - **Thin agent** — `vk-agent` sidecar only executes commands; all decisions live in the Raft leader
 - **Secure by default** — the server refuses to start without API keys and certificates; Raft and `vk-agent` gRPC require client certificates from the cluster CA
 - **Prometheus metrics** — failover count, replication lag, leader status, connection pool saturation
@@ -67,7 +68,7 @@ make status       # show container health and ports
 The stack exposes:
 | Port | Service |
 |------|---------|
-| `5432` | Postgres proxy (routes to the primary) |
+| `5432` | Postgres proxy (routes to the primary, and optionally reads to replicas) |
 | `8009` | REST API |
 | `9190` | Prometheus metrics |
 | `8008` | HTTP health check (for load balancers) |
@@ -265,7 +266,7 @@ cert    = "/etc/pgcluster/node.crt"
 key     = "/etc/pgcluster/node.key"
 ```
 
-The server refuses to start without `api_keys` and all three certificate paths. `pgcluster certs` generates a cluster CA and certificates, as described in [`docs/components/tls_manager.md`](docs/components/tls_manager.md). The CLI reads its key from `PGCLUSTER_API_KEY`. `vk-agent` needs its own `[tls]` section.
+The server refuses to start without `api_keys`, all three certificate paths and `PGCLUSTER_AUTH_PASSWORD`, the password for the role the proxy reads password verifiers with. `pgcluster certs` generates a cluster CA and certificates, as described in [`docs/components/tls_manager.md`](docs/components/tls_manager.md). The CLI reads its key from `PGCLUSTER_API_KEY`. `vk-agent` needs its own `[tls]` section.
 
 For local development only, `insecure_no_auth = true` under `[api]` and `insecure_plaintext = true` under `[tls]` turn these checks off.
 

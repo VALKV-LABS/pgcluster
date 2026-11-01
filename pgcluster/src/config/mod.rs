@@ -148,11 +148,14 @@ pub struct ProxyConfig {
     pub pool: PoolConfig,
     #[serde(default)]
     pub read_routing: ReadRoutingConfig,
-    /// Use TLS to Postgres, verified against the cluster CA. SCRAM auth
-    /// passthrough cannot work over it, because Postgres then expects channel
-    /// binding to a TLS session the client is not part of.
-    #[serde(default)]
-    pub backend_tls: bool,
+    /// The role the proxy uses to read password verifiers. pgcluster creates it,
+    /// with access to one function and nothing else.
+    #[serde(default = "default_auth_user")]
+    pub auth_user: String,
+    /// Environment variable holding that role's password. Required, and it must
+    /// match on every instance.
+    #[serde(default = "default_auth_password_env")]
+    pub auth_password_env: String,
     /// The proxy stops routing this long after it last reached a majority of
     /// Raft voters. Must be shorter than failover detection, so that it stops
     /// before a new primary can be promoted.
@@ -160,6 +163,12 @@ pub struct ProxyConfig {
     pub quorum_lease_ms: u64,
 }
 
+fn default_auth_user() -> String {
+    "pgcluster_auth".into()
+}
+fn default_auth_password_env() -> String {
+    "PGCLUSTER_AUTH_PASSWORD".into()
+}
 fn default_quorum_lease() -> u64 {
     1000
 }
@@ -221,7 +230,8 @@ impl Default for ReadRoutingConfig {
 }
 
 fn default_read_routing_enabled() -> bool {
-    true
+    // Off, because a read that follows a write may then miss it.
+    false
 }
 fn default_max_lag_bytes() -> u64 {
     10 * 1024 * 1024
@@ -519,7 +529,7 @@ api_keys    = ["test-key"]
     fn defaults_applied_for_optional_sections() {
         let cfg: PgClusterConfig = toml::from_str(VALID_TOML).unwrap();
         assert_eq!(cfg.proxy.pool.max_connections_per_db_user, 25);
-        assert!(cfg.proxy.read_routing.enabled);
+        assert!(!cfg.proxy.read_routing.enabled);
         assert_eq!(cfg.metrics.listen_addr, "0.0.0.0:9190");
         assert!(!cfg.tls.insecure_plaintext);
     }

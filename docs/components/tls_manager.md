@@ -9,7 +9,7 @@ pgcluster refuses to start without certificates, unless a development flag is se
 | pgcluster to pgcluster (Raft, topology) | gRPC over TLS | Both sides, by the cluster CA |
 | pgcluster to vk-agent | gRPC over TLS | Both sides, by the cluster CA |
 | Client to proxy | TLS, when the client asks for it | The proxy, by its certificate |
-| Proxy to Postgres | TLS when `backend_tls = true` | Postgres, by the cluster CA and its hostname |
+| Proxy to Postgres | TLS | Postgres, by the cluster CA and its hostname |
 
 A gRPC connection with no client certificate, or with one from another CA, is rejected. So is a plaintext connection.
 
@@ -28,7 +28,7 @@ All three are required, in both `pgcluster` and `vk-agent` configs. Certificates
 
 A certificate's subject alternative name must match the address peers use: the `agent_addr`, `postgres_addr` or Raft peer address in the config.
 
-For local development only, `insecure_plaintext = true` replaces all three and turns TLS off. Both binaries log a warning. The flag cannot be combined with certificate files, or with `backend_tls`.
+For local development only, `insecure_plaintext = true` replaces all three and turns TLS off. Both binaries log a warning. The flag cannot be combined with certificate files.
 
 ## Generating certificates
 
@@ -46,9 +46,9 @@ Certificates from any other CA work too, such as Vault or cert-manager, as long 
 
 ## Proxy to Postgres
 
-`[proxy] backend_tls = true` encrypts the connection to Postgres, which needs `ssl = on` and a certificate from the cluster CA. The proxy verifies that certificate and its hostname, and a server that declines TLS is an error, never a fallback to plain TCP.
+The proxy always uses TLS to Postgres, which needs `ssl = on` and a certificate from the cluster CA with a name matching `postgres_addr`. The proxy verifies that certificate and its hostname. A server that declines TLS is an error, never a fallback to plain TCP.
 
-It defaults to `false`. Clients authenticate to Postgres through the proxy, and with TLS on that leg Postgres offers SCRAM channel binding, which binds to a session the client is not part of. So SCRAM logins fail through the proxy with `backend_tls` on.
+A client's SCRAM exchange cannot pass through a TLS connection to Postgres, because Postgres would bind the login to a session the client is not part of. So the proxy authenticates clients itself, as described in [proxy_layer.md](proxy_layer.md).
 
 ## Module layout
 

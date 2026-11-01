@@ -188,6 +188,7 @@ services:
       dockerfile: docker/pgcluster.Dockerfile
     environment:
       POSTGRES_PASSWORD: test
+      PGCLUSTER_AUTH_PASSWORD: dev-auth-password
       BACKUP_KEY: *backup-key
     depends_on:
       pg-primary:
@@ -215,6 +216,7 @@ services:
       dockerfile: docker/pgcluster.Dockerfile
     environment:
       POSTGRES_PASSWORD: test
+      PGCLUSTER_AUTH_PASSWORD: dev-auth-password
       BACKUP_KEY: *backup-key
     depends_on:
       pgcluster-1:
@@ -242,6 +244,7 @@ services:
       dockerfile: docker/pgcluster.Dockerfile
     environment:
       POSTGRES_PASSWORD: test
+      PGCLUSTER_AUTH_PASSWORD: dev-auth-password
       BACKUP_KEY: *backup-key
     depends_on:
       pgcluster-1:

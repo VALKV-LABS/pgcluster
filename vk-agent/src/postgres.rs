@@ -17,7 +17,15 @@ pub const MANAGED_PARAMETERS: &[&str] = &["synchronous_standby_names", "max_slot
 /// `name` must already be checked against `MANAGED_PARAMETERS`: identifiers
 /// cannot be bound as parameters, and neither can `ALTER SYSTEM` values.
 fn alter_system_sql(name: &str, value: &str) -> String {
-    format!("ALTER SYSTEM SET {name} = '{}'", value.replace('\'', "''"))
+    format!("ALTER SYSTEM SET {name} = {}", quote_literal(value))
+}
+
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// Wraps a `sqlx` connection pool to the local Postgres instance and exposes
@@ -204,6 +212,67 @@ impl LocalPostgres {
         Ok(())
     }
 
+    /// Create the role and function the proxy reads password verifiers with.
+    ///
+    /// `pg_authid` is readable only by superusers, so the function runs as its
+    /// owner, and the role can do nothing but call it. The version goes in the
+    /// function's comment, and everything commits together. Commit does not
+    /// wait for standbys, so this works while `sync_strict` is blocking writes.
+    pub async fn set_proxy_auth(&self, user: &str, password: &str, version: &str) -> Result<()> {
+        let role = quote_ident(user);
+        let mut tx = self.pool.begin().await.context("begin")?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+                .bind(user)
+                .fetch_one(&mut *tx)
+                .await
+                .context("look up the auth role")?;
+        let statements = [
+            "SET LOCAL synchronous_commit = local".to_string(),
+            if exists {
+                String::new()
+            } else {
+                format!("CREATE ROLE {role} LOGIN")
+            },
+            format!(
+                "ALTER ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD {}",
+                quote_literal(password)
+            ),
+            "CREATE SCHEMA IF NOT EXISTS pgcluster".to_string(),
+            "CREATE OR REPLACE FUNCTION pgcluster.get_auth(role_name name) RETURNS text \
+             LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$ \
+             SELECT rolpassword FROM pg_authid WHERE rolname = role_name AND rolcanlogin \
+             AND (rolvaliduntil IS NULL OR rolvaliduntil > now()) $$"
+                .to_string(),
+            "REVOKE ALL ON SCHEMA pgcluster FROM PUBLIC".to_string(),
+            "REVOKE ALL ON FUNCTION pgcluster.get_auth(name) FROM PUBLIC".to_string(),
+            format!("GRANT USAGE ON SCHEMA pgcluster TO {role}"),
+            format!("GRANT EXECUTE ON FUNCTION pgcluster.get_auth(name) TO {role}"),
+            format!(
+                "COMMENT ON FUNCTION pgcluster.get_auth(name) IS {}",
+                quote_literal(version)
+            ),
+        ];
+        for statement in statements.iter().filter(|s| !s.is_empty()) {
+            sqlx::query(statement)
+                .execute(&mut *tx)
+                .await
+                .context("set up the auth role")?;
+        }
+        tx.commit().await.context("commit")
+    }
+
+    /// The version from the last `set_proxy_auth`, if it has run.
+    pub async fn get_proxy_auth_version(&self) -> Result<String> {
+        let version: Option<String> = sqlx::query_scalar(
+            "SELECT obj_description(to_regprocedure('pgcluster.get_auth(name)'), 'pg_proc')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("get_proxy_auth_version query failed")?;
+        Ok(version.unwrap_or_default())
+    }
+
     /// Returns replication slots whose WAL has been removed. Their standbys
     /// can no longer catch up by streaming.
     pub async fn get_lost_slots(&self) -> Result<Vec<String>> {
@@ -278,6 +347,12 @@ pub fn parse_lsn(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_and_values_are_quoted() {
+        assert_eq!(quote_literal("it's"), "'it''s'");
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+    }
 
     #[test]
     fn alter_system_escapes_quotes() {
