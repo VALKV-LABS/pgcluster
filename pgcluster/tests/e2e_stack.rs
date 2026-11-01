@@ -504,6 +504,8 @@ async fn e2e_partition_stops_writes_on_both_sides() {
 /// Start the stack, and wait until the proxy can log clients in, which needs the
 /// leader to have set up its role on the primary.
 fn start_stack() {
+    // A test that failed leaves its stack up, and it must not fail the next one.
+    compose(&["--profile", "spare", "down", "-v", "--remove-orphans"]);
     if std::env::var("E2E_SKIP_BUILD").as_deref() == Ok("1") {
         compose(&["up", "-d", "--wait"]);
     } else {
@@ -872,6 +874,16 @@ async fn e2e_diverged_primary_rejoins_with_rewind() {
     start_stack();
     create_mode_test_table().await;
     add_and_seed_pg4().await;
+
+    // Streaming comes first, and the monitor marks it a replica on a later tick.
+    wait_until("pg4 to be a replica", Duration::from_secs(30), || async {
+        let Ok(response) = reqwest::get(format!("{DEFAULT_API}/api/nodes/pg4")).await else {
+            return false;
+        };
+        let node: serde_json::Value = response.json().await.unwrap_or_default();
+        node["role"] == "replica"
+    })
+    .await;
 
     let switched = reqwest::Client::new()
         .post(format!("{DEFAULT_API}/api/switchover"))
@@ -1499,6 +1511,7 @@ async fn e2e_one_node_recovers_after_its_vm_is_replaced() {
     let api = "http://localhost:8109";
     let dsn = "host=localhost port=5532 user=postgres password=test dbname=postgres";
 
+    single(&["down", "-v", "--remove-orphans"]);
     single(&["up", "-d", "--build", "--wait"]);
     wait_for_primary(api, Duration::from_secs(60)).await;
     let pg = connect_with_retries(dsn).await;

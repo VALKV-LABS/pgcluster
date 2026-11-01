@@ -86,7 +86,15 @@ async fn start_cluster() -> Vec<Node> {
     for (id, addr) in addrs.iter().rev() {
         nodes.push(start_node(*id, *addr, &addrs, *id == 1).await);
     }
-    leader_of(&nodes).await;
+    // Committing an entry commits the initial membership before it. Until then a
+    // membership change is refused as already in progress.
+    let leader = leader_of(&nodes).await;
+    let mut attempts = 0;
+    while leader.client_write(write(u64::MAX)).await.is_err() {
+        attempts += 1;
+        assert!(attempts < 100, "the cluster never committed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     nodes
 }
 
