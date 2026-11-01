@@ -5,10 +5,10 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 ## Part 1: Release and project basics
 
 - [ ] **1.1 Publish `v0.1.3`.** Add the Docker Hub secrets, then push the tag. *Done when:* `valkvlabs/pgcluster:0.1.3` and `valkvlabs/vk-agent:0.1.3` pull, and the GitHub release exists.
-- [ ] **1.2 Publish `latest` from releases.** `latest` is only enabled for the default branch, and releases run on tags. *Done when:* a release updates `latest`.
-- [ ] **1.3 Add `CONTRIBUTING.md`, `SECURITY.md` and `CHANGELOG.md`, and choose a CLA or DCO.** *Done when:* contributors have a documented path and security reports have a private route.
-- [ ] **1.4 Fix documentation drift.** The README links to `docs/config.md`, which does not exist, and `docs/components/rest_api.md` documents `/api/v1/*` while the server uses `/api/*`. *Done when:* every README link resolves and the API doc matches the routes.
-- [ ] **1.5 Run the Docker integration and end-to-end tests in CI.** These `#[ignore]` tests do not run in CI, and later parts depend on them. *Done when:* they run on every PR or nightly.
+- [ ] **1.2 Publish `latest` from releases.** The workflow now sets it explicitly on every release. *Done when:* a release updates `latest`.
+- [x] **1.3 Add `CONTRIBUTING.md`, `SECURITY.md` and `CHANGELOG.md`, and choose a CLA or DCO.** The project uses the DCO. *Done when:* contributors have a documented path and security reports have a private route.
+- [x] **1.4 Fix documentation drift.** *Done when:* every README link resolves and the API doc matches the routes.
+- [x] **1.5 Run the Docker integration and end-to-end tests in CI.** *Done when:* they run on every PR.
 
 ## Part 2: Secure defaults
 
@@ -109,3 +109,4 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 - End-to-end and CLI integration tests
 - TLS on Raft and `vk-agent` connections
 - Apache 2.0 licence, Clippy on `main`, and README corrections
+- Replica seeding in `make start`

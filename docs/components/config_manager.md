@@ -218,7 +218,7 @@ impl ConfigReloader {
 ### 5. Integration Points
 
 - All components receive `Arc<RwLock<PgClusterConfig>>` at startup and read it on demand.
-- `rest_api` calls `config_reloader.reload()` on `POST /api/v1/config/reload`.
+- `rest_api` serves the configuration, without secrets, on `GET /api/config`.
 - `tls_manager` is notified on TLS config changes.
 - `connection_pool` is updated on pool size changes.
 - `pgcluster config validate` loads and validates without starting any services.

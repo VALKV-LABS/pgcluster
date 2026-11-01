@@ -24,4 +24,6 @@ COPY vk-agent   ./vk-agent
 RUN cargo test --workspace --no-run
 
 # At runtime: run unit tests AND #[ignore] integration tests, stream all output.
-CMD ["cargo", "test", "--workspace", "--", "--include-ignored", "--nocapture"]
+# The e2e_ tests start their own stack with docker compose, so they run on the
+# host through `make test-e2e`.
+CMD ["cargo", "test", "--workspace", "--no-fail-fast", "--", "--include-ignored", "--skip", "e2e_", "--nocapture"]
