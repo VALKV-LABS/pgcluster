@@ -59,3 +59,28 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --workspace
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run integration tests
+        run: make test-integ
+
+  e2e:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Run end-to-end tests
+        run: make test-e2e

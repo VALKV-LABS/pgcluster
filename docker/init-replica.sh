@@ -26,11 +26,10 @@ if [ -f "${PGDATA}/PG_VERSION" ]; then
 else
   echo "[init-replica] Running pg_basebackup from ${PRIMARY_HOST}:${PRIMARY_PORT} ..."
 
-  # Write .pgpass into PGDATA so pg_basebackup can authenticate and the file
-  # persists for use by the standby's primary_conninfo (via passfile=).
+  # pg_basebackup needs an empty PGDATA, so the password file stays outside it
+  # until the backup finishes. It then moves in for primary_conninfo (passfile=).
   if [ -n "${POSTGRES_PASSWORD:-}" ]; then
-    mkdir -p "${PGDATA}"
-    PGPASSFILE="${PGDATA}/.pgpass"
+    PGPASSFILE="$(mktemp)"
     echo "${PRIMARY_HOST}:${PRIMARY_PORT}:replication:${PGUSER}:${POSTGRES_PASSWORD}" \
       > "${PGPASSFILE}"
     chmod 600 "${PGPASSFILE}"
@@ -40,6 +39,7 @@ else
   # Retry pg_basebackup up to 5 times: two replicas starting simultaneously can
   # race and hit "WAL segment already removed" if the other replica's stream
   # causes a checkpoint between slot creation and WAL streaming.
+  BACKUP_DONE=0
   for attempt in 1 2 3 4 5; do
     if pg_basebackup \
         --host="${PRIMARY_HOST}" \
@@ -51,12 +51,18 @@ else
         --no-password \
         --progress \
         --verbose; then
+      BACKUP_DONE=1
       break
     fi
     echo "[init-replica] pg_basebackup failed (attempt ${attempt}/5), retrying in 3s ..."
-    rm -rf "${PGDATA:?}"/*
+    find "${PGDATA}" -mindepth 1 -delete
     sleep 3
   done
+
+  if [ "${BACKUP_DONE}" -ne 1 ]; then
+    echo "[init-replica] pg_basebackup failed after 5 attempts." >&2
+    exit 1
+  fi
 
   # Write standby.signal so Postgres starts as a hot standby
   touch "${PGDATA}/standby.signal"
@@ -65,6 +71,8 @@ else
   # Use passfile= so the password is not stored in plaintext in the config.
   PASSFILE_ARG=""
   if [ -n "${POSTGRES_PASSWORD:-}" ]; then
+    mv "${PGPASSFILE}" "${PGDATA}/.pgpass"
+    chmod 600 "${PGDATA}/.pgpass"
     PASSFILE_ARG=" passfile=${PGDATA}/.pgpass"
   fi
   cat >> "${PGDATA}/postgresql.auto.conf" <<EOF

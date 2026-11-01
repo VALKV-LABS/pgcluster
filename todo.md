@@ -1,204 +1,113 @@
-# pgcluster Hardening TODO
+# pgcluster Roadmap
 
-## Critical — data loss or extended downtime risk
+Work in order, top to bottom. Each step lists what must be true for it to be done. Steps in Parts 1 to 5 implement [§10 of the management plane spec](docs/management-plane.md), and Parts 6 to 10 implement its stages.
 
-### 1. Concurrent switchover / failover guard
-**Problem:** The switchover API handler spawns a task with no lock. Two simultaneous
-`POST /api/switchover` calls (or a switchover racing an automatic failover on a different
-code path) can both run `execute_switchover` concurrently, issuing two competing promote
-RPCs and two `SetPrimary` writes.  
-**Fix:** Hold a single `Arc<Mutex<()>>` in `ApiState`; switchover and trigger_failover
-must acquire it before proceeding. Switchover should also check the in-progress flag and
-return `409 Conflict` if one is already running.  
-**Files:** `pgcluster/src/api/switchover.rs`, `pgcluster/src/failover/mod.rs`
+## Part 1: Release and project basics
 
-### 2. Fencing the old primary in a network-partition scenario
-**Problem:** When all application traffic flows through the pgcluster proxy, the Raft
-`SetPrimary` update propagates to all 3 proxy instances within milliseconds, effectively
-fencing the old primary from new writes. This is sufficient when the proxy is the
-**only** path to postgres.
+- [ ] **1.1 Publish `v0.1.3`.** Add the Docker Hub secrets, then push the tag. *Done when:* `valkvlabs/pgcluster:0.1.3` and `valkvlabs/vk-agent:0.1.3` pull, and the GitHub release exists.
+- [ ] **1.2 Publish `latest` from releases.** The workflow now sets it explicitly on every release. *Done when:* a release updates `latest`.
+- [x] **1.3 Add `CONTRIBUTING.md`, `SECURITY.md` and `CHANGELOG.md`, and choose a CLA or DCO.** The project uses the DCO. *Done when:* contributors have a documented path and security reports have a private route.
+- [x] **1.4 Fix documentation drift.** *Done when:* every README link resolves and the API doc matches the routes.
+- [x] **1.5 Run the Docker integration and end-to-end tests in CI.** *Done when:* they run on every PR.
+- [ ] **1.6 Build release images natively.** Each architecture builds on its own runner, with dependencies in a cached layer, and pushes to `main` keep the cache warm. *Done when:* a push to `main` publishes `edge` for both architectures, and a release takes under 15 minutes.
 
-The remaining gap is a **network partition** (not a crash): if pgcluster nodes lose
-contact with pg1 but some application servers can still reach pg1's postgres port
-directly (bypassing the proxy), those apps keep writing to pg1 while pg2 is promoted
-— split-brain. In a crash scenario (pg1 is actually down) this cannot happen.
+## Part 2: Secure defaults
 
-**Fix options (in order of effort):**  
-- **Firewall direct postgres ports** in production so only pgcluster can reach them (eliminates the gap entirely, low effort).  
-- **Watchdog in vk-agent**: if no pgcluster heartbeat is received for N seconds, vk-agent calls `pg_ctl stop` on itself, self-fencing the node.  
-- **STONITH** (IPMI / cloud power API): hard-reboot the old primary before promoting the candidate.  
-**Files:** `vk-agent/src/heartbeat.rs`, `vk-agent/src/server.rs`, infra/network config
+- [ ] **2.1 Require credentials on the REST API.** *Done when:* the server refuses to start without API keys, unless an explicit development flag is set.
+- [ ] **2.2 Require client certificates on every gRPC endpoint.** Covers `vk-agent` and Raft, signed by the cluster CA. *Done when:* a connection without a valid client certificate is rejected, by automated test.
+- [ ] **2.3 Use TLS between the proxy and Postgres.** *Done when:* the connection is encrypted and certificates are verified.
+- [ ] **2.4 Update docs.** *Done when:* the README and `docs/components/tls_manager.md` describe what 2.1 to 2.3 deliver.
 
-### 3. Automatic repoint after node recovery
-**Problem:** When a replica is offline during a failover, it is skipped in the repoint
-step (its vk-agent is unreachable). When it comes back, `MarkReplica` is called
-(updating Raft role), but its `primary_conninfo` still points at the dead old primary.
-It will keep retrying the dead host forever and never rejoin the cluster without manual
-intervention.  
-**Fix:** In `node_monitor::poll_all_nodes`, after proposing `MarkReplica`, also issue
-a `demote` RPC to repoint the node to `topology.primary_node_id`. Only do this when
-the node's `primary_conninfo` (visible in `pg_stat_wal_receiver`) does not match the
-current primary's hostname — add a `replication_conninfo` field to `StatusResponse`
-for this check.  
-**Files:** `pgcluster/src/node_monitor/mod.rs`, `vk-agent/src/server.rs`,
-`pgcluster/src/raft/network.rs` (proto)
+## Part 3: Safe failover
 
----
+- [ ] **3.1 Choose the failover candidate from live status.** Query reachable standbys at failover time. *Done when:* a test with a stale cached position promotes the most current standby.
+- [ ] **3.2 Stop writes on a proxy without quorum.** It must stop before a new primary can be promoted. *Done when:* a partition test shows no writes accepted on both sides.
+- [ ] **3.3 Turn self-fencing on by default.** Align its timeout with 3.2 and with failover timing, and validate the settings at startup. *Done when:* an invalid timing combination fails config validation.
+- [ ] **3.4 Add a partition test to the end-to-end suite.** *Done when:* it runs in CI and passes for 3.2 and 3.3.
 
-## High — security or major reliability gaps
+## Part 4: Replication modes
 
-### 4. vk-agent has no authentication
-**Problem:** Any process that can reach port 7001 on a vk-agent container can call
-`promote`, `demote`, or `stop_postgres`. There is no mTLS or token check.  
-**Fix:** Add mTLS: vk-agent generates a self-signed cert on first start; pgcluster
-presents a cluster CA-signed client cert. TLS infrastructure (`pgcluster/src/tls/`)
-already exists. Wire it into the tonic channel builder in `agent_clients.rs` and into
-the tonic server in vk-agent.  
-**Files:** `vk-agent/src/main.rs`, `pgcluster/src/agent_clients.rs`, `pgcluster/src/tls/`
+- [ ] **4.1 Add `replication_mode` to the config.** Values are `async`, `sync` and `sync_strict`, replacing the unused `synchronous_standby_names` setting and its sample comment. *Done when:* the setting is validated, and changing it applies without a restart.
+- [ ] **4.2 Apply `synchronous_standby_names` from the mode.** Use `ANY 1 (...)`, and update it when membership changes. *Done when:* `sync` commits wait for a standby, by test.
+- [ ] **4.3 Implement the fallback for `sync`.** Record the fallback through Raft before clearing the setting. *Done when:* writes resume after `sync_degrade_timeout` with both standbys down, and a later failover knows no standby is guaranteed current.
+- [ ] **4.4 Implement `sync_strict`.** Writes block with no standby, and promotion needs both standbys to answer. *Done when:* each case is covered by test.
+- [ ] **4.5 Set `max_slot_wal_keep_size`.** *Done when:* a dead standby cannot fill the primary's disk, and a standby past the limit is flagged for re-seeding.
 
-### 5. Raft gRPC is plaintext HTTP
-**Problem:** `network.rs` builds channels with `http://` — Raft consensus messages
-(topology commands, votes, log entries) are sent in the clear between pgcluster nodes.  
-**Fix:** Switch to `https://` with TLS using the same cluster CA as item 4. The
-`TlsManager` already generates certs; thread it into `PgClusterNetworkFactory`.  
-**Files:** `pgcluster/src/raft/network.rs`, `pgcluster/src/lib.rs`
+## Part 5: Node lifecycle and backups
 
-### 6. REST API has no authentication
-**Problem:** `POST /api/switchover`, `POST /api/failover`, and all admin endpoints are
-unauthenticated. Anyone who can reach port 8009 can trigger a failover.  
-**Fix:** Add a shared bearer token (configurable in TOML) validated by an Axum
-middleware layer. Long-term, mTLS on the API port is cleaner.  
-**Files:** `pgcluster/src/api/mod.rs`
+- [ ] **5.1 Add Raft membership changes.** Learners, voter promotion and member removal, through the REST API. *Done when:* a member can be replaced with no loss of quorum.
+- [ ] **5.2 Move node seeding into `vk-agent`.** It lives in `docker/init-replica.sh` today. *Done when:* a new node seeds through an RPC, from the primary.
+- [ ] **5.3 Rejoin an old primary with `pg_rewind`.** Re-seed if rewind fails. *Done when:* a diverged old primary rejoins automatically, by test.
+- [ ] **5.4 Add rolling restart.** Standbys, then switchover, then the old primary. *Done when:* it completes under client load with no failed commits beyond the switchover.
+- [ ] **5.5 Add a pgBackRest engine to the backup coordinator.** Use 2.60.0 or later, with data checksums. *Done when:* scheduled backups run from a standby and survive a leader change.
+- [ ] **5.6 Add WAL archiving.** *Done when:* `archive_command` works from whichever node is primary, including after failover.
+- [ ] **5.7 Add restore.** Seed from backup, and restore to a point in time. *Done when:* a point-in-time restore is verified by automated test, and 5.2 can seed from backup.
+- [ ] **5.8 Test one-node recovery.** *Done when:* a one-node cluster recovers after its VM is replaced and its volume reattached.
+- [ ] **5.9 Add an external standby role.** Excluded from failover and from Raft. *Done when:* it follows the primary and can be promoted into an independent cluster.
+- [ ] **5.10 Release `v0.2.0`.** *Done when:* the full end-to-end suite passes and images are published.
 
-### 7. Stale replication slots block WAL cleanup
-**Problem:** pgcluster creates replication slots (`pgcluster_<node_id>`) but never
-drops them. If a replica is permanently removed or the slot becomes stale (e.g. after
-a failover where the old primary comes back on a different timeline), the slot prevents
-the primary from recycling WAL, eventually filling the disk.  
-**Fix:** During failover step 1 (pick candidate), call
-`SELECT pg_drop_replication_slot(...)` on the old primary for every slot associated
-with nodes that will not reconnect. Also add a slot-audit job to node_monitor that
-drops orphaned slots (slots with `active = false` and `confirmed_flush_lsn` far behind
-`pg_current_wal_lsn()`).  
-**Files:** `pgcluster/src/failover/mod.rs`, `pgcluster/src/failover/slots.rs`
+## Part 6: Management plane, one node (Stage 1)
 
-### 8. No way to pause automatic failover during maintenance
-**Problem:** Routine maintenance (patching postgres, restarting a node) triggers
-automatic failover because node_monitor sees the node go offline. Operators have no
-way to inhibit it.  
-**Fix:** Add `POST /api/maintenance/{node_id}` to put a node in `Maintenance` role
-(already exists in `NodeRole` enum) before stopping it. node_monitor must skip
-failover for nodes in Maintenance state. Add `DELETE /api/maintenance/{node_id}` to
-restore.  
-**Files:** `pgcluster/src/api/nodes.rs`, `pgcluster/src/node_monitor/mod.rs`
+- [ ] **6.1 Define the contracts.** Write the admin and agent APIs in `openapi/`. *Done when:* both validate in CI.
+- [ ] **6.2 Scaffold `pgcluster-admin`.** Service, Postgres schema and migrations, and required API keys. *Done when:* it starts, migrates and serves health.
+- [ ] **6.3 Add hosts and enrolment.** Single-use tokens, the internal CA and client certificates. *Done when:* a host enrols, and a reused or expired token is rejected.
+- [ ] **6.4 Add `vk-agent host`.** New mode in the existing binary, with `vk-agent <config>` unchanged. It enrols, reports capacity and long-polls desired state. *Done when:* it runs as its own process, opens no port, and keeps its last state on disk.
+- [ ] **6.5 Add config rendering.** Generate each instance's `pgcluster` and `vk-agent` config from desired state. *Done when:* output passes `pgcluster` validation.
+- [ ] **6.6 Add process runners.** systemd for production, plain processes for development and tests. *Done when:* the host agent starts, stops and restarts an instance with both.
+- [ ] **6.7 Add the reconciler and operations.** Stored steps with `FOR UPDATE SKIP LOCKED`, `generation` and `observed_generation`. *Done when:* a restarted `pgcluster-admin` resumes an operation with no duplicate work.
+- [ ] **6.8 Add the database API for one node.** Create, read, delete, the owner role with a SCRAM verifier, and the allowlist. *Done when:* a database is created through the API and reachable over TLS.
+- [ ] **6.9 Add extensions.** *Done when:* each listed extension installs through the API without superuser.
+- [ ] **6.10 Add CLI commands.** *Done when:* the CLI covers enrolment and creating a database, and generates the password locally.
+- [ ] **6.11 Build the node image.** Packer recipe in `images/`, published as a public AMI with each release. *Done when:* a host from the AMI enrols.
+- [ ] **6.12 Add local quick start.** *Done when:* `make start` runs the full stack, including `pgcluster-admin` and the host agent.
+- [ ] **6.13 Add the AWS template.** Terraform in `deploy/aws/`, with a required `allowed_cidr` and per-host single-use tokens. *Done when:* one `terraform apply` produces a working database, and `terraform destroy` removes everything.
 
----
+## Part 7: Management plane, high availability (Stage 2)
 
-## Medium — operational gaps that will bite in production
+- [ ] **7.1 Create three-node databases.** *Done when:* nodes land on separate hosts and failure domains.
+- [ ] **7.2 Expose replication modes through the API.** *Done when:* `PATCH` changes the mode online.
+- [ ] **7.3 Add node replacement.** Replace a node through the API, using 5.1 and 5.2. *Done when:* replacement completes under client load.
+- [ ] **7.4 Add the event feed.** `GET /v1/events`, including `replacement_needed`. *Done when:* tooling can react without polling every database.
+- [ ] **7.5 Add switchover and restart.** *Done when:* both run as operations with logs.
+- [ ] **7.6 Add the HA test suite.** *Done when:* primary loss, a network partition and node replacement pass in all three modes.
 
-### 9. Proxy does not drain connections during switchover
-**Problem:** When switchover runs, clients with active transactions through the proxy
-get their connections dropped mid-flight when the backend switches. No graceful drain.  
-**Fix:** On switchover start, signal the proxy to stop accepting new connections to
-the old primary (mark it `draining`), wait up to N seconds for in-flight transactions
-to complete, then proceed. Clients waiting for a new connection get the new primary.  
-**Files:** `pgcluster/src/proxy/mod.rs`, `pgcluster/src/proxy/pool.rs`,
-`pgcluster/src/switchover/mod.rs`
+## Part 8: Management plane, backups (Stage 3)
 
-### 10. No post-promotion health check
-**Problem:** After `pg_promote()` returns, pgcluster immediately updates Raft and starts
-routing writes. If the promotion silently failed (e.g., pg_promote returned OK but
-postgres is actually confused), writes go to a non-primary.  
-**Fix:** After the promote RPC, issue `GetStatus` on the new primary and verify
-`is_in_recovery = false` before proposing `SetPrimary` to Raft. Retry up to 3 times
-with 500 ms gaps before aborting the switchover/failover.  
-**Files:** `pgcluster/src/switchover/handoff.rs`, `pgcluster/src/failover/mod.rs`
+- [ ] **8.1 Add backup repositories.** S3-compatible and POSIX, with per-database encryption. *Done when:* a repository is verified when registered.
+- [ ] **8.2 Add the backup API.** Retention, on-demand backups, listing and the restore window. *Done when:* the window matches what can actually be restored.
+- [ ] **8.3 Add restore as a new database.** *Done when:* a restore to a chosen time is verified by automated test and the source stays up.
+- [ ] **8.4 Require a first backup before access.** *Done when:* no database becomes `active` without a restorable backup.
 
-### 11. Failover history grows unbounded in Raft log
-**Problem:** Each `RecordFailover` command appends to `failover_history` in the Raft
-state machine with no cap. A cluster that experiences many failovers will have a
-growing state snapshot.  
-**Fix:** Cap `failover_history` at a configurable limit (e.g. 100 entries, oldest
-first out) in the state machine `apply` handler.  
-**Files:** `pgcluster/src/raft/state_machine.rs`
+## Part 9: Management plane, shared hosts (Stage 4)
 
-### 12. Switchover does not validate target is a Replica
-**Problem:** Calling `POST /api/switchover {"target_node_id": "pg1"}` when pg1 is
-already the primary, or when pg1 is `Offline`, will attempt the switchover anyway
-and fail mid-way through (demote succeeds, promote fails), leaving the cluster in a
-partial state.  
-**Fix:** In `api/switchover.rs`, validate that `target_node_id != current_primary`,
-that the target exists in topology, and that its role is `Replica` before spawning
-the switchover task. Return `400 Bad Request` with a clear message otherwise.  
-**Files:** `pgcluster/src/api/switchover.rs`
+- [ ] **9.1 Add the scheduler.** Capacity tracking, no overcommit, memory reserved for page cache, and placement across failure domains. *Done when:* an impossible request fails with a clear error.
+- [ ] **9.2 Add port blocks.** *Done when:* several instances run on one host with no collisions.
+- [ ] **9.3 Add isolation.** cgroup v2 limits and per-instance disk quotas. *Done when:* one busy database cannot starve another, by load test.
+- [ ] **9.4 Add host drain.** *Done when:* draining moves every instance off a host with no downtime.
 
-### 13. Replication password exposed in `postgresql.auto.conf`
-**Problem:** `primary_conninfo` written to each replica's `postgresql.auto.conf` by
-vk-agent's demote handler contains the plaintext replication password (e.g.
-`password=test`). Anyone who can read PGDATA can see the credential.  
-**Fix:** Use a `.pgpass` file owned by postgres (mode 600) instead of embedding the
-password in `primary_conninfo`. Alternatively, configure `pg_hba.conf` to use `trust`
-or `scram-sha-256` with a passfile, keeping the credential out of auto.conf.  
-**Files:** `vk-agent/src/server.rs` (demote handler), `docker/init-replica.sh`
+## Part 10: Management plane, day two (Stage 5)
 
-### 14. No end-to-end automated test
-**Problem:** Switchover and failover are only validated manually. Regressions (like
-the race condition and Unknown-role bugs fixed in this session) go undetected until
-manual testing.  
-**Fix:** Add an e2e test in `pgcluster/tests/` (or a separate `e2e/` crate) that:
-1. Starts the Docker Compose stack
-2. Runs `POST /api/switchover` and asserts the new primary is correct and both
-   other nodes are standbys
-3. Kills the primary container and asserts automatic failover promotes the right
-   candidate and all nodes repoint correctly  
-**Files:** new `e2e/` crate or `pgcluster/tests/e2e_integ.rs`
+- [ ] **10.1 Add resizing.** Resources and storage. *Done when:* each passes under client load.
+- [ ] **10.2 Add minor upgrades.** *Done when:* a rolling upgrade passes under client load.
+- [ ] **10.3 Add cross-region replicas.** Uses 5.9. *Done when:* a replica promotes into an independent database through the API.
+- [ ] **10.4 Release `v1.0.0`.** *Done when:* every stage in the spec meets its completion check, and the upgrade path from `v0.2.0` is documented.
 
-### 15. vk-agent PID namespace restart race
-**Problem:** When a postgres container restarts, Docker sometimes fails to attach the
-corresponding vk-agent to the new PID namespace, leaving vk-agent in a crash loop
-until manually `docker start`-ed.  
-**Fix:** Add a `depends_on` with `restart: on-failure` and a startup probe in
-vk-agent (retry connecting to the local postgres pool for up to 30 s before entering
-listen mode). Or decouple vk-agent from the shared PID namespace entirely and use
-`pg_ctl stop` with the explicit PID file path instead of the shared namespace trick.  
-**Files:** `docker/e2e-compose.yml`, `vk-agent/src/main.rs`
+## Done
 
----
-
-## Low — polish and observability
-
-### 16. Prometheus alerting rules not defined
-**Problem:** Metrics are exported (`pgcluster_failover_total`, `replica_lag_bytes`,
-`raft_is_leader`) but no alerting rules ship with the project. Operators have no
-default alerts for "primary has been offline for > 30s" or "replica lag > 100 MB".  
-**Fix:** Add a `docker/prometheus-alerts.yml` with rules for: failover triggered,
-no Raft leader, replica lag threshold breached, vk-agent unreachable.
-
-### 17. `pg_hba.conf` managed outside postgres
-**Problem:** `pg_hba.conf` is mounted as a static read-only file. Adding a new node
-or changing auth rules requires touching the Docker volume mount and restarting the
-container.  
-**Fix:** Add `POST /api/pg-hba/reload` that calls `reload_config` (pg_ctl reload /
-SIGHUP) on each vk-agent after writing a new `pg_hba.conf` snippet. This lets
-operators update auth rules without a container restart.  
-**Files:** `pgcluster/src/api/`, `vk-agent/src/server.rs`
-
-### 18. Failover history timestamp is unix epoch, not human-readable in API
-**Problem:** `triggered_at` in failover history is a raw `u64` unix timestamp.
-Operators reading the API response have to convert it manually.  
-**Fix:** Serialize as RFC 3339 string in the JSON API response.  
-**Files:** `pgcluster/src/api/status.rs`, `pgcluster/src/failover/events.rs`
-
-### 19. No `pgcluster` CLI end-to-end test
-**Problem:** The CLI commands (`pgcluster switchover`, `pgcluster status`, etc.) in
-`pgcluster/src/cli/` are tested only via unit tests. Integration with a running cluster
-is not covered.  
-**Fix:** Add integration tests in `pgcluster/tests/` that start the API server and
-exercise CLI commands against it.
-
-### 20. Raft gRPC Raft election timeout in `pgcluster-N.toml` is default
-**Problem:** `election_timeout_ms` defaults to 500 ms but with three pgcluster nodes
-all on the same host and `health_check_interval_ms = 1000`, the first health-check
-cycle after a Raft leader loss can take up to 1.5 s before a new leader is elected
-and failover can begin. Document recommended values and validate them in `validate.rs`.  
-**Files:** `pgcluster/src/config/validate.rs`, `docker/configs/pgcluster-*.toml`
+- Concurrent switchover and failover guard
+- Repoint of a recovered replica
+- Slot cleanup and orphan audit
+- Maintenance mode
+- Connection drain during switchover
+- Post-promotion health check
+- Failover history cap
+- Switchover target validation
+- `.pgpass` for replication credentials
+- `vk-agent` startup retry
+- Prometheus alert rules
+- Config reload endpoint
+- RFC 3339 failover timestamps
+- End-to-end and CLI integration tests
+- TLS on Raft and `vk-agent` connections
+- Apache 2.0 licence, Clippy on `main`, and README corrections
+- Replica seeding in `make start`

@@ -144,7 +144,7 @@ The topology is persisted through Raft log snapshots (see `raft_consensus.md`). 
 - `proxy_layer` reads `current_primary_addr()` and `replica_addrs_within_lag()` on every routing decision.
 - `failover_engine` calls `best_failover_candidate()` to select who to promote.
 - `node_monitor` proposes `UpdateFlushLsn` on every health check.
-- `rest_api` reads the full `ClusterTopology` to serve `/api/v1/cluster/status`.
+- `rest_api` reads the full `ClusterTopology` to serve `/api/topology`.
 - `connection_pool` subscribes to `TopologyWatch` to drain pools when primary changes.
 
 ---

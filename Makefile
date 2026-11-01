@@ -78,6 +78,11 @@ logs:  ## Tail logs from all containers in the full stack
 status:  ## Show container health and ports for the full stack
 	docker compose -f $(COMPOSE_E2E) ps
 
+.PHONY: test-e2e
+
+test-e2e:  ## Run the 3-node end-to-end tests on the host (they start and stop the stack)
+	$(CARGO) test -p pgcluster --test e2e_stack -- --ignored --test-threads=1 --skip e2e_switchover_against_running_stack --nocapture
+
 ##@ Multi-Shard E2E Stack (M5-A — coordinator + 2 shards)
 
 .PHONY: shard-start shard-stop shard-logs shard-status

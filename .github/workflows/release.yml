@@ -1,40 +1,60 @@
 name: Release
 
-# Triggered by version tags: v1.2.3
+# Every push to main publishes both images as `edge`. That also keeps the build
+# cache warm, so a release reuses it.
+#
+# Pushing a tag vX.Y.Z runs CI, publishes both images for amd64 and arm64 as
+# X.Y.Z, X.Y and latest, and creates the GitHub release.
+#
 # Requires two repository secrets:
 #   DOCKERHUB_USERNAME — Docker Hub username (valkvlabs)
 #   DOCKERHUB_TOKEN    — Docker Hub access token (create at hub.docker.com → Account Settings → Security)
 
 on:
   push:
+    branches: [main]
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
 
-env:
-  CARGO_TERM_COLOR: always
+permissions:
+  contents: read
 
 jobs:
-  # ── Gate: all CI checks must pass before pushing images ──────────────────────
+  # ── Gate: all CI checks must pass before a release ───────────────────────────
+  # ci.yml already runs on pushes to main.
   ci:
     name: CI
+    if: startsWith(github.ref, 'refs/tags/')
     uses: ./.github/workflows/ci.yml
 
-  # ── pgcluster image ───────────────────────────────────────────────────────────
-  docker-pgcluster:
-    name: Push pgcluster image
+  # ── Images ────────────────────────────────────────────────────────────────────
+  # Each platform builds on its own hardware, because compiling Rust under
+  # emulation takes hours.
+  build:
+    name: Build ${{ matrix.component }} ${{ matrix.arch }}
     needs: ci
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
+    if: ${{ !cancelled() && (needs.ci.result == 'success' || needs.ci.result == 'skipped') }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [pgcluster, vk-agent]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - component: pgcluster
+            image: valkvlabs/pgcluster
+            dockerfile: docker/pgcluster.Dockerfile
+          - component: vk-agent
+            image: valkvlabs/vk-agent
+            dockerfile: docker/vk-agent.Dockerfile
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up QEMU (ARM emulation)
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -42,45 +62,49 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: valkvlabs/pgcluster
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push pgcluster
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
+        env:
+          # The build record is not an archive the publish job can unpack, and
+          # nothing here reads it.
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: .
-          file: docker/pgcluster.Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=pgcluster
-          cache-to: type=gha,mode=max,scope=pgcluster
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('edge-{0}', github.sha) }}
+            org.opencontainers.image.licenses=Apache-2.0
+          outputs: type=image,name=${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.component }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.component }}-${{ matrix.arch }},mode=max
 
-  # ── vk-agent image ────────────────────────────────────────────────────────────
-  docker-vk-agent:
-    name: Push vk-agent image
-    needs: ci
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+      - name: Record the digest
+        run: |
+          mkdir -p digests
+          echo "${{ steps.build.outputs.digest }}" > "digests/${{ matrix.component }}-${{ matrix.arch }}"
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.component }}-${{ matrix.arch }}
+          path: digests/*
+          retention-days: 1
+
+  publish:
+    name: Publish images
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: artifacts
 
-      - name: Set up QEMU (ARM emulation)
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -88,50 +112,55 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: valkvlabs/vk-agent
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Join the platforms under one tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+            tags="$version ${version%.*} latest"
+          else
+            tags=edge
+          fi
+          for component in pgcluster vk-agent; do
+            image="valkvlabs/$component"
+            sources=""
+            for arch in amd64 arm64; do
+              sources="$sources $image@$(cat "artifacts/digest-$component-$arch/$component-$arch")"
+            done
+            args=""
+            for tag in $tags; do args="$args -t $image:$tag"; done
+            # shellcheck disable=SC2086
+            docker buildx imagetools create $args $sources
+          done
 
-      - name: Build and push vk-agent
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/vk-agent.Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=vk-agent
-          cache-to: type=gha,mode=max,scope=vk-agent
-
-  # ── GitHub Release note ───────────────────────────────────────────────────────
+  # ── GitHub release ────────────────────────────────────────────────────────────
   github-release:
     name: Create GitHub Release
-    needs: [docker-pgcluster, docker-vk-agent]
-    runs-on: ubuntu-latest
+    needs: publish
+    if: ${{ !cancelled() && needs.publish.result == 'success' && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - name: Release notes from the changelog
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            /^## / { on = (index($0, "[" v "]") > 0) ; next }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
+          {
+            echo
+            echo "## Docker images"
+            echo
+            echo '```'
+            echo "docker pull valkvlabs/pgcluster:$version"
+            echo "docker pull valkvlabs/vk-agent:$version"
+            echo '```'
+          } >> notes.md
+
+      - uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
-          body: |
-            ## Docker images
-
-            ```
-            docker pull valkvlabs/pgcluster:${{ github.ref_name }}
-            docker pull valkvlabs/vk-agent:${{ github.ref_name }}
-            ```
-
-            See [AGENT_CONTEXT.md](AGENT_CONTEXT.md) for quick-start instructions.
+          body_path: notes.md

@@ -259,7 +259,7 @@ listen_addr = "0.0.0.0:8009"
 api_keys    = ["change-me"]
 ```
 
-Full config reference: [`docs/config.md`](docs/config.md) · Example: [`examples/cluster.toml`](examples/cluster.toml)
+Full config reference: [`docs/components/config_manager.md`](docs/components/config_manager.md) · Example: [`examples/cluster.toml`](examples/cluster.toml)
 
 ---
 

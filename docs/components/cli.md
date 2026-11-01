@@ -197,11 +197,11 @@ pub struct PgClusterClient {
 
 impl PgClusterClient {
     pub async fn get_status(&self) -> Result<ClusterStatusResponse> {
-        self.get("/api/v1/cluster/status").await
+        self.get("/api/status").await
     }
 
     pub async fn switchover(&self, target: &str) -> Result<SwitchoverResponse> {
-        self.post("/api/v1/cluster/switchover", json!({ "target": target })).await
+        self.post("/api/switchover", json!({ "target_node_id": target })).await
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
