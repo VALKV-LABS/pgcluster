@@ -137,8 +137,16 @@ pub struct ProxyConfig {
     /// binding to a TLS session the client is not part of.
     #[serde(default)]
     pub backend_tls: bool,
+    /// The proxy stops routing this long after it last reached a majority of
+    /// Raft voters. Must be shorter than failover detection, so that it stops
+    /// before a new primary can be promoted.
+    #[serde(default = "default_quorum_lease")]
+    pub quorum_lease_ms: u64,
 }
 
+fn default_quorum_lease() -> u64 {
+    1000
+}
 fn default_proxy_listen() -> String {
     "0.0.0.0:5432".into()
 }

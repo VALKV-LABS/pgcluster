@@ -2,12 +2,16 @@ use super::PgClusterConfig;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 
+/// Below this, a single slow probe round would stop the proxy.
+const MIN_QUORUM_LEASE_MS: u64 = 200;
+
 /// Validate the parsed config and return a descriptive error if anything is wrong.
 pub fn validate(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     validate_cluster(cfg)?;
     validate_raft(cfg)?;
     validate_nodes(cfg)?;
     validate_addresses(cfg)?;
+    validate_timing(cfg)?;
     validate_tls(cfg)?;
     validate_api(cfg)?;
     validate_backup(cfg)?;
@@ -110,6 +114,38 @@ fn validate_addresses(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Partition safety rests on these orderings, so a config that breaks one is
+/// refused rather than left to fail during an outage.
+fn validate_timing(cfg: &PgClusterConfig) -> anyhow::Result<()> {
+    let failover = &cfg.failover;
+    let lease = cfg.proxy.quorum_lease_ms;
+    let detection = failover.health_check_interval_ms
+        * u64::from(failover.health_check_failures_before_failover);
+
+    if lease < MIN_QUORUM_LEASE_MS {
+        anyhow::bail!("[proxy] quorum_lease_ms ({lease}) must be >= {MIN_QUORUM_LEASE_MS}");
+    }
+    // An isolated proxy must stop before the majority can start a failover.
+    if lease >= detection {
+        anyhow::bail!(
+            "[proxy] quorum_lease_ms ({lease}) must be < failover detection time \
+             (health_check_interval_ms × health_check_failures_before_failover = {detection})"
+        );
+    }
+    // An election, plus one heartbeat period, must not read as lost contact,
+    // or a routine leader change would fence healthy nodes.
+    let needed = cfg.raft.election_timeout_ms * 2 + failover.health_check_interval_ms;
+    let heartbeat_timeout = failover.agent_heartbeat_timeout_seconds * 1000;
+    if heartbeat_timeout <= needed {
+        anyhow::bail!(
+            "[failover] agent_heartbeat_timeout_seconds ({}) must be longer than \
+             2 × election_timeout_ms + health_check_interval_ms ({needed} ms)",
+            failover.agent_heartbeat_timeout_seconds
+        );
+    }
+    Ok(())
+}
+
 fn validate_tls(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     let tls = &cfg.tls;
     let files = [&tls.ca_cert, &tls.cert, &tls.key];
@@ -190,6 +226,10 @@ mod tests {
     use super::*;
     use crate::config::*;
 
+    fn default_quorum_lease() -> u64 {
+        toml::from_str::<ProxyConfig>("").unwrap().quorum_lease_ms
+    }
+
     fn minimal() -> PgClusterConfig {
         PgClusterConfig {
             cluster: ClusterConfig {
@@ -239,6 +279,7 @@ mod tests {
                 pool: Default::default(),
                 read_routing: Default::default(),
                 backend_tls: false,
+                quorum_lease_ms: 1000,
             },
             failover: FailoverConfig::default(),
             tls: TlsConfig {
@@ -321,6 +362,45 @@ mod tests {
         let mut cfg = minimal();
         cfg.nodes.node[0].postgres_addr = "postgres:notaport".into();
         assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn quorum_lease_must_expire_before_failover_detection() {
+        let mut cfg = minimal();
+        cfg.failover.health_check_interval_ms = 500;
+        cfg.failover.health_check_failures_before_failover = 3;
+        cfg.proxy.quorum_lease_ms = 1500;
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("quorum_lease_ms"), "{err}");
+
+        cfg.proxy.quorum_lease_ms = 1499;
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn quorum_lease_must_not_be_too_short() {
+        let mut cfg = minimal();
+        cfg.proxy.quorum_lease_ms = 50;
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn agent_heartbeat_timeout_must_outlast_an_election() {
+        let mut cfg = minimal();
+        cfg.raft.election_timeout_ms = 5000;
+        cfg.failover.agent_heartbeat_timeout_seconds = 10;
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("agent_heartbeat_timeout_seconds"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn default_timing_is_valid() {
+        let cfg = minimal();
+        assert_eq!(cfg.proxy.quorum_lease_ms, default_quorum_lease());
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]

@@ -69,6 +69,10 @@ idle_timeout_seconds        = 600
 enabled               = true
 max_replica_lag_bytes = 10485760   # 10 MiB
 
+# Stop routing this long after losing contact with the Raft majority. Must be
+# shorter than failover detection (interval × failures below).
+# quorum_lease_ms = 1000
+
 [failover]
 health_check_interval_ms              = 500   # How often to poll vk-agent on each node
 health_check_failures_before_failover = 3     # Consecutive failures before triggering failover

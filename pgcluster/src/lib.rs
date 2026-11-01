@@ -98,10 +98,18 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
     // Build the proxy Router early so it can be shared between the ProxyServer
     // (which uses it for routing) and ApiState (which uses it for drain control).
-    let proxy_router = Arc::new(proxy::Router::new(
-        topology_rx.clone(),
-        cfg.proxy.read_routing.clone(),
+    let quorum = Arc::new(raft::lease::QuorumLease::new(
+        std::time::Duration::from_millis(cfg.proxy.quorum_lease_ms),
     ));
+    raft::lease::spawn_renewal(
+        quorum.clone(),
+        raft_node.raft.clone(),
+        tls_mgr.as_ref().map(|t| t.tonic_client_tls_config()),
+    );
+    let proxy_router = Arc::new(
+        proxy::Router::new(topology_rx.clone(), cfg.proxy.read_routing.clone())
+            .with_quorum(quorum.clone()),
+    );
 
     // Shared op_in_progress flag: prevents concurrent automatic failover (node_monitor)
     // and operator-initiated failover/switchover (API handlers) from running simultaneously.
@@ -249,6 +257,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                 repl_password,
                 slot_prefix,
                 op_in_progress.clone(),
+                quorum,
             );
             monitor.run().await;
         }));

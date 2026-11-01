@@ -5,6 +5,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Security
+- **Breaking:** self-fencing is on by default. `fence_timeout_seconds` defaults to 30, and 0 turns it off. It was previously off unless set, and 0 fenced immediately.
 - **Breaking:** `pgcluster server` refuses to start without `api_keys`. `insecure_no_auth = true` opts out, for local development only.
 - **Breaking:** Raft, topology and `vk-agent` gRPC require a client certificate from the cluster CA. `pgcluster` and `vk-agent` refuse to start without `ca_cert`, `cert` and `key`. `insecure_plaintext = true` opts out, for local development only.
 - **Breaking:** `[tls] auto_generate` and `pgcluster init --gen-certs` are gone, because they gave each node its own CA. Use `pgcluster certs`.
@@ -22,6 +23,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - A release skips CI when it already passed on `main` for the tagged commit.
 
 ### Added
+- A proxy that loses contact with the Raft majority stops routing, within `quorum_lease_ms` and before a new primary can be promoted.
+- A Raft leader without quorum stops heartbeating agents and stops driving failover.
+- Startup validation of partition timing: `quorum_lease_ms` against failover detection, and `agent_heartbeat_timeout_seconds` against Raft elections.
+- A partition test in the end-to-end suite.
 - The CLI sends the key in `PGCLUSTER_API_KEY` to the REST API.
 - `pgcluster certs` generates a cluster CA and certificates.
 - `[proxy] backend_tls` encrypts and verifies the connection to Postgres.

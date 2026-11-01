@@ -6,6 +6,7 @@
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 
 use crate::config::ReadRoutingConfig;
+use crate::raft::lease::QuorumLease;
 use crate::raft::{NodeRole, TopologyWatch};
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -17,6 +18,8 @@ pub struct Router {
     /// When `true`, new connections to the primary are refused so in-flight
     /// transactions can complete before a switchover proceeds.
     draining: Arc<AtomicBool>,
+    /// Must be held to route anything. `None` skips the check.
+    quorum: Option<Arc<QuorumLease>>,
 }
 
 impl Router {
@@ -25,7 +28,19 @@ impl Router {
             topology: watch,
             config,
             draining: Arc::new(AtomicBool::new(false)),
+            quorum: None,
         }
+    }
+
+    /// Stop routing whenever `quorum` is not held.
+    pub fn with_quorum(mut self, quorum: Arc<QuorumLease>) -> Self {
+        self.quorum = Some(quorum);
+        self
+    }
+
+    /// Returns `false` once this proxy has lost contact with the Raft majority.
+    pub fn has_quorum(&self) -> bool {
+        self.quorum.as_ref().is_none_or(|q| q.is_held())
     }
 
     /// Begin draining: refuse new primary connections. Call before switchover.

@@ -60,6 +60,7 @@ services:
   # ── Postgres nodes ──────────────────────────────────────────────────────────
 
   pg-primary:
+    networks: [default, side-a]
     image: postgres:16
     init: true
     restart: unless-stopped
@@ -94,6 +95,7 @@ services:
       retries: 15
 
   pg-replica-1:
+    networks: [default, side-b]
     image: postgres:16
     init: true
     restart: unless-stopped
@@ -115,6 +117,7 @@ services:
     entrypoint: ["/docker-entrypoint-initdb.d/init-replica.sh", "pg-primary"]
 
   pg-replica-2:
+    networks: [default, side-b]
     image: postgres:16
     init: true
     restart: unless-stopped
@@ -138,6 +141,7 @@ services:
   # ── vk-agent sidecars ───────────────────────────────────────────────────────
 
   vk-agent-1:
+    networks: [default, side-a]
     build:
       context: ..
       dockerfile: docker/vk-agent.Dockerfile
@@ -162,6 +166,7 @@ services:
       retries: 10
 
   vk-agent-2:
+    networks: [default, side-b]
     build:
       context: ..
       dockerfile: docker/vk-agent.Dockerfile
@@ -178,6 +183,7 @@ services:
       - certs:/certs:ro
 
   vk-agent-3:
+    networks: [default, side-b]
     build:
       context: ..
       dockerfile: docker/vk-agent.Dockerfile
@@ -196,6 +202,7 @@ services:
   # ── pgcluster nodes ─────────────────────────────────────────────────────────
 
   pgcluster-1:
+    networks: [default, side-a]
     build:
       context: ..
       dockerfile: docker/pgcluster.Dockerfile
@@ -225,6 +232,7 @@ services:
       retries: 20
 
   pgcluster-2:
+    networks: [default, side-b]
     build:
       context: ..
       dockerfile: docker/pgcluster.Dockerfile
@@ -250,6 +258,7 @@ services:
       retries: 20
 
   pgcluster-3:
+    networks: [default, side-b]
     build:
       context: ..
       dockerfile: docker/pgcluster.Dockerfile
@@ -273,6 +282,12 @@ services:
       interval: 3s
       timeout: 5s
       retries: 20
+
+# Each side keeps its own network, so disconnecting one side from `default`
+# partitions the cluster and leaves that side working. See e2e_partition_*.
+networks:
+  side-a:
+  side-b:
 
 volumes:
   certs:

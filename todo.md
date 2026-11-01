@@ -21,9 +21,9 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 ## Part 3: Safe failover
 
 - [x] **3.1 Choose the failover candidate from live status.** Query reachable standbys at failover time. *Done when:* a test with a stale cached position promotes the most current standby.
-- [ ] **3.2 Stop writes on a proxy without quorum.** It must stop before a new primary can be promoted. *Done when:* a partition test shows no writes accepted on both sides.
-- [ ] **3.3 Turn self-fencing on by default.** Align its timeout with 3.2 and with failover timing, and validate the settings at startup. *Done when:* an invalid timing combination fails config validation.
-- [ ] **3.4 Add a partition test to the end-to-end suite.** *Done when:* it runs in CI and passes for 3.2 and 3.3.
+- [x] **3.2 Stop writes on a proxy without quorum.** It must stop before a new primary can be promoted. *Done when:* a partition test shows no writes accepted on both sides.
+- [x] **3.3 Turn self-fencing on by default.** Align its timeout with 3.2 and with failover timing, and validate the settings at startup. *Done when:* an invalid timing combination fails config validation.
+- [x] **3.4 Add a partition test to the end-to-end suite.** *Done when:* it runs in CI and passes for 3.2 and 3.3.
 
 ## Part 4: Replication modes
 

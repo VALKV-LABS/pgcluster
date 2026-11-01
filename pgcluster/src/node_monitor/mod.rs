@@ -12,6 +12,7 @@ use crate::agent_clients::AgentClientPool;
 use crate::config::FailoverConfig;
 use crate::metrics_registry::Metrics;
 use crate::raft::commands::TopologyCommand;
+use crate::raft::lease::QuorumLease;
 use crate::raft::topology::{ClusterTopology, NodeRole};
 use crate::raft::{RaftNode, TopologyWatch};
 use failure_state::FailureTracker;
@@ -34,6 +35,9 @@ pub struct NodeMonitor {
     slot_prefix: String,
     /// Shared with the API handlers: prevents concurrent automatic + manual operations.
     op_in_progress: Arc<AtomicBool>,
+    /// A leader cut off from the majority does not know it has lost leadership
+    /// yet, so this instance acts only while it holds the lease.
+    quorum: Arc<QuorumLease>,
     /// How many health-check ticks between orphaned-slot audits on the primary.
     /// Default: 120 ticks × 500 ms interval ≈ once per minute.
     slot_audit_ticks: u64,
@@ -51,6 +55,7 @@ impl NodeMonitor {
         repl_password: String,
         slot_prefix: String,
         op_in_progress: Arc<AtomicBool>,
+        quorum: Arc<QuorumLease>,
     ) -> Self {
         Self {
             raft,
@@ -62,6 +67,7 @@ impl NodeMonitor {
             repl_password,
             slot_prefix,
             op_in_progress,
+            quorum,
             slot_audit_ticks: 120,
         }
     }
@@ -100,6 +106,10 @@ impl NodeMonitor {
             if !is_leader {
                 continue;
             }
+            if !self.quorum.is_held() {
+                debug!("Raft leader without quorum, skipping health check");
+                continue;
+            }
 
             let topology = self.topology_rx.current();
             self.poll_all_nodes(&topology, &mut tracker).await;
@@ -116,7 +126,8 @@ impl NodeMonitor {
         }
     }
 
-    /// Heartbeat every agent while this instance is the Raft leader.
+    /// Heartbeat every agent while this instance is the Raft leader with quorum.
+    /// A stale leader must go quiet, or its isolated agent would never fence.
     ///
     /// Runs apart from the health checks, because a status call that hangs on
     /// one busy Postgres must not starve the others and fence them.
@@ -124,12 +135,13 @@ impl NodeMonitor {
         let raft = self.raft.clone();
         let topology_rx = self.topology_rx.clone();
         let pool = self.pool.clone();
+        let quorum = self.quorum.clone();
         tokio::spawn(async move {
             let mut tick = time::interval(interval);
             loop {
                 tick.tick().await;
                 let metrics = raft.raft.metrics().borrow().clone();
-                if metrics.current_leader != Some(metrics.id) {
+                if metrics.current_leader != Some(metrics.id) || !quorum.is_held() {
                     continue;
                 }
                 for (node_id, cfg) in &topology_rx.current().node_configs {

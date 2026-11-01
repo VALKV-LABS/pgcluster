@@ -25,6 +25,9 @@ use super::{
     ssl::{handle_ssl_owned, MaybeTlsStream},
 };
 
+const NO_QUORUM_MESSAGE: &str =
+    "proxy lost contact with the cluster majority; reconnect to another node";
+
 // ── ProxyConnection ───────────────────────────────────────────────────────────
 
 /// Run the full proxy session state machine for one client connection.
@@ -105,6 +108,12 @@ impl ProxyConnection {
             return Ok(());
         }
 
+        // Without quorum the other side may already be promoting a new primary.
+        if !router.has_quorum() {
+            write_error_response(&mut client, "FATAL", "57P03", NO_QUORUM_MESSAGE).await?;
+            return Ok(());
+        }
+
         let (primary_node_id, primary_addr) =
             match router.primary_node_id().zip(router.primary_addr()) {
                 Some(pair) => pair,
@@ -159,6 +168,11 @@ impl ProxyConnection {
                     break;
                 }
             };
+
+            if !router.has_quorum() && !matches!(msg, FrontendMessage::Terminate) {
+                write_error_response(&mut client, "FATAL", "57P03", NO_QUORUM_MESSAGE).await?;
+                break;
+            }
 
             match msg {
                 // ── Terminate ─────────────────────────────────────────────

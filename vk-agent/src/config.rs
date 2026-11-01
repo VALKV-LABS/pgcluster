@@ -36,9 +36,9 @@ pub struct AgentConfig {
     /// If pgcluster heartbeats are absent for this many seconds *after* safe mode
     /// is entered, vk-agent calls `pg_ctl stop -m immediate` and exits, self-fencing
     /// the local postgres against split-brain writes in a network partition.
-    /// Set to 0 or omit to disable (default: disabled).
-    #[serde(default)]
-    pub fence_timeout_seconds: Option<u64>,
+    /// 0 turns self-fencing off.
+    #[serde(default = "default_fence_timeout")]
+    pub fence_timeout_seconds: u64,
 
     /// TLS for the gRPC server. Required unless `insecure_plaintext` is set.
     #[serde(default)]
@@ -81,6 +81,9 @@ fn default_pg_dbname() -> String {
 fn default_heartbeat_timeout() -> u64 {
     10
 }
+fn default_fence_timeout() -> u64 {
+    30
+}
 fn default_pg_ctl() -> String {
     "pg_ctl".into()
 }
@@ -103,6 +106,9 @@ impl AgentConfig {
         self.listen_addr
             .parse::<SocketAddr>()
             .map_err(|e| anyhow::anyhow!("listen_addr {:?} is invalid: {}", self.listen_addr, e))?;
+        if self.heartbeat_timeout_seconds == 0 {
+            anyhow::bail!("heartbeat_timeout_seconds must be > 0");
+        }
         let tls = &self.tls;
         let files = [&tls.ca_cert, &tls.cert, &tls.key];
         if tls.insecure_plaintext {
@@ -165,6 +171,10 @@ listen_addr = "0.0.0.0:7001"
 "#;
         let cfg: AgentConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.heartbeat_timeout_seconds, 10);
+        assert_eq!(
+            cfg.fence_timeout_seconds, 30,
+            "self-fencing is on by default"
+        );
         assert_eq!(cfg.postgres_user, "postgres");
         assert_eq!(cfg.postgres_dbname, "postgres");
     }
@@ -172,6 +182,13 @@ listen_addr = "0.0.0.0:7001"
     fn parse(tls: &str) -> anyhow::Result<()> {
         let toml = format!("data_dir = \"/pgdata\"\n{tls}");
         toml::from_str::<AgentConfig>(&toml).unwrap().validate()
+    }
+
+    #[test]
+    fn zero_heartbeat_timeout_fails() {
+        let toml = "data_dir = \"/pgdata\"\nheartbeat_timeout_seconds = 0\n\n[tls]\ninsecure_plaintext = true";
+        let cfg: AgentConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
@@ -198,7 +215,7 @@ listen_addr = "0.0.0.0:7001"
             postgres_password: None,
             postgres_dbname: "postgres".into(),
             heartbeat_timeout_seconds: 10,
-            fence_timeout_seconds: None,
+            fence_timeout_seconds: 30,
             tls: Default::default(),
             pg_ctl_path: "pg_ctl".into(),
         };

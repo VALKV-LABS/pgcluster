@@ -67,7 +67,10 @@ async fn main() -> Result<()> {
 
     // Self-fencing watchdog: if pgcluster heartbeats are absent for fence_timeout seconds
     // after entering safe mode, stop postgres immediately to prevent split-brain writes.
-    if let Some(fence_secs) = config.fence_timeout_seconds {
+    let fence_secs = config.fence_timeout_seconds;
+    if fence_secs == 0 {
+        tracing::warn!("self-fencing is off (fence_timeout_seconds = 0)");
+    } else {
         let fence_timeout = Duration::from_secs(fence_secs);
         let hb = heartbeat.clone();
         let ctl = pg_ctl.clone();

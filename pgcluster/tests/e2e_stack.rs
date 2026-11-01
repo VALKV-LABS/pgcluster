@@ -361,6 +361,144 @@ async fn e2e_cluster_forms_and_has_primary() {
     compose(&["down", "-v", "--remove-orphans"]);
 }
 
+/// The containers on the minority side, which starts with the primary.
+const MINORITY: [&str; 3] = ["pg-primary", "vk-agent-1", "pgcluster-1"];
+
+fn psql(service: &str, proxy: &str, sql: &str) -> std::process::Output {
+    let conninfo =
+        format!("host={proxy} user=postgres dbname=postgres sslmode=disable connect_timeout=2");
+    Command::new("docker")
+        .args(["compose", "-f", COMPOSE_FILE, "exec", "-T"])
+        .args(["-e", "PGPASSWORD=test", service])
+        .args(["psql", &conninfo, "-v", "ON_ERROR_STOP=1", "-Atc", sql])
+        .current_dir(project_root())
+        .output()
+        .expect("docker compose exec psql")
+}
+
+fn write_through(service: &str, proxy: &str, value: u32) -> bool {
+    psql(
+        service,
+        proxy,
+        &format!("INSERT INTO partition_test VALUES ({value})"),
+    )
+    .status
+    .success()
+}
+
+fn cut_off_from_default_network(service: &str) {
+    let id = compose(&["ps", "-q", service]);
+    let id = String::from_utf8_lossy(&id.stdout).trim().to_string();
+    let status = Command::new("docker")
+        .args(["network", "disconnect", "docker_default", &id])
+        .status()
+        .expect("docker network disconnect");
+    assert!(status.success(), "could not disconnect {service}");
+}
+
+/// Splits the cluster with the primary on the minority side. The isolated proxy
+/// must stop accepting writes before the majority starts its failover, so no
+/// write lands on both sides, and the isolated agent must then fence Postgres.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_partition_stops_writes_on_both_sides() {
+    let skip_build = std::env::var("E2E_SKIP_BUILD").as_deref() == Ok("1");
+    let majority_api = "http://localhost:18009";
+
+    if skip_build {
+        compose(&["up", "-d", "--wait"]);
+    } else {
+        compose(&["up", "-d", "--build", "--wait"]);
+    }
+    let status = wait_for_primary(DEFAULT_API, Duration::from_secs(90)).await;
+    assert_eq!(
+        status["primary_node_id"], "pg1",
+        "pg1 must start as primary"
+    );
+
+    assert!(
+        psql(
+            "pg-primary",
+            "pgcluster-1",
+            "CREATE TABLE partition_test (value int)"
+        )
+        .status
+        .success(),
+        "create the test table"
+    );
+    assert!(write_through("pg-primary", "pgcluster-1", 0));
+
+    for service in MINORITY {
+        cut_off_from_default_network(service);
+    }
+    eprintln!("==> Partitioned");
+
+    // Keep writing on the isolated side until it refuses.
+    let mut last_accepted = chrono::Utc::now();
+    let mut refused = false;
+    for value in 1..100 {
+        if write_through("pg-primary", "pgcluster-1", value) {
+            last_accepted = chrono::Utc::now();
+        } else {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "the isolated proxy kept accepting writes");
+    eprintln!("==> Isolated proxy refused writes after {last_accepted}");
+
+    let new_primary = wait_for_new_primary(majority_api, "pg1", Duration::from_secs(60)).await;
+    eprintln!("==> Majority promoted {new_primary}");
+
+    let history: serde_json::Value = reqwest::get(format!("{majority_api}/api/failover/history"))
+        .await
+        .expect("GET /api/failover/history")
+        .json()
+        .await
+        .expect("parse failover history");
+    eprintln!("==> History: {history}");
+    let triggered_at = history
+        .as_array()
+        .and_then(|events| events.last())
+        .and_then(|event| event["triggered_at"].as_str())
+        .expect("failover history must record the failover");
+    let triggered_at = chrono::DateTime::parse_from_rfc3339(triggered_at)
+        .expect("parse triggered_at")
+        .with_timezone(&chrono::Utc);
+    // triggered_at has whole seconds, so compare at that resolution.
+    assert!(
+        last_accepted.timestamp() <= triggered_at.timestamp(),
+        "the isolated side accepted a write at {last_accepted}, \
+         after failover began at {triggered_at}"
+    );
+
+    assert!(
+        !write_through("pg-primary", "pgcluster-1", 1000),
+        "the isolated side must still refuse writes"
+    );
+    assert!(
+        write_through("pg-replica-2", "pgcluster-2", 2000),
+        "the majority must accept writes on the new primary"
+    );
+
+    // heartbeat_timeout_seconds + fence_timeout_seconds, plus a margin.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let logs = compose(&["logs", "--no-log-prefix", "vk-agent-1"]);
+        if String::from_utf8_lossy(&logs.stdout).contains("self-fencing") {
+            eprintln!("==> Isolated agent self-fenced");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the isolated agent did not fence"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    compose(&["down", "-v", "--remove-orphans"]);
+}
+
 /// Runs switchover only — useful when the stack is already up (E2E_SKIP_BUILD=1).
 #[tokio::test]
 #[ignore = "requires Docker e2e stack (make start) with E2E_STACK_ADDR or localhost:8009"]

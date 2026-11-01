@@ -42,6 +42,12 @@ Once a connection is assigned to a backend, it stays there until:
 
 `SET` commands and `LISTEN` / `NOTIFY` require session affinity (they have per-connection state). These always go to primary.
 
+### Partitions
+
+Every instance probes the Raft voters four times per `quorum_lease_ms` (default 1000) and renews a lease when it reaches a majority. Once the lease expires, the proxy refuses new connections, ends existing sessions with `57P03` at their next statement, and `/health` returns `503`.
+
+The lease expires by the clock, so a hung probe cannot extend it. The server refuses to start unless `quorum_lease_ms` is shorter than failover detection (`health_check_interval_ms × health_check_failures_before_failover`), so an isolated proxy always stops before the majority can promote a new primary.
+
 ### Lag-Aware Read Routing
 
 This is the design for read routing, and it is off for now: the proxy routes every statement to the primary, because a session is only authenticated there.

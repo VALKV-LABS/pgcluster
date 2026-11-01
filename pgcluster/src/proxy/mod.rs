@@ -119,7 +119,8 @@ impl ProxyServer {
     /// Bind a health-check HTTP server on `config.health_listen_addr`.
     ///
     /// Routes:
-    /// - `GET /health` → 200 OK if a primary is known, 503 if not.
+    /// - `GET /health` → 200 OK if a primary is known and the proxy has quorum,
+    ///   503 if not.
     pub async fn run_health_endpoint(&self) -> Result<()> {
         let router_state = Arc::clone(&self.router);
 
@@ -144,7 +145,9 @@ impl ProxyServer {
 // ── Health handler ────────────────────────────────────────────────────────────
 
 async fn health_handler(State(router): State<Arc<Router>>) -> impl IntoResponse {
-    if router.primary_addr().is_some() {
+    if !router.has_quorum() {
+        (StatusCode::SERVICE_UNAVAILABLE, "no quorum")
+    } else if router.primary_addr().is_some() {
         (StatusCode::OK, "ok")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "no primary")
