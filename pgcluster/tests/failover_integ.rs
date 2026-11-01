@@ -5,12 +5,12 @@ use pgcluster::agent_clients::agent_proto::agent_service_server::{
 };
 use pgcluster::agent_clients::agent_proto::{
     DemoteRequest, DemoteResponse, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
-    PromoteResponse, ReloadRequest, ReloadResponse, StatusRequest, StatusResponse, StopRequest,
-    StopResponse,
+    PromoteResponse, ReloadRequest, ReloadResponse, SetParametersRequest, SetParametersResponse,
+    StatusRequest, StatusResponse, StopRequest, StopResponse,
 };
 use pgcluster::agent_clients::AgentClientPool;
 use pgcluster::failover::candidate::pick_live_candidate;
-use pgcluster::raft::topology::{ClusterTopology, NodeConfig, NodeRole};
+use pgcluster::raft::topology::{ClusterTopology, NodeConfig, NodeRole, ReplicationMode};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status};
@@ -48,6 +48,12 @@ impl AgentService for FakeAgent {
     }
     async fn reload_config(&self, _: Request<ReloadRequest>) -> RpcResult<ReloadResponse> {
         Err(Status::unimplemented("reload_config"))
+    }
+    async fn set_parameters(
+        &self,
+        _: Request<SetParametersRequest>,
+    ) -> RpcResult<SetParametersResponse> {
+        Err(Status::unimplemented("set_parameters"))
     }
 }
 
@@ -143,6 +149,41 @@ async fn node_not_in_recovery_is_skipped() {
     let pg3 = fake_agent(standby_at(100)).await;
     let t = cluster(&[("pg2", &pg2, 0), ("pg3", &pg3, 0)]);
     assert_eq!(pick(&t).await, Some(("pg3".into(), 100)));
+}
+
+#[tokio::test]
+async fn sync_strict_promotes_when_every_standby_answers() {
+    let pg2 = fake_agent(standby_at(100)).await;
+    let pg3 = fake_agent(standby_at(999)).await;
+    let mut t = cluster(&[("pg2", &pg2, 0), ("pg3", &pg3, 0)]);
+    t.replication_mode = ReplicationMode::SyncStrict;
+    assert_eq!(pick(&t).await, Some(("pg3".into(), 999)));
+}
+
+#[tokio::test]
+async fn sync_strict_refuses_when_a_standby_does_not_answer() {
+    let pg3 = fake_agent(standby_at(999)).await;
+    let mut t = cluster(&[("pg2", "127.0.0.1:1", 0), ("pg3", &pg3, 0)]);
+    t.replication_mode = ReplicationMode::SyncStrict;
+    assert_eq!(pick(&t).await, None);
+}
+
+#[tokio::test]
+async fn sync_strict_counts_an_offline_standby_as_not_answering() {
+    let pg2 = fake_agent(standby_at(100)).await;
+    let pg3 = fake_agent(standby_at(999)).await;
+    let mut t = cluster(&[("pg2", &pg2, 0), ("pg3", &pg3, 0)]);
+    t.replication_mode = ReplicationMode::SyncStrict;
+    t.node_roles.insert("pg2".into(), NodeRole::Offline);
+    assert_eq!(pick(&t).await, None);
+}
+
+#[tokio::test]
+async fn sync_promotes_the_best_reachable_standby() {
+    let pg3 = fake_agent(standby_at(999)).await;
+    let mut t = cluster(&[("pg2", "127.0.0.1:1", 0), ("pg3", &pg3, 0)]);
+    t.replication_mode = ReplicationMode::Sync;
+    assert_eq!(pick(&t).await, Some(("pg3".into(), 999)));
 }
 
 #[tokio::test]

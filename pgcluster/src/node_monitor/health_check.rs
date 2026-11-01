@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use tracing::warn;
@@ -23,6 +24,12 @@ pub struct HealthCheckResult {
     /// The `conninfo` string from `pg_stat_wal_receiver` (standby only; empty on primary).
     /// Used to detect a stale `primary_conninfo` after failover.
     pub replication_conninfo: String,
+    /// Primary only: `application_name` of each standby that is streaming.
+    pub streaming_standbys: Vec<String>,
+    /// Current values of the settings pgcluster manages.
+    pub parameters: HashMap<String, String>,
+    /// Primary only: slots whose WAL has been removed.
+    pub lost_slots: Vec<String>,
 }
 
 // ── send_heartbeat ────────────────────────────────────────────────────────────
@@ -86,6 +93,14 @@ pub async fn check_node(
                 timeline: status.timeline,
                 pg_running: status.postgres_running,
                 replication_conninfo: status.replication_conninfo,
+                streaming_standbys: status
+                    .replicas
+                    .into_iter()
+                    .filter(|r| r.state == "streaming")
+                    .map(|r| r.application_name)
+                    .collect(),
+                parameters: status.parameters,
+                lost_slots: status.lost_slots,
             }
         }
         Err(e) => {
@@ -107,5 +122,8 @@ fn unreachable_result(node_id: &str) -> HealthCheckResult {
         timeline: 0,
         pg_running: false,
         replication_conninfo: String::new(),
+        streaming_standbys: Vec::new(),
+        parameters: HashMap::new(),
+        lost_slots: Vec::new(),
     }
 }

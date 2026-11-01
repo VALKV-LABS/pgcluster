@@ -241,3 +241,21 @@ impl FailoverEngine {
 - `proxy_layer` reads new topology from Raft state machine — no direct call needed.
 - `vk_agent` receives Promote (step 4) and Demote (step 8) gRPC calls.
 - `rest_api` and alerting webhook receive `ClusterEvent::FailoverComplete`.
+
+## Replication modes
+
+The mode lives in Raft. `[replication] replication_mode` sets it for a new cluster, and `POST /api/replication/mode` changes it online. On every tick the leader compares the primary's settings with what the mode requires and applies any difference, so a mode change, a membership change and a new primary all take the same path.
+
+| | `async` | `sync` | `sync_strict` |
+|---|---|---|---|
+| `synchronous_standby_names` | empty | `ANY 1 (...)` over every standby | `ANY 1 (...)` over every standby |
+| No standby streaming | No effect | Commits stall for `sync_degrade_timeout_seconds`, then fall back | Commits block until a standby returns |
+| Primary lost | Promote the best reachable standby | Promote the best reachable standby | Promote only when every standby answers |
+
+Standbys are matched by `application_name`, which must be the node ID. Demote sets it, and a node seeded by other means needs it in `primary_conninfo`.
+
+The fallback is recorded through Raft before the setting is cleared, so a later failover knows no standby is guaranteed current. It logs a warning and sets `ran_degraded` in the failover history. When a standby streams again, the setting is restored first and the record cleared after.
+
+`max_slot_wal_keep_size_mb` caps the WAL a slot can hold back. A standby past that limit cannot catch up by streaming, and appears under `needs_reseed` in `GET /api/replication`.
+
+Failover retries until it succeeds. If the primary returns first, it keeps its role.

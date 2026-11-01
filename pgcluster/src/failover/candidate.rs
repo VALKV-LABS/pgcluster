@@ -2,10 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::task::JoinSet;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::agent_clients::AgentClientPool;
-use crate::raft::topology::{ClusterTopology, NodeRole};
+use crate::raft::topology::{ClusterTopology, NodeRole, ReplicationMode};
 
 /// How long a standby has to report its position during failover.
 const LIVE_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -15,12 +15,30 @@ const LIVE_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
 /// The positions in the topology trail the health checks, and promoting from
 /// them can lose commits that a more current standby holds. Returns the node
 /// and its live position, or `None` if no standby answered.
+///
+/// With `ANY 1` of two standbys, only one is guaranteed to hold the last commit,
+/// and only asking both reveals which. So `SyncStrict` returns `None` unless
+/// every standby answers.
 pub async fn pick_live_candidate(
     topology: &ClusterTopology,
     failed_node_id: &str,
     pool: &Arc<AgentClientPool>,
 ) -> Option<(String, u64)> {
     let positions = live_positions(topology, failed_node_id, pool).await;
+    if topology.replication_mode == ReplicationMode::SyncStrict {
+        let standbys = topology
+            .node_configs
+            .keys()
+            .filter(|id| *id != failed_node_id)
+            .count();
+        if positions.len() < standbys {
+            error!(
+                answered = positions.len(),
+                standbys, "sync_strict: not promoting until every standby answers"
+            );
+            return None;
+        }
+    }
     rank_positions(topology, &positions)
 }
 

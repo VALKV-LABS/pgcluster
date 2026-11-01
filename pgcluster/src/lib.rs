@@ -54,14 +54,23 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     if cfg.raft.bootstrap && !cfg.nodes.node.is_empty() {
         let seed_raft = raft_node.clone();
         let seed_nodes = cfg.nodes.node.clone();
+        let seed_topology = topology_rx.clone();
+        let seed_mode = cfg.replication.replication_mode;
         tokio::spawn(async move {
-            // Wait until this instance is the Raft leader (fast in single-node bootstrap).
+            // Wait until this instance is the Raft leader and has applied its
+            // log (fast in single-node bootstrap).
             for _ in 0..50u32 {
                 let m = seed_raft.raft.metrics().borrow().clone();
-                if m.current_leader == Some(m.id) {
+                let applied = m.last_applied.map(|id| id.index) >= m.last_log_index;
+                if m.current_leader == Some(m.id) && applied {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            // A restart must not repeat the seed: it would move the primary back
+            // to the highest-priority node and undo any online mode change.
+            if !seed_topology.current().node_configs.is_empty() {
+                return;
             }
             for node in &seed_nodes {
                 let cmd = raft::commands::TopologyCommand::AddNode(raft::topology::NodeConfig {
@@ -85,6 +94,10 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                 if let Err(e) = seed_raft.raft.client_write(cmd).await {
                     tracing::warn!(err = %e, "bootstrap seed: SetPrimary failed");
                 }
+            }
+            let cmd = raft::commands::TopologyCommand::SetReplicationMode { mode: seed_mode };
+            if let Err(e) = seed_raft.raft.client_write(cmd).await {
+                tracing::warn!(err = %e, "bootstrap seed: SetReplicationMode failed");
             }
             tracing::info!(count = seed_nodes.len(), "bootstrap seed complete");
         });
@@ -242,10 +255,9 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         let pool = pool.clone();
         let fcfg = cfg.failover.clone();
         let mon_metrics = metrics.clone();
-        let repl_user = cfg.replication.replication_user.clone();
+        let replication = cfg.replication.clone();
         let repl_password =
             std::env::var(&cfg.replication.replication_password_env).unwrap_or_default();
-        let slot_prefix = cfg.replication.slot_prefix.clone();
         tasks.push(tokio::spawn(async move {
             let mut monitor = node_monitor::NodeMonitor::new(
                 raft,
@@ -253,9 +265,8 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                 pool,
                 fcfg,
                 mon_metrics,
-                repl_user,
+                &replication,
                 repl_password,
-                slot_prefix,
                 op_in_progress.clone(),
                 quorum,
             );

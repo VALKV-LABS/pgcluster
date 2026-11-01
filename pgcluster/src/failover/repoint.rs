@@ -32,7 +32,10 @@ pub async fn repoint_replicas(
         };
 
         let slot_name = format!("{}{}", slot_prefix, node_id);
-        match client.demote(new_primary_conninfo, &slot_name).await {
+        match client
+            .demote(new_primary_conninfo, &slot_name, node_id)
+            .await
+        {
             Ok(resp) if resp.success => {
                 info!(node_id, "replica repointed to new primary");
             }

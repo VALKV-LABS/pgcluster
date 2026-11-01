@@ -50,7 +50,11 @@ replication_user         = "replicator"
 # Name of the environment variable that holds the replication password.
 replication_password_env = "PG_REPLICATION_PASSWORD"
 slot_prefix              = "pgcluster_"
-synchronous_standby_names = ""   # Set to "pg2,pg3" for synchronous replication
+# async, sync or sync_strict. This sets the mode of a new cluster; after that,
+# POST /api/replication/mode changes it with no restart.
+replication_mode             = "async"
+sync_degrade_timeout_seconds = 30      # How long sync stalls commits before falling back
+max_slot_wal_keep_size_mb    = 10240   # WAL a slot may hold back
 
 [proxy]
 # Client applications connect to this address.

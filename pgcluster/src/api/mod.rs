@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod nodes;
 pub mod pg_hba;
 pub mod replication;
+pub mod replication_mode;
 pub mod status;
 pub mod switchover;
 
@@ -79,6 +80,8 @@ pub fn router(state: ApiState) -> Router {
                 .route("/failover", post(failover::trigger_failover))
                 .route("/failover/history", get(failover::failover_history))
                 .route("/switchover", post(switchover::trigger_switchover))
+                .route("/replication", get(replication_mode::get_replication))
+                .route("/replication/mode", post(replication_mode::set_mode))
                 .route("/replication/slots", get(replication::list_slots))
                 .route("/config", get(config::get_config))
                 .route(

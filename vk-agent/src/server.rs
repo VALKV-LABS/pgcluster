@@ -13,8 +13,8 @@ use tonic::{Request, Response, Status};
 use agent::agent_service_server::{AgentService, AgentServiceServer};
 use agent::{
     DemoteRequest, DemoteResponse, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
-    PromoteResponse, ReloadRequest, ReloadResponse, StatusRequest, StatusResponse, StopRequest,
-    StopResponse,
+    PromoteResponse, ReloadRequest, ReloadResponse, SetParametersRequest, SetParametersResponse,
+    StatusRequest, StatusResponse, StopRequest, StopResponse,
 };
 
 use crate::config::AgentConfig;
@@ -131,7 +131,11 @@ impl AgentService for AgentServiceImpl {
 
         // Write new primary_conninfo and slot_name to postgresql.auto.conf.
         if !req.new_primary_conninfo.is_empty() {
-            let (conninfo, maybe_password) = extract_conninfo_password(&req.new_primary_conninfo);
+            let (mut conninfo, maybe_password) =
+                extract_conninfo_password(&req.new_primary_conninfo);
+            if !req.application_name.is_empty() {
+                conninfo = format!("{conninfo} application_name={}", req.application_name);
+            }
 
             // If the conninfo carried a password, persist it to .pgpass and use
             // passfile= so the password is never stored in the config file.
@@ -217,6 +221,8 @@ impl AgentService for AgentServiceImpl {
                 postgres_running: false,
                 replicas: vec![],
                 replication_conninfo: String::new(),
+                parameters: Default::default(),
+                lost_slots: vec![],
             }));
         }
 
@@ -236,6 +242,8 @@ impl AgentService for AgentServiceImpl {
                     postgres_running: false,
                     replicas: vec![],
                     replication_conninfo: String::new(),
+                    parameters: Default::default(),
+                    lost_slots: vec![],
                 }));
             }
         };
@@ -268,6 +276,13 @@ impl AgentService for AgentServiceImpl {
             String::new()
         };
 
+        let parameters = self.pg.get_parameters().await.unwrap_or_default();
+        let lost_slots = if is_recovery {
+            vec![]
+        } else {
+            self.pg.get_lost_slots().await.unwrap_or_default()
+        };
+
         let _ = safe_mode; // exposed indirectly through heartbeat; not in StatusResponse proto
 
         Ok(Response::new(StatusResponse {
@@ -281,6 +296,21 @@ impl AgentService for AgentServiceImpl {
             postgres_running: true,
             replicas,
             replication_conninfo,
+            parameters,
+            lost_slots,
+        }))
+    }
+
+    /// Apply settings pgcluster manages. Never touches the rest of the config.
+    async fn set_parameters(
+        &self,
+        request: Request<SetParametersRequest>,
+    ) -> Result<Response<SetParametersResponse>, Status> {
+        let parameters = request.into_inner().parameters;
+        let result = self.pg.set_parameters(&parameters).await;
+        Ok(Response::new(SetParametersResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
         }))
     }
 

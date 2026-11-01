@@ -11,6 +11,7 @@ pub fn build_failover_event(
     new_primary: String,
     started_at: Instant,
     reason: String,
+    ran_degraded: bool,
 ) -> FailoverEvent {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -23,5 +24,6 @@ pub fn build_failover_event(
         triggered_at: now_unix,
         duration_ms: started_at.elapsed().as_millis() as u64,
         reason,
+        ran_degraded,
     }
 }

@@ -27,11 +27,11 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 
 ## Part 4: Replication modes
 
-- [ ] **4.1 Add `replication_mode` to the config.** Values are `async`, `sync` and `sync_strict`, replacing the unused `synchronous_standby_names` setting and its sample comment. *Done when:* the setting is validated, and changing it applies without a restart.
-- [ ] **4.2 Apply `synchronous_standby_names` from the mode.** Use `ANY 1 (...)`, and update it when membership changes. *Done when:* `sync` commits wait for a standby, by test.
-- [ ] **4.3 Implement the fallback for `sync`.** Record the fallback through Raft before clearing the setting. *Done when:* writes resume after `sync_degrade_timeout` with both standbys down, and a later failover knows no standby is guaranteed current.
-- [ ] **4.4 Implement `sync_strict`.** Writes block with no standby, and promotion needs both standbys to answer. *Done when:* each case is covered by test.
-- [ ] **4.5 Set `max_slot_wal_keep_size`.** *Done when:* a dead standby cannot fill the primary's disk, and a standby past the limit is flagged for re-seeding.
+- [x] **4.1 Add `replication_mode` to the config.** Values are `async`, `sync` and `sync_strict`, replacing the unused `synchronous_standby_names` setting and its sample comment. *Done when:* the setting is validated, and changing it applies without a restart.
+- [x] **4.2 Apply `synchronous_standby_names` from the mode.** Use `ANY 1 (...)`, and update it when membership changes. *Done when:* `sync` commits wait for a standby, by test.
+- [x] **4.3 Implement the fallback for `sync`.** Record the fallback through Raft before clearing the setting. *Done when:* writes resume after `sync_degrade_timeout` with both standbys down, and a later failover knows no standby is guaranteed current.
+- [x] **4.4 Implement `sync_strict`.** Writes block with no standby, and promotion needs both standbys to answer. *Done when:* each case is covered by test.
+- [x] **4.5 Set `max_slot_wal_keep_size`.** *Done when:* a dead standby cannot fill the primary's disk, and a standby past the limit is flagged for re-seeding.
 
 ## Part 5: Node lifecycle and backups
 

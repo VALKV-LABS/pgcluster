@@ -1,4 +1,4 @@
-use super::topology::{BackupManifest, NodeConfig};
+use super::topology::{BackupManifest, NodeConfig, ReplicationMode};
 use serde::{Deserialize, Serialize};
 
 /// Every topology change is a Raft log entry with one of these variants.
@@ -37,7 +37,16 @@ pub enum TopologyCommand {
         triggered_at: i64,
         duration_ms: u64,
         reason: String,
+        #[serde(default)]
+        ran_degraded: bool,
     },
+    /// Change the replication mode. Clears any fallback, because the new mode
+    /// decides from here on.
+    SetReplicationMode { mode: ReplicationMode },
+    /// Record that `Sync` fell back to async, or has recovered
+    SetSyncDegraded { degraded: bool },
+    /// Flag a standby that fell past `max_slot_wal_keep_size`, or clear the flag
+    SetNeedsReseed { node_id: String, needs_reseed: bool },
     /// Update the replication slot name for a replica
     SetReplicationSlot { node_id: String, slot_name: String },
     /// Record a completed (or failed) backup in cluster state

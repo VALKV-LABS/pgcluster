@@ -8,6 +8,7 @@
 #   PGDATA           — replica data directory (default: /var/lib/postgresql/data)
 #   POSTGRES_USER    — replication user (default: postgres)
 #   POSTGRES_PASSWORD — password (optional; used in .pgpass if set)
+#   PG_NODE_ID       — pgcluster node ID, used as application_name (optional)
 #   PG_TLS_NAME      — serve TLS with /certs/<name>.crt and .key (optional)
 #
 # The script is idempotent: if PGDATA/PG_VERSION already exists the backup step
@@ -35,6 +36,17 @@ else
       > "${PGPASSFILE}"
     chmod 600 "${PGPASSFILE}"
     export PGPASSFILE
+  fi
+
+  # A slot holds WAL for this standby while it is away, up to
+  # max_slot_wal_keep_size. It must exist before the standby first connects.
+  if [ -n "${PG_NODE_ID:-}" ]; then
+    SLOT_NAME="pgcluster_${PG_NODE_ID}"
+    PGPASSWORD="${POSTGRES_PASSWORD:-}" psql \
+      --host="${PRIMARY_HOST}" --port="${PRIMARY_PORT}" --username="${PGUSER}" \
+      --dbname=postgres --no-password --quiet \
+      -c "SELECT pg_create_physical_replication_slot('${SLOT_NAME}')
+          WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '${SLOT_NAME}')"
   fi
 
   # Retry pg_basebackup up to 5 times: two replicas starting simultaneously can
@@ -79,9 +91,13 @@ else
   cat >> "${PGDATA}/postgresql.auto.conf" <<EOF
 
 # Added by init-replica.sh
-primary_conninfo = 'host=${PRIMARY_HOST} port=${PRIMARY_PORT} user=${PGUSER}${PASSFILE_ARG}'
+primary_conninfo = 'host=${PRIMARY_HOST} port=${PRIMARY_PORT} user=${PGUSER}${PASSFILE_ARG}${PG_NODE_ID:+ application_name=${PG_NODE_ID}}'
 hot_standby = on
 EOF
+
+  if [ -n "${SLOT_NAME:-}" ]; then
+    echo "primary_slot_name = '${SLOT_NAME}'" >> "${PGDATA}/postgresql.auto.conf"
+  fi
 
   echo "[init-replica] pg_basebackup complete. Standby mode configured."
 fi

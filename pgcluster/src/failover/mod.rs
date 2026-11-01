@@ -62,6 +62,13 @@ pub async fn trigger_failover(
         }
     };
 
+    if topology.sync_degraded {
+        warn!(
+            candidate,
+            "sync had fallen back to async: no standby is guaranteed current"
+        );
+    }
+
     // ── 2. Promote candidate ─────────────────────────────────────────────────
     if let Err(e) = promote::promote_node(&candidate, &candidate_cfg.agent_addr, pool).await {
         error!(
@@ -113,6 +120,7 @@ pub async fn trigger_failover(
         candidate.clone(),
         started,
         "health_check_failure".to_string(),
+        topology.sync_degraded,
     );
     let _ = raft
         .raft
@@ -122,6 +130,7 @@ pub async fn trigger_failover(
             triggered_at: event.triggered_at,
             duration_ms: event.duration_ms,
             reason: event.reason.clone(),
+            ran_degraded: event.ran_degraded,
         })
         .await;
 

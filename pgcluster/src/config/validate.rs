@@ -1,4 +1,5 @@
 use super::PgClusterConfig;
+use crate::raft::topology::ReplicationMode;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 
@@ -11,6 +12,7 @@ pub fn validate(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     validate_raft(cfg)?;
     validate_nodes(cfg)?;
     validate_addresses(cfg)?;
+    validate_replication(cfg)?;
     validate_timing(cfg)?;
     validate_tls(cfg)?;
     validate_api(cfg)?;
@@ -110,6 +112,20 @@ fn validate_addresses(cfg: &PgClusterConfig) -> anyhow::Result<()> {
         parse_host_port(&node.agent_addr).map_err(|e| {
             anyhow::anyhow!("node {:?} agent_addr {:?}: {}", node.id, node.agent_addr, e)
         })?;
+    }
+    Ok(())
+}
+
+fn validate_replication(cfg: &PgClusterConfig) -> anyhow::Result<()> {
+    let replication = &cfg.replication;
+    if replication.replication_mode != ReplicationMode::Async && cfg.nodes.node.len() < 2 {
+        anyhow::bail!("[replication] replication_mode sync and sync_strict need a standby");
+    }
+    if replication.sync_degrade_timeout_seconds == 0 {
+        anyhow::bail!("[replication] sync_degrade_timeout_seconds must be > 0");
+    }
+    if replication.max_slot_wal_keep_size_mb == 0 {
+        anyhow::bail!("[replication] max_slot_wal_keep_size_mb must be > 0");
     }
     Ok(())
 }
@@ -270,7 +286,9 @@ mod tests {
                 replication_user: "replicator".into(),
                 replication_password_env: "PG_REPLICATION_PASSWORD".into(),
                 slot_prefix: "pgcluster_".into(),
-                synchronous_standby_names: "".into(),
+                replication_mode: Default::default(),
+                sync_degrade_timeout_seconds: 30,
+                max_slot_wal_keep_size_mb: 1024,
             },
             proxy: ProxyConfig {
                 listen_addr: "0.0.0.0:5432".into(),
@@ -361,6 +379,48 @@ mod tests {
     fn node_addr_invalid_port_fails() {
         let mut cfg = minimal();
         cfg.nodes.node[0].postgres_addr = "postgres:notaport".into();
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn replication_mode_parses_each_value() {
+        for (value, mode) in [
+            ("async", ReplicationMode::Async),
+            ("sync", ReplicationMode::Sync),
+            ("sync_strict", ReplicationMode::SyncStrict),
+        ] {
+            let toml = format!("replication_user = \"r\"\nreplication_mode = \"{value}\"");
+            let parsed: ReplicationConfig = toml::from_str(&toml).unwrap();
+            assert_eq!(parsed.replication_mode, mode);
+        }
+        let bad = "replication_user = \"r\"\nreplication_mode = \"quorum\"";
+        assert!(toml::from_str::<ReplicationConfig>(bad).is_err());
+    }
+
+    #[test]
+    fn synchronous_modes_need_a_standby() {
+        let mut cfg = minimal();
+        cfg.replication.replication_mode = ReplicationMode::Sync;
+        assert!(validate(&cfg).is_err());
+
+        cfg.nodes.node.push(NodeConfig {
+            id: "pg2".into(),
+            agent_addr: "127.0.0.1:7011".into(),
+            postgres_addr: "127.0.0.1:5433".into(),
+            priority: 90,
+            tags: Default::default(),
+        });
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn zero_replication_settings_fail() {
+        let mut cfg = minimal();
+        cfg.replication.sync_degrade_timeout_seconds = 0;
+        assert!(validate(&cfg).is_err());
+
+        let mut cfg = minimal();
+        cfg.replication.max_slot_wal_keep_size_mb = 0;
         assert!(validate(&cfg).is_err());
     }
 

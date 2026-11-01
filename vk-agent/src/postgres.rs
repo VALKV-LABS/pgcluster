@@ -1,7 +1,18 @@
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Context, Result};
 use sqlx::PgPool;
 
 use crate::server::agent::ReplicaStatus;
+
+/// The settings pgcluster may change through `set_parameters`.
+pub const MANAGED_PARAMETERS: &[&str] = &["synchronous_standby_names", "max_slot_wal_keep_size"];
+
+/// `name` must already be checked against `MANAGED_PARAMETERS`: identifiers
+/// cannot be bound as parameters, and neither can `ALTER SYSTEM` values.
+fn alter_system_sql(name: &str, value: &str) -> String {
+    format!("ALTER SYSTEM SET {name} = '{}'", value.replace('\'', "''"))
+}
 
 /// Wraps a `sqlx` connection pool to the local Postgres instance and exposes
 /// the queries that vk-agent needs to report status and verify LSNs.
@@ -106,6 +117,49 @@ impl LocalPostgres {
             .collect())
     }
 
+    /// Returns the current value of every setting in `MANAGED_PARAMETERS`.
+    pub async fn get_parameters(&self) -> Result<HashMap<String, String>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, setting FROM pg_settings WHERE name = ANY($1)")
+                .bind(MANAGED_PARAMETERS)
+                .fetch_all(&self.pool)
+                .await
+                .context("get_parameters query failed")?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Apply `parameters` with `ALTER SYSTEM`, then reload. Only names in
+    /// `MANAGED_PARAMETERS` are accepted, and the file write does not wait for
+    /// a synchronous standby, so this works while commits are stalled.
+    pub async fn set_parameters(&self, parameters: &HashMap<String, String>) -> Result<()> {
+        for (name, value) in parameters {
+            if !MANAGED_PARAMETERS.contains(&name.as_str()) {
+                anyhow::bail!("{name} is not a setting pgcluster manages");
+            }
+            sqlx::query(&alter_system_sql(name, value))
+                .execute(&self.pool)
+                .await
+                .with_context(|| format!("ALTER SYSTEM SET {name} failed"))?;
+        }
+        sqlx::query("SELECT pg_reload_conf()")
+            .execute(&self.pool)
+            .await
+            .context("pg_reload_conf failed")?;
+        Ok(())
+    }
+
+    /// Returns replication slots whose WAL has been removed. Their standbys
+    /// can no longer catch up by streaming.
+    pub async fn get_lost_slots(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT slot_name::text FROM pg_replication_slots WHERE wal_status = 'lost'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("get_lost_slots query failed")?;
+        Ok(rows.into_iter().map(|(name,)| name).collect())
+    }
+
     /// Returns the number of active non-idle connections (excluding this one).
     pub async fn get_active_connections(&self) -> Result<u32> {
         let row: (i64,) = sqlx::query_as(
@@ -168,6 +222,14 @@ pub fn parse_lsn(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alter_system_escapes_quotes() {
+        assert_eq!(
+            alter_system_sql("synchronous_standby_names", "ANY 1 (\"a'b\")"),
+            "ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 (\"a''b\")'"
+        );
+    }
 
     #[test]
     fn parse_lsn_basic() {

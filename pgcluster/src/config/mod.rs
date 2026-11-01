@@ -1,3 +1,4 @@
+use crate::raft::topology::ReplicationMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -107,8 +108,23 @@ pub struct ReplicationConfig {
     pub replication_password_env: String,
     #[serde(default = "default_slot_prefix")]
     pub slot_prefix: String,
+    /// The mode a new cluster starts in. After that the mode lives in Raft, and
+    /// `POST /api/replication/mode` changes it without a restart.
     #[serde(default)]
-    pub synchronous_standby_names: String,
+    pub replication_mode: ReplicationMode,
+    /// How long `sync` stalls commits with no standby before it falls back.
+    #[serde(default = "default_sync_degrade_timeout")]
+    pub sync_degrade_timeout_seconds: u64,
+    /// WAL a slot may hold back, so a dead standby cannot fill the disk.
+    #[serde(default = "default_max_slot_wal_keep_size")]
+    pub max_slot_wal_keep_size_mb: u64,
+}
+
+fn default_sync_degrade_timeout() -> u64 {
+    30
+}
+fn default_max_slot_wal_keep_size() -> u64 {
+    10 * 1024
 }
 
 fn default_replication_password_env() -> String {

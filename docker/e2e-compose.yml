@@ -104,6 +104,7 @@ services:
       POSTGRES_PASSWORD: test
       PGDATA: /var/lib/postgresql/data
       PG_TLS_NAME: pg-replica-1
+      PG_NODE_ID: pg2
     depends_on:
       pg-primary:
         condition: service_healthy
@@ -126,6 +127,7 @@ services:
       POSTGRES_PASSWORD: test
       PGDATA: /var/lib/postgresql/data
       PG_TLS_NAME: pg-replica-2
+      PG_NODE_ID: pg3
     depends_on:
       pg-primary:
         condition: service_healthy

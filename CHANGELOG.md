@@ -11,6 +11,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Breaking:** `[tls] auto_generate` and `pgcluster init --gen-certs` are gone, because they gave each node its own CA. Use `pgcluster certs`.
 
 ### Fixed
+- An aborted failover is retried. Before, the first attempt marked the primary offline, which stopped later attempts and left the cluster with no primary.
+- Restarting the bootstrap node no longer repeats the bootstrap seed, which moved the primary back to the highest-priority node.
 - Failover chooses the candidate from the live position of reachable standbys, not the last position the health checks recorded, and aborts if none answers.
 - `pgcluster` now sends the heartbeats `vk-agent` expects. Without them every agent entered safe mode, and with `fence_timeout_seconds` set it stopped Postgres.
 - Logging in through the proxy no longer hangs when a client takes more than 10 ms to answer an authentication challenge, as SCRAM clients do.
@@ -23,6 +25,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - A release skips CI when it already passed on `main` for the tagged commit.
 
 ### Added
+- `replication_mode` with `async`, `sync` and `sync_strict`, which replaces `synchronous_standby_names`. The config sets the mode of a new cluster, and `POST /api/replication/mode` changes it online. `GET /api/replication` reports it.
+- `sync` falls back to async after `sync_degrade_timeout_seconds` with no standby, recording that through Raft first, and the failover history shows `ran_degraded`. `sync_strict` never falls back, and promotes only if every standby answers.
+- `max_slot_wal_keep_size_mb` limits the WAL a slot can hold back. A standby past the limit appears under `needs_reseed` in `GET /api/replication`.
 - A proxy that loses contact with the Raft majority stops routing, within `quorum_lease_ms` and before a new primary can be promoted.
 - A Raft leader without quorum stops heartbeating agents and stops driving failover.
 - Startup validation of partition timing: `quorum_lease_ms` against failover detection, and `agent_heartbeat_timeout_seconds` against Raft elections.

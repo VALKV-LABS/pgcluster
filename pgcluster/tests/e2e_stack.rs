@@ -386,9 +386,24 @@ fn write_through(service: &str, proxy: &str, value: u32) -> bool {
     .success()
 }
 
+fn container_id(service: &str) -> String {
+    let id = compose(&["ps", "-a", "-q", service]);
+    String::from_utf8_lossy(&id.stdout).trim().to_string()
+}
+
+/// Stop or start one container. `docker compose start` would also start the
+/// services it depends on, which could revive a node a test has taken down.
+fn docker(action: &str, service: &str) {
+    let status = Command::new("docker")
+        .args([action, &container_id(service)])
+        .stdout(Stdio::null())
+        .status()
+        .expect("docker stop or start");
+    assert!(status.success(), "docker {action} {service}");
+}
+
 fn cut_off_from_default_network(service: &str) {
-    let id = compose(&["ps", "-q", service]);
-    let id = String::from_utf8_lossy(&id.stdout).trim().to_string();
+    let id = container_id(service);
     let status = Command::new("docker")
         .args(["network", "disconnect", "docker_default", &id])
         .status()
@@ -495,6 +510,276 @@ async fn e2e_partition_stops_writes_on_both_sides() {
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+
+    compose(&["down", "-v", "--remove-orphans"]);
+}
+
+// ── Replication modes ─────────────────────────────────────────────────────────
+
+fn start_stack() {
+    if std::env::var("E2E_SKIP_BUILD").as_deref() == Ok("1") {
+        compose(&["up", "-d", "--wait"]);
+    } else {
+        compose(&["up", "-d", "--build", "--wait"]);
+    }
+}
+
+async fn set_mode(mode: &str) {
+    let response = reqwest::Client::new()
+        .post(format!("{DEFAULT_API}/api/replication/mode"))
+        .bearer_auth("dev-api-key")
+        .json(&serde_json::json!({ "mode": mode }))
+        .send()
+        .await
+        .expect("POST /api/replication/mode");
+    assert_eq!(response.status(), 204, "set mode {mode}");
+}
+
+async fn replication(api: &str) -> serde_json::Value {
+    reqwest::get(format!("{api}/api/replication"))
+        .await
+        .expect("GET /api/replication")
+        .json()
+        .await
+        .expect("parse replication status")
+}
+
+fn show(service: &str, setting: &str) -> String {
+    let out = Command::new("docker")
+        .args(["compose", "-f", COMPOSE_FILE, "exec", "-T", service])
+        .args(["psql", "-U", "postgres", "-Atc", &format!("SHOW {setting}")])
+        .current_dir(project_root())
+        .output()
+        .expect("docker compose exec psql");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Wait until `check` holds, or fail naming `what`.
+async fn wait_until<F, Fut>(what: &str, timeout: Duration, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + timeout;
+    while !check().await {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_for_standby_names(expected: &str) {
+    wait_until(
+        &format!("synchronous_standby_names = {expected:?}"),
+        Duration::from_secs(20),
+        || async { show("pg-primary", "synchronous_standby_names") == expected },
+    )
+    .await;
+}
+
+/// Start an insert on the primary in the background, for a commit that may stall.
+fn spawn_write(value: u32) -> std::process::Child {
+    Command::new("docker")
+        .args(["compose", "-f", COMPOSE_FILE, "exec", "-T", "pg-primary"])
+        .args(["psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c"])
+        .arg(format!("INSERT INTO mode_test VALUES ({value})"))
+        .current_dir(project_root())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn psql")
+}
+
+fn is_running(write: &mut std::process::Child) -> bool {
+    write.try_wait().expect("poll write").is_none()
+}
+
+async fn wait_for_exit(write: &mut std::process::Child, timeout: Duration) {
+    wait_until("the write to finish", timeout, || {
+        let done = !is_running(write);
+        async move { done }
+    })
+    .await;
+    assert!(write.wait().expect("write status").success());
+}
+
+async fn create_mode_test_table() {
+    wait_for_primary(DEFAULT_API, Duration::from_secs(90)).await;
+    let out = psql(
+        "pg-primary",
+        "pgcluster-1",
+        "CREATE TABLE mode_test (value int)",
+    );
+    assert!(out.status.success(), "create the test table");
+    wait_until(
+        "both standbys to stream",
+        Duration::from_secs(30),
+        || async {
+            let out = psql(
+                "pg-primary",
+                "pgcluster-1",
+                "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'",
+            );
+            String::from_utf8_lossy(&out.stdout).trim() == "2"
+        },
+    )
+    .await;
+}
+
+const STANDBY_NAMES: &str = r#"ANY 1 ("pg2", "pg3")"#;
+
+/// `sync` commits wait for a standby, fall back after the timeout with both
+/// standbys down, and recover when one returns. `sync_strict` never falls back.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_sync_modes_control_commits() {
+    start_stack();
+    create_mode_test_table().await;
+
+    // Changing the mode needs no restart.
+    assert_eq!(show("pg-primary", "synchronous_standby_names"), "");
+    set_mode("sync").await;
+    wait_for_standby_names(STANDBY_NAMES).await;
+    assert_eq!(replication(DEFAULT_API).await["mode"], "sync");
+    wait_for_exit(&mut spawn_write(1), Duration::from_secs(10)).await;
+
+    // With both standbys down, the commit waits, then the fallback releases it.
+    compose(&["stop", "pg-replica-1", "pg-replica-2"]);
+    let mut write = spawn_write(2);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        is_running(&mut write),
+        "a sync commit must wait for a standby"
+    );
+    wait_for_exit(&mut write, Duration::from_secs(30)).await;
+    assert_eq!(replication(DEFAULT_API).await["degraded"], true);
+    assert_eq!(show("pg-primary", "synchronous_standby_names"), "");
+    wait_for_exit(&mut spawn_write(3), Duration::from_secs(5)).await;
+
+    // A returning standby restores sync.
+    compose(&["start", "pg-replica-1", "pg-replica-2"]);
+    wait_for_standby_names(STANDBY_NAMES).await;
+    wait_until("sync to recover", Duration::from_secs(20), || async {
+        replication(DEFAULT_API).await["degraded"] == false
+    })
+    .await;
+
+    // sync_strict holds the commit past the timeout, until a standby returns.
+    set_mode("sync_strict").await;
+    compose(&["stop", "pg-replica-1", "pg-replica-2"]);
+    let mut write = spawn_write(4);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(is_running(&mut write), "sync_strict must never fall back");
+    assert_eq!(replication(DEFAULT_API).await["degraded"], false);
+    assert_eq!(
+        show("pg-primary", "synchronous_standby_names"),
+        STANDBY_NAMES
+    );
+    compose(&["start", "pg-replica-1", "pg-replica-2"]);
+    wait_for_exit(&mut write, Duration::from_secs(30)).await;
+
+    compose(&["down", "-v", "--remove-orphans"]);
+}
+
+/// `sync_strict` stays down until both standbys answer.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_sync_strict_promotes_only_when_both_standbys_answer() {
+    let majority_api = "http://localhost:18009";
+    start_stack();
+    create_mode_test_table().await;
+    set_mode("sync_strict").await;
+    wait_for_standby_names(STANDBY_NAMES).await;
+
+    // pg3 keeps running, but its agent cannot answer.
+    docker("stop", "vk-agent-3");
+    docker("stop", "pg-primary");
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    let status: serde_json::Value = reqwest::get(format!("{majority_api}/api/status"))
+        .await
+        .expect("GET /api/status")
+        .json()
+        .await
+        .expect("parse status");
+    assert_eq!(status["primary_node_id"], "pg1", "must not promote yet");
+
+    docker("start", "vk-agent-3");
+    let new_primary = wait_for_new_primary(majority_api, "pg1", Duration::from_secs(60)).await;
+    eprintln!("==> Promoted {new_primary} once both standbys answered");
+
+    compose(&["down", "-v", "--remove-orphans"]);
+}
+
+/// A failover after the fallback records that no standby was guaranteed current.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_failover_after_fallback_is_recorded() {
+    let majority_api = "http://localhost:18009";
+    start_stack();
+    create_mode_test_table().await;
+    set_mode("sync").await;
+    wait_for_standby_names(STANDBY_NAMES).await;
+
+    compose(&["stop", "pg-replica-1", "pg-replica-2"]);
+    wait_until("the fallback", Duration::from_secs(30), || async {
+        replication(DEFAULT_API).await["degraded"] == true
+    })
+    .await;
+
+    // Stopping Postgres takes its agent with it, because they share a PID
+    // namespace, so each standby's agent needs starting too.
+    docker("stop", "pg-primary");
+    for service in ["pg-replica-1", "vk-agent-2", "pg-replica-2", "vk-agent-3"] {
+        docker("start", service);
+    }
+    wait_for_new_primary(majority_api, "pg1", Duration::from_secs(60)).await;
+
+    let history: serde_json::Value = reqwest::get(format!("{majority_api}/api/failover/history"))
+        .await
+        .expect("GET /api/failover/history")
+        .json()
+        .await
+        .expect("parse failover history");
+    assert_eq!(
+        history.as_array().and_then(|e| e.last()).unwrap()["ran_degraded"],
+        true
+    );
+
+    compose(&["down", "-v", "--remove-orphans"]);
+}
+
+/// A dead standby holds back at most `max_slot_wal_keep_size`, then is flagged.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_dead_standby_past_the_limit_is_flagged() {
+    start_stack();
+    create_mode_test_table().await;
+    wait_until("the slot limit", Duration::from_secs(20), || async {
+        show("pg-primary", "max_slot_wal_keep_size") == "32MB"
+    })
+    .await;
+
+    compose(&["stop", "pg-replica-2"]);
+    for _ in 0..8 {
+        let out = psql(
+            "pg-primary",
+            "pgcluster-1",
+            "BEGIN; CREATE TABLE IF NOT EXISTS wal_fill AS SELECT 1 AS a; \
+             INSERT INTO wal_fill SELECT generate_series(1, 300000); COMMIT; \
+             SELECT pg_switch_wal(); CHECKPOINT",
+        );
+        assert!(
+            out.status.success(),
+            "generate WAL: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    wait_until("the re-seed flag", Duration::from_secs(30), || async {
+        let flagged = replication(DEFAULT_API).await["needs_reseed"].clone();
+        flagged
+            .as_array()
+            .is_some_and(|f| f.iter().any(|n| n == "pg3"))
+    })
+    .await;
 
     compose(&["down", "-v", "--remove-orphans"]);
 }

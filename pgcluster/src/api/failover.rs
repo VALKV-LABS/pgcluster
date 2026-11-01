@@ -118,6 +118,7 @@ pub async fn failover_history(State(s): State<ApiState>) -> Json<serde_json::Val
                 "triggered_at": crate::api::status::unix_to_rfc3339(e.triggered_at),
                 "duration_ms":  e.duration_ms,
                 "reason":       e.reason,
+                "ran_degraded": e.ran_degraded,
             })
         })
         .collect();

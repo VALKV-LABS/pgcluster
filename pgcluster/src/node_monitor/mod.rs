@@ -1,5 +1,6 @@
 pub mod failure_state;
 pub mod health_check;
+pub mod replication;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::agent_clients::AgentClientPool;
-use crate::config::FailoverConfig;
+use crate::config::{FailoverConfig, ReplicationConfig};
 use crate::metrics_registry::Metrics;
 use crate::raft::commands::TopologyCommand;
 use crate::raft::lease::QuorumLease;
@@ -19,6 +20,7 @@ use failure_state::FailureTracker;
 #[cfg(test)]
 use health_check::HealthCheckResult;
 use health_check::{check_node, send_heartbeat};
+use replication::DegradeTimer;
 
 // ── NodeMonitor ───────────────────────────────────────────────────────────────
 
@@ -38,6 +40,8 @@ pub struct NodeMonitor {
     /// A leader cut off from the majority does not know it has lost leadership
     /// yet, so this instance acts only while it holds the lease.
     quorum: Arc<QuorumLease>,
+    sync_degrade_timeout_seconds: u64,
+    max_slot_wal_keep_size_mb: u64,
     /// How many health-check ticks between orphaned-slot audits on the primary.
     /// Default: 120 ticks × 500 ms interval ≈ once per minute.
     slot_audit_ticks: u64,
@@ -51,9 +55,8 @@ impl NodeMonitor {
         pool: Arc<AgentClientPool>,
         config: FailoverConfig,
         metrics: Arc<Metrics>,
-        repl_user: String,
+        replication: &ReplicationConfig,
         repl_password: String,
-        slot_prefix: String,
         op_in_progress: Arc<AtomicBool>,
         quorum: Arc<QuorumLease>,
     ) -> Self {
@@ -63,11 +66,13 @@ impl NodeMonitor {
             pool,
             config,
             metrics,
-            repl_user,
+            repl_user: replication.replication_user.clone(),
             repl_password,
-            slot_prefix,
+            slot_prefix: replication.slot_prefix.clone(),
             op_in_progress,
             quorum,
+            sync_degrade_timeout_seconds: replication.sync_degrade_timeout_seconds,
+            max_slot_wal_keep_size_mb: replication.max_slot_wal_keep_size_mb,
             slot_audit_ticks: 120,
         }
     }
@@ -82,6 +87,7 @@ impl NodeMonitor {
     ///    mark it offline and call `failover::trigger_failover`.
     pub async fn run(&mut self) {
         let mut tracker = FailureTracker::default();
+        let mut degrade_timer = DegradeTimer::default();
         let interval = Duration::from_millis(self.config.health_check_interval_ms);
         let mut tick = time::interval(interval);
         let mut tick_count: u64 = 0;
@@ -112,7 +118,8 @@ impl NodeMonitor {
             }
 
             let topology = self.topology_rx.current();
-            self.poll_all_nodes(&topology, &mut tracker).await;
+            self.poll_all_nodes(&topology, &mut tracker, &mut degrade_timer)
+                .await;
 
             // Update topology_version metric
             self.metrics.topology_version.set(topology.version as i64);
@@ -190,7 +197,12 @@ impl NodeMonitor {
         }
     }
 
-    async fn poll_all_nodes(&self, topology: &ClusterTopology, tracker: &mut FailureTracker) {
+    async fn poll_all_nodes(
+        &self,
+        topology: &ClusterTopology,
+        tracker: &mut FailureTracker,
+        degrade_timer: &mut DegradeTimer,
+    ) {
         let primary_lsn = topology
             .last_flush_lsns
             .get(&topology.primary_node_id)
@@ -215,6 +227,13 @@ impl NodeMonitor {
             }
         }
 
+        if let Some(primary) = check_results.iter().find(|r| {
+            r.node_id == topology.primary_node_id && r.reachable && r.pg_running && !r.in_recovery
+        }) {
+            self.reconcile_replication(topology, primary, degrade_timer)
+                .await;
+        }
+
         // Process results sequentially — tracker updates and Raft writes must not race.
         for result in check_results {
             let node_id = &result.node_id;
@@ -225,6 +244,23 @@ impl NodeMonitor {
 
             if result.reachable && result.pg_running {
                 tracker.record_success(node_id);
+
+                // The primary came back before a failover could complete.
+                if *node_id == topology.primary_node_id
+                    && topology.node_roles.get(node_id) == Some(&NodeRole::Offline)
+                    && !result.in_recovery
+                {
+                    info!(node_id, "primary recovered before failover completed");
+                    let _ = self
+                        .raft
+                        .raft
+                        .client_write(TopologyCommand::SetPrimary {
+                            node_id: node_id.clone(),
+                            at_lsn: result.flush_lsn,
+                            new_timeline: result.timeline,
+                        })
+                        .await;
+                }
 
                 // If the node has no effective role (Unknown, Offline, or Maintenance) but is
                 // healthy, promote it to Replica. This handles recovery from failure, nodes
@@ -284,7 +320,7 @@ impl NodeMonitor {
                                     primary_host, self.repl_user, self.repl_password
                                 );
                                 let slot_name = format!("{}{}", self.slot_prefix, node_id);
-                                match client.demote(&conninfo, &slot_name).await {
+                                match client.demote(&conninfo, &slot_name, node_id).await {
                                     Ok(r) if r.success => {
                                         info!(
                                             node_id,
@@ -339,7 +375,9 @@ impl NodeMonitor {
 
                 let threshold = self.config.health_check_failures_before_failover;
                 if tracker.is_failed(node_id, threshold) {
-                    let is_primary = topology.node_roles.get(node_id) == Some(&NodeRole::Primary);
+                    // By ID, not role: the first attempt marks the primary offline,
+                    // and an attempt that aborts must be able to run again.
+                    let is_primary = *node_id == topology.primary_node_id;
 
                     if is_primary {
                         // Guard: skip automatic failover if an operator-initiated
@@ -436,6 +474,9 @@ mod tests {
             timeline: 1,
             pg_running: true,
             replication_conninfo: "host=pg-primary port=5432 user=replicator".into(),
+            streaming_standbys: Vec::new(),
+            parameters: Default::default(),
+            lost_slots: Vec::new(),
         };
         let primary_host = "pg-replica-1"; // new primary after failover
         assert!(
@@ -456,6 +497,9 @@ mod tests {
             timeline: 2,
             pg_running: true,
             replication_conninfo: "host=pg-replica-1 port=5432 user=replicator".into(),
+            streaming_standbys: Vec::new(),
+            parameters: Default::default(),
+            lost_slots: Vec::new(),
         };
         let primary_host = "pg-replica-1";
         assert!(
@@ -476,6 +520,9 @@ mod tests {
             timeline: 0,
             pg_running: true,
             replication_conninfo: String::new(),
+            streaming_standbys: Vec::new(),
+            parameters: Default::default(),
+            lost_slots: Vec::new(),
         };
         let primary_host = "pg-replica-1";
         assert!(
@@ -496,6 +543,9 @@ mod tests {
             timeline: 1,
             pg_running: true,
             replication_conninfo: "host=pg-primary port=5432 user=replicator".into(),
+            streaming_standbys: Vec::new(),
+            parameters: Default::default(),
+            lost_slots: Vec::new(),
         };
         let primary_host = ""; // no primary elected yet
         assert!(

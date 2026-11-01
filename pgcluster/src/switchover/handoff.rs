@@ -88,7 +88,9 @@ pub async fn execute_switchover(
         let mut client = pool
             .get_or_connect(old_primary_id, &old_cfg.agent_addr)
             .await?;
-        let resp = client.demote(&conninfo_to_new, &slot_name).await?;
+        let resp = client
+            .demote(&conninfo_to_new, &slot_name, old_primary_id)
+            .await?;
         if !resp.success {
             anyhow::bail!(
                 "demote RPC failed for old primary {}: {}",
@@ -262,6 +264,7 @@ pub async fn execute_switchover(
             triggered_at,
             duration_ms,
             reason: "planned_switchover".to_string(),
+            ran_degraded: false,
         })
         .await;
 

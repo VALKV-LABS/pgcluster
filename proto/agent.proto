@@ -16,6 +16,8 @@ service AgentService {
   rpc StopPostgres(StopRequest) returns (StopResponse);
   // Reload Postgres config (SIGHUP)
   rpc ReloadConfig(ReloadRequest) returns (ReloadResponse);
+  // Apply settings pgcluster manages, with ALTER SYSTEM and a reload
+  rpc SetParameters(SetParametersRequest) returns (SetParametersResponse);
 }
 
 // ── Promote ──────────────────────────────────────────────────────────────────
@@ -41,6 +43,9 @@ message DemoteRequest {
   string new_primary_conninfo = 1;
   // Replication slot name to use (primary_slot_name)
   string slot_name            = 2;
+  // application_name for the WAL receiver: the name synchronous_standby_names
+  // uses for this node. Pass the node ID.
+  string application_name     = 3;
 }
 
 message DemoteResponse {
@@ -67,6 +72,10 @@ message StatusResponse {
   // Empty when this node is the primary or when WAL receiver is not running.
   // Used by node_monitor to detect a stale primary_conninfo after failover.
   string replication_conninfo = 10;
+  // Current values of the settings pgcluster manages.
+  map<string, string> parameters = 11;
+  // Replication slots whose WAL has been removed (wal_status = 'lost').
+  repeated string lost_slots = 12;
 }
 
 message ReplicaStatus {
@@ -107,6 +116,17 @@ message StopResponse {
 message ReloadRequest {}
 
 message ReloadResponse {
+  bool   success = 1;
+  string error   = 2;
+}
+
+// ── SetParameters ────────────────────────────────────────────────────────────
+
+message SetParametersRequest {
+  map<string, string> parameters = 1;
+}
+
+message SetParametersResponse {
   bool   success = 1;
   string error   = 2;
 }

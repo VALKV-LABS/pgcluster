@@ -85,11 +85,13 @@ impl AgentClient {
         &mut self,
         new_primary_conninfo: &str,
         slot_name: &str,
+        node_id: &str,
     ) -> Result<agent_proto::DemoteResponse> {
         self.stub
             .demote(tonic::Request::new(agent_proto::DemoteRequest {
                 new_primary_conninfo: new_primary_conninfo.to_string(),
                 slot_name: slot_name.to_string(),
+                application_name: node_id.to_string(),
             }))
             .await
             .with_context(|| format!("Demote at {}", self.addr))
@@ -104,6 +106,20 @@ impl AgentClient {
             }))
             .await
             .with_context(|| format!("StopPostgres at {}", self.addr))
+            .map(|r| r.into_inner())
+    }
+
+    /// Apply settings pgcluster manages on this node.
+    pub async fn set_parameters(
+        &mut self,
+        parameters: std::collections::HashMap<String, String>,
+    ) -> Result<agent_proto::SetParametersResponse> {
+        self.stub
+            .set_parameters(tonic::Request::new(agent_proto::SetParametersRequest {
+                parameters,
+            }))
+            .await
+            .with_context(|| format!("SetParameters at {}", self.addr))
             .map(|r| r.into_inner())
     }
 

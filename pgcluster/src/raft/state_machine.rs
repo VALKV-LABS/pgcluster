@@ -322,6 +322,7 @@ impl TopologyStateMachine {
                 triggered_at,
                 duration_ms,
                 reason,
+                ran_degraded,
             } => {
                 topology.record_failover(FailoverEvent {
                     old_primary: old_primary.clone(),
@@ -329,7 +330,28 @@ impl TopologyStateMachine {
                     triggered_at: *triggered_at,
                     duration_ms: *duration_ms,
                     reason: reason.clone(),
+                    ran_degraded: *ran_degraded,
                 });
+            }
+
+            TopologyCommand::SetReplicationMode { mode } => {
+                topology.replication_mode = *mode;
+                topology.sync_degraded = false;
+            }
+
+            TopologyCommand::SetSyncDegraded { degraded } => {
+                topology.sync_degraded = *degraded;
+            }
+
+            TopologyCommand::SetNeedsReseed {
+                node_id,
+                needs_reseed,
+            } => {
+                if *needs_reseed {
+                    topology.needs_reseed.insert(node_id.clone());
+                } else {
+                    topology.needs_reseed.remove(node_id);
+                }
             }
 
             TopologyCommand::SetReplicationSlot { node_id, slot_name } => {
@@ -368,6 +390,7 @@ impl openraft::RaftSnapshotBuilder<RaftTypeConfig> for TopologyStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::topology::ReplicationMode;
     use crate::raft::{
         commands::TopologyCommand,
         topology::{NodeConfig, NodeRole},
@@ -386,6 +409,34 @@ mod tests {
 
     fn apply(t: &mut ClusterTopology, cmd: TopologyCommand) {
         TopologyStateMachine::apply_command(t, &cmd);
+    }
+
+    #[test]
+    fn changing_mode_clears_a_fallback() {
+        let mut t = ClusterTopology::default();
+        apply(&mut t, TopologyCommand::SetSyncDegraded { degraded: true });
+        assert!(t.sync_degraded);
+        apply(
+            &mut t,
+            TopologyCommand::SetReplicationMode {
+                mode: ReplicationMode::SyncStrict,
+            },
+        );
+        assert_eq!(t.replication_mode, ReplicationMode::SyncStrict);
+        assert!(!t.sync_degraded);
+    }
+
+    #[test]
+    fn needs_reseed_flag_sets_and_clears() {
+        let mut t = ClusterTopology::default();
+        let flag = |needs_reseed| TopologyCommand::SetNeedsReseed {
+            node_id: "pg2".into(),
+            needs_reseed,
+        };
+        apply(&mut t, flag(true));
+        assert!(t.needs_reseed.contains("pg2"));
+        apply(&mut t, flag(false));
+        assert!(t.needs_reseed.is_empty());
     }
 
     #[test]

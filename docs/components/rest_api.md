@@ -30,6 +30,8 @@ The CLI sends the key in the `PGCLUSTER_API_KEY` environment variable.
 | `GET` | `/health` | `200` | Health; `503` when no primary is known |
 | `GET` | `/api/status` | `200` | Cluster summary |
 | `GET` | `/api/topology` | `200` | Full topology snapshot |
+| `GET` | `/api/replication` | `200` | Replication mode, fallback state and standbys that need seeding |
+| `POST` | `/api/replication/mode` | `204` | Change the mode online: `{"mode": "async"}`, `"sync"` or `"sync_strict"` |
 | `GET` | `/api/nodes` | `200` | List nodes |
 | `GET` | `/api/nodes/:node_id` | `200` | One node |
 | `POST` | `/api/nodes/add` | `201` | Register a Postgres node |
