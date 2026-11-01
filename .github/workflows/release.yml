@@ -3,8 +3,9 @@ name: Release
 # Every push to main publishes both images as `edge`. That also keeps the build
 # cache warm, so a release reuses it.
 #
-# Pushing a tag vX.Y.Z runs CI, publishes both images for amd64 and arm64 as
-# X.Y.Z, X.Y and latest, and creates the GitHub release.
+# Pushing a tag vX.Y.Z publishes both images for amd64 and arm64 as X.Y.Z, X.Y
+# and latest, and creates the GitHub release. CI runs first, unless it already
+# passed on main for the tagged commit.
 #
 # Requires two repository secrets:
 #   DOCKERHUB_USERNAME — Docker Hub username (valkvlabs)
@@ -21,10 +22,31 @@ permissions:
 
 jobs:
   # ── Gate: all CI checks must pass before a release ───────────────────────────
-  # ci.yml already runs on pushes to main.
+  # ci.yml already runs on pushes to main, and takes longer than the rest of a
+  # release, so a tag on a commit that passed there does not run it again.
+  ci-status:
+    name: Check CI on main
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    outputs:
+      passed: ${{ steps.check.outputs.passed }}
+    steps:
+      - name: Look for a passing run of this commit
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+            --branch main --event push --commit "$GITHUB_SHA" --status success \
+            --json databaseId --jq length)
+          echo "passed=$([ "$count" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
   ci:
     name: CI
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: ci-status
+    if: ${{ needs.ci-status.result == 'success' && needs.ci-status.outputs.passed != 'true' }}
     uses: ./.github/workflows/ci.yml
 
   # ── Images ────────────────────────────────────────────────────────────────────
@@ -32,8 +54,8 @@ jobs:
   # emulation takes hours.
   build:
     name: Build ${{ matrix.component }} ${{ matrix.arch }}
-    needs: ci
-    if: ${{ !cancelled() && (needs.ci.result == 'success' || needs.ci.result == 'skipped') }}
+    needs: [ci-status, ci]
+    if: ${{ !cancelled() && needs.ci-status.result != 'failure' && (needs.ci.result == 'success' || needs.ci.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
