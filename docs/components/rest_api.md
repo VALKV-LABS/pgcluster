@@ -36,6 +36,7 @@ The CLI sends the key in the `PGCLUSTER_API_KEY` environment variable.
 | `POST` | `/api/restart` | `202` | Start a rolling restart, on the Raft leader |
 | `GET` | `/api/restart` | `200` | Whether a rolling restart is running on this instance, and any error |
 | `GET` | `/api/backups/verify` | `200` | Check the WAL archive for gaps |
+| `POST` | `/api/nodes/:node_id/detach` | `204` | Turn an external standby into an independent database, on the Raft leader |
 | `POST` | `/api/backups/restore` | `202` | Restore onto a separate agent, optionally to a point in time |
 | `GET` | `/api/backups/restore` | `200` | Whether a restore is running on this instance, and any error |
 | `GET` | `/api/members` | `200` | List Raft voters and learners |

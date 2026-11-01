@@ -174,6 +174,36 @@ impl LocalPostgres {
         Ok(())
     }
 
+    /// Promote, and drop the settings that tie this node to its old cluster.
+    /// `archive_command` is replaced rather than cleared, because with
+    /// `archive_mode` on an empty command would hold WAL forever.
+    pub async fn detach(&self) -> Result<()> {
+        sqlx::query("SELECT pg_promote(true, 30)")
+            .execute(&self.pool)
+            .await
+            .context("pg_promote failed")?;
+        for name in ["primary_conninfo", "primary_slot_name"] {
+            sqlx::query(&format!("ALTER SYSTEM RESET {name}"))
+                .execute(&self.pool)
+                .await
+                .with_context(|| format!("ALTER SYSTEM RESET {name} failed"))?;
+        }
+        for (name, value) in [
+            ("archive_command", "/bin/true"),
+            ("synchronous_standby_names", ""),
+        ] {
+            sqlx::query(&alter_system_sql(name, value))
+                .execute(&self.pool)
+                .await
+                .with_context(|| format!("ALTER SYSTEM SET {name} failed"))?;
+        }
+        sqlx::query("SELECT pg_reload_conf()")
+            .execute(&self.pool)
+            .await
+            .context("pg_reload_conf failed")?;
+        Ok(())
+    }
+
     /// Returns replication slots whose WAL has been removed. Their standbys
     /// can no longer catch up by streaming.
     pub async fn get_lost_slots(&self) -> Result<Vec<String>> {

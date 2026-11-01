@@ -788,6 +788,10 @@ async fn add_and_seed_pg4() {
 }
 
 async fn add_and_seed_pg4_from(from_backup: bool) {
+    add_pg4(from_backup, false).await;
+}
+
+async fn add_pg4(from_backup: bool, external: bool) {
     compose(&[
         "--profile",
         "spare",
@@ -806,6 +810,8 @@ async fn add_and_seed_pg4_from(from_backup: bool) {
             "node_id": "pg4",
             "agent_addr": "vk-agent-4:7001",
             "postgres_addr": "pg-new:5432",
+            "priority": 1000,
+            "external": external,
         }))
         .send()
         .await
@@ -1101,7 +1107,8 @@ fn service_of(node_id: &str) -> &'static str {
 
 fn exec_sql(service: &str, sql: &str) -> String {
     let out = Command::new("docker")
-        .args(["compose", "-f", COMPOSE_FILE, "exec", "-T", service])
+        .args(["compose", "-f", COMPOSE_FILE, "--profile", "spare"])
+        .args(["exec", "-T", service])
         .args(["psql", "-U", "postgres", "-Atc", sql])
         .current_dir(project_root())
         .output()
@@ -1363,6 +1370,167 @@ async fn e2e_new_node_seeds_from_a_backup() {
     );
 
     compose(&["--profile", "spare", "down", "-v", "--remove-orphans"]);
+}
+
+/// An external standby follows every primary but is never promoted by a
+/// failover, and detaching it gives an independent database.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_external_standby_stays_out_and_can_detach() {
+    let api = "http://localhost:18009";
+    start_stack();
+    create_mode_test_table().await;
+    add_pg4(false, true).await;
+
+    // It takes no part in synchronous commit.
+    set_mode("sync").await;
+    wait_for_standby_names(STANDBY_NAMES).await;
+    set_mode("async").await;
+    wait_for_standby_names("").await;
+
+    // With the highest priority and every commit, it is still passed over, and
+    // it follows whoever is promoted.
+    docker("stop", "pg-primary");
+    let new_primary = wait_for_new_primary(api, "pg1", Duration::from_secs(60)).await;
+    assert_ne!(
+        new_primary, "pg4",
+        "an external standby must not be promoted"
+    );
+    let service = service_of(&new_primary);
+    wait_until(
+        "pg4 to follow the new primary",
+        Duration::from_secs(60),
+        || async {
+            exec_sql(
+                service,
+                "SELECT count(*) FROM pg_stat_replication \
+             WHERE application_name = 'pg4' AND state = 'streaming'",
+            ) == "1"
+        },
+    )
+    .await;
+
+    // Only the leader can detach a node, and any instance could be leading.
+    let client = reqwest::Client::new();
+    let mut detached = false;
+    for port in [8009, 18009, 28009] {
+        let response = client
+            .post(format!("http://localhost:{port}/api/nodes/pg4/detach"))
+            .bearer_auth("dev-api-key")
+            .send()
+            .await
+            .expect("POST /api/nodes/pg4/detach");
+        if response.status() == 204 {
+            detached = true;
+            break;
+        }
+        assert_eq!(response.status(), 503, "{}", response.text().await.unwrap());
+    }
+    assert!(detached, "the leader must detach pg4");
+
+    wait_until("pg4 to accept writes", Duration::from_secs(30), || async {
+        pg4_query("SELECT pg_is_in_recovery()") == "f"
+    })
+    .await;
+    assert_eq!(
+        pg4_query("INSERT INTO mode_test VALUES (500) RETURNING value")
+            .lines()
+            .next(),
+        Some("500")
+    );
+    assert_eq!(
+        exec_sql(service, "SELECT count(*) FROM mode_test WHERE value = 500"),
+        "0",
+        "a detached node must be independent"
+    );
+    assert_eq!(
+        exec_sql(
+            service,
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pgcluster_pg4'"
+        ),
+        "0",
+        "its slot must not hold WAL on the old primary"
+    );
+
+    // With no heartbeats, a node still in a cluster would fence by now.
+    tokio::time::sleep(Duration::from_secs(45)).await;
+    assert_eq!(
+        pg4_query("SELECT pg_is_in_recovery()"),
+        "f",
+        "a detached node must not fence itself"
+    );
+
+    compose(&["--profile", "spare", "down", "-v", "--remove-orphans"]);
+}
+
+const SINGLE_COMPOSE: &str = "docker/single-compose.yml";
+
+fn single(args: &[&str]) -> std::process::Output {
+    let out = Command::new("docker")
+        .args(["compose", "-p", "pgcluster-single", "-f", SINGLE_COMPOSE])
+        .args(args)
+        .current_dir(project_root())
+        .output()
+        .expect("docker compose");
+    assert!(
+        out.status.success(),
+        "docker compose {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// One node has no failover: it recovers from its volume. Removing the
+/// containers and network stands for losing the VM, with its disk reattached.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_one_node_recovers_after_its_vm_is_replaced() {
+    let api = "http://localhost:8109";
+    let dsn = "host=localhost port=5532 user=postgres password=test dbname=postgres";
+
+    single(&["up", "-d", "--build", "--wait"]);
+    wait_for_primary(api, Duration::from_secs(60)).await;
+    let (pg, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect through the proxy");
+    tokio::spawn(connection);
+    pg.simple_query("CREATE TABLE survives (value int); INSERT INTO survives VALUES (1)")
+        .await
+        .expect("write before the replacement");
+    drop(pg);
+
+    single(&["down"]);
+    single(&["up", "-d", "--wait"]);
+
+    let status = wait_for_primary(api, Duration::from_secs(60)).await;
+    assert_eq!(status["primary_node_id"], "pg1");
+
+    // The proxy needs a moment for its lease, so allow for retries.
+    let mut session = None;
+    for _ in 0..30 {
+        if let Ok((client, connection)) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await
+        {
+            tokio::spawn(connection);
+            session = Some(client);
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let pg = session.expect("connect after the replacement");
+    let rows = pg
+        .simple_query("SELECT value FROM survives")
+        .await
+        .expect("read after the replacement");
+    assert!(
+        rows.iter()
+            .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_))),
+        "the data must survive"
+    );
+    pg.simple_query("INSERT INTO survives VALUES (2)")
+        .await
+        .expect("write after the replacement");
+
+    single(&["down", "-v", "--remove-orphans"]);
 }
 
 /// Runs switchover only — useful when the stack is already up (E2E_SKIP_BUILD=1).

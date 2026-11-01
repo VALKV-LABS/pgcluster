@@ -34,6 +34,9 @@ service AgentService {
   rpc BackupVerify(BackupVerifyRequest) returns (BackupVerifyResponse);
   // Replace this node's data from a backup and start Postgres
   rpc Restore(RestoreRequest) returns (SeedResponse);
+  // Promote this external standby and leave the cluster: it stops expecting
+  // heartbeats, following the primary and archiving to the cluster's repository.
+  rpc Detach(DetachRequest) returns (SeedResponse);
 }
 
 // ── Promote ──────────────────────────────────────────────────────────────────
@@ -222,3 +225,7 @@ message RestoreRequest {
   // Settings for the backup tool, which this node may not have yet.
   map<string, string> settings = 5;
 }
+
+// ── Detach ───────────────────────────────────────────────────────────────────
+
+message DetachRequest {}

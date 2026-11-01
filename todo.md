@@ -15,7 +15,7 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 
 - [x] **2.1 Require credentials on the REST API.** *Done when:* the server refuses to start without API keys, unless an explicit development flag is set.
 - [x] **2.2 Require client certificates on every gRPC endpoint.** Covers `vk-agent` and Raft, signed by the cluster CA. *Done when:* a connection without a valid client certificate is rejected, by automated test.
-- [ ] **2.3 Use TLS between the proxy and Postgres.** *Done when:* the connection is encrypted and certificates are verified. **Pending decision:** how logins work over this link. `[proxy] backend_tls` is built and tested, but off by default, because SCRAM passthrough fails once this link uses TLS: Postgres binds the login to a TLS session the client is not part of. Replica read routing has the same cause, since the proxy cannot log in to a replica for a client, so reads go to the primary for now. Options: (a) `pg_hba` method `password` with TLS required at the proxy, which works today but shows the proxy every password and conflicts with 6.10 generating passwords locally; (b) the proxy terminates SCRAM from stored verifiers, as PgBouncer does, which needs a privileged role to read them and also makes replica reads possible. Recommended: (b).
+- [ ] **2.3 Use TLS between the proxy and Postgres.** *Done when:* the connection is encrypted and certificates are verified. **Pending decision:** how logins work over this link. `[proxy] backend_tls` is built and tested, but off by default, because SCRAM passthrough fails once this link uses TLS: Postgres binds the login to a TLS session the client is not part of. Replica read routing has the same cause, since the proxy cannot log in to a replica for a client, so reads go to the primary for now. Options: (a) `pg_hba` method `password` with TLS required at the proxy, which works today but shows the proxy every password and conflicts with 6.10 generating passwords locally; (b) the proxy terminates SCRAM from stored verifiers, as PgBouncer does, which needs a role that can read them, limited to one `SECURITY DEFINER` function as Supavisor does, and also makes replica reads possible. Recommended: (b).
 - [x] **2.4 Update docs.** *Done when:* the README and `docs/components/tls_manager.md` describe what 2.1 to 2.3 deliver.
 
 ## Part 3: Safe failover
@@ -42,9 +42,9 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 - [x] **5.5 Add a WAL-G engine to the backup coordinator.** Behind backup RPCs that name no tool, run by `vk-agent`, with data checksums and a pinned version. Weekly full, daily delta. *Done when:* scheduled backups run from a standby and survive a leader change.
 - [x] **5.6 Add WAL archiving.** `archive_command` runs `wal-g wal-push`. *Done when:* archiving works from whichever node is primary, including after failover, and `wal-g wal-verify` finds no gaps.
 - [x] **5.7 Add restore.** Seed from backup, and restore to a point in time with `wal-g backup-fetch` and `wal-fetch`. *Done when:* a point-in-time restore is verified by automated test, and 5.2 can seed from backup.
-- [ ] **5.8 Test one-node recovery.** *Done when:* a one-node cluster recovers after its VM is replaced and its volume reattached.
-- [ ] **5.9 Add an external standby role.** Excluded from failover and from Raft. *Done when:* it follows the primary and can be promoted into an independent cluster.
-- [ ] **5.10 Release `v0.2.0`.** *Done when:* the full end-to-end suite passes and images are published.
+- [x] **5.8 Test one-node recovery.** *Done when:* a one-node cluster recovers after its VM is replaced and its volume reattached.
+- [x] **5.9 Add an external standby role.** Excluded from failover and from Raft. *Done when:* it follows the primary and can be promoted into an independent cluster.
+- [ ] **5.10 Release `v0.2.0`.** *Done when:* the full end-to-end suite passes and images are published. **Pending go-ahead:** the suite passes locally. This needs a merge to `main`, CI there, and a pushed tag, which publishes images.
 
 **Pause here.** Stop after Part 5 and wait for the go-ahead before starting Part 6.
 

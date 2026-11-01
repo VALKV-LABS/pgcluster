@@ -54,8 +54,8 @@ fn standbys_in_order(topology: &ClusterTopology) -> Result<Vec<String>> {
         bail!("the cluster has no primary");
     }
     let mut standbys = Vec::new();
-    for node_id in topology.node_configs.keys() {
-        if *node_id == topology.primary_node_id {
+    for (node_id, cfg) in &topology.node_configs {
+        if *node_id == topology.primary_node_id || cfg.is_external() {
             continue;
         }
         match topology.node_roles.get(node_id) {

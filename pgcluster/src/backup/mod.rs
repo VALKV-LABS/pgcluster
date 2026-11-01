@@ -209,6 +209,12 @@ pub fn select_source(topology: &ClusterTopology, prefer_replica: bool) -> Option
             .node_roles
             .iter()
             .filter(|(_, role)| **role == NodeRole::Replica)
+            .filter(|(id, _)| {
+                topology
+                    .node_configs
+                    .get(*id)
+                    .is_some_and(|cfg| !cfg.is_external())
+            })
             .map(|(id, _)| {
                 let lag = topology
                     .replica_lag_bytes

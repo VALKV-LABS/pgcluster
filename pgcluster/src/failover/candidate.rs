@@ -28,8 +28,8 @@ pub async fn pick_live_candidate(
     if topology.replication_mode == ReplicationMode::SyncStrict {
         let standbys = topology
             .node_configs
-            .keys()
-            .filter(|id| *id != failed_node_id)
+            .iter()
+            .filter(|(id, cfg)| *id != failed_node_id && !cfg.is_external())
             .count();
         if positions.len() < standbys {
             error!(
@@ -57,6 +57,9 @@ async fn live_positions(
         let Some(cfg) = topology.node_configs.get(node_id) else {
             continue;
         };
+        if cfg.is_external() {
+            continue;
+        }
         let node_id = node_id.clone();
         let addr = cfg.agent_addr.clone();
         let pool = pool.clone();

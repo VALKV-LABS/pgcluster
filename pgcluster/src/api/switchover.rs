@@ -58,6 +58,19 @@ pub async fn trigger_switchover(
         );
     }
 
+    if topology.node_configs[&req.target_node_id].is_external() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SwitchoverResponse {
+                success: false,
+                message: format!(
+                    "target {} is an external standby — detach it instead",
+                    req.target_node_id
+                ),
+            }),
+        );
+    }
+
     // Validate target role: must be Replica (not Offline, Maintenance, Unknown).
     use crate::raft::topology::NodeRole;
     match topology.node_roles.get(&req.target_node_id) {

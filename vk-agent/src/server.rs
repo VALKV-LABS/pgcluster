@@ -15,9 +15,10 @@ use agent::agent_service_server::{AgentService, AgentServiceServer};
 use agent::{
     BackupDeleteRequest, BackupDeleteResponse, BackupPushRequest, BackupPushResponse,
     BackupVerifyRequest, BackupVerifyResponse, ConfigureBackupsRequest, DemoteRequest,
-    DemoteResponse, HeartbeatRequest, HeartbeatResponse, PromoteRequest, PromoteResponse,
-    ReloadRequest, ReloadResponse, RestoreRequest, SeedRequest, SeedResponse, SetParametersRequest,
-    SetParametersResponse, StatusRequest, StatusResponse, StopRequest, StopResponse,
+    DemoteResponse, DetachRequest, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
+    PromoteResponse, ReloadRequest, ReloadResponse, RestoreRequest, SeedRequest, SeedResponse,
+    SetParametersRequest, SetParametersResponse, StatusRequest, StatusResponse, StopRequest,
+    StopResponse,
 };
 
 use crate::config::AgentConfig;
@@ -26,6 +27,9 @@ use crate::postgres::LocalPostgres;
 use crate::process::PgCtl;
 use crate::standby::configure_standby;
 use crate::walg::WalG;
+
+/// In the data directory of a node that has left its cluster.
+pub const DETACHED_MARKER: &str = "pgcluster.detached";
 
 pub struct AgentServiceImpl {
     config: Arc<AgentConfig>,
@@ -298,6 +302,27 @@ impl AgentService for AgentServiceImpl {
             Ok(_guard) => self.walg.restore(&self.pg_ctl, data_dir, &req).await,
             Err(e) => Err(e),
         };
+        Ok(Response::new(SeedResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        }))
+    }
+
+    /// Leave the cluster as an independent primary. The marker keeps this node
+    /// from fencing itself after a restart, when no pgcluster will heartbeat it.
+    async fn detach(
+        &self,
+        _request: Request<DetachRequest>,
+    ) -> Result<Response<SeedResponse>, Status> {
+        let data_dir = Path::new(&self.config.data_dir);
+        self.heartbeat.detach();
+        let result = async {
+            tokio::fs::write(data_dir.join(DETACHED_MARKER), b"")
+                .await
+                .map_err(anyhow::Error::from)?;
+            self.pg.detach().await
+        }
+        .await;
         Ok(Response::new(SeedResponse {
             success: result.is_ok(),
             error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),

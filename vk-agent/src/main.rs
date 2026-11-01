@@ -44,6 +44,12 @@ async fn main() -> Result<()> {
 
     let heartbeat = HeartbeatTracker::new(Duration::from_secs(config.heartbeat_timeout_seconds));
     heartbeat.clone().spawn_watchdog();
+    if std::path::Path::new(&config.data_dir)
+        .join(vk_agent::server::DETACHED_MARKER)
+        .exists()
+    {
+        heartbeat.detach();
+    }
 
     let pg_ctl = Arc::new(PgCtl::new(&config.pg_ctl_path, &config.data_dir));
 

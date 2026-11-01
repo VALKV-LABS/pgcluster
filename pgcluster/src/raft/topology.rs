@@ -51,6 +51,19 @@ pub struct NodeConfig {
     pub tags: HashMap<String, String>,
 }
 
+/// Tag value for a node that follows the primary from outside the cluster.
+pub const EXTERNAL_ROLE: &str = "external";
+
+impl NodeConfig {
+    /// An external standby follows the primary, typically from another region.
+    /// It never votes, never takes part in synchronous commit, is never promoted
+    /// by a failover, and takes no backups. `POST /api/nodes/:id/detach` turns it
+    /// into an independent database.
+    pub fn is_external(&self) -> bool {
+        self.tags.get("role").is_some_and(|r| r == EXTERNAL_ROLE)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum BackupStatus {
@@ -158,8 +171,9 @@ impl ClusterTopology {
     pub fn standby_names(&self) -> String {
         let mut standbys: Vec<&String> = self
             .node_configs
-            .keys()
-            .filter(|id| **id != self.primary_node_id)
+            .iter()
+            .filter(|(id, cfg)| **id != self.primary_node_id && !cfg.is_external())
+            .map(|(id, _)| id)
             .collect();
         if standbys.is_empty() {
             return String::new();
@@ -314,6 +328,18 @@ mod tests {
         t.replication_mode = ReplicationMode::Sync;
         assert_eq!(t.synchronous_standby_names(), "");
         t.replication_mode = ReplicationMode::SyncStrict;
+        assert_eq!(t.synchronous_standby_names(), r#"ANY 1 ("pg2")"#);
+    }
+
+    #[test]
+    fn external_standbys_are_not_synchronous() {
+        let mut t = nodes(&["pg1", "pg2", "pg3"], "pg1");
+        t.replication_mode = ReplicationMode::Sync;
+        t.node_configs
+            .get_mut("pg3")
+            .unwrap()
+            .tags
+            .insert("role".into(), EXTERNAL_ROLE.into());
         assert_eq!(t.synchronous_standby_names(), r#"ANY 1 ("pg2")"#);
     }
 

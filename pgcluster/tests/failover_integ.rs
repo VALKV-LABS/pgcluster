@@ -6,9 +6,10 @@ use pgcluster::agent_clients::agent_proto::agent_service_server::{
 use pgcluster::agent_clients::agent_proto::{
     BackupDeleteRequest, BackupDeleteResponse, BackupPushRequest, BackupPushResponse,
     BackupVerifyRequest, BackupVerifyResponse, ConfigureBackupsRequest, DemoteRequest,
-    DemoteResponse, HeartbeatRequest, HeartbeatResponse, PromoteRequest, PromoteResponse,
-    ReloadRequest, ReloadResponse, RestoreRequest, SeedRequest, SeedResponse, SetParametersRequest,
-    SetParametersResponse, StatusRequest, StatusResponse, StopRequest, StopResponse,
+    DemoteResponse, DetachRequest, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
+    PromoteResponse, ReloadRequest, ReloadResponse, RestoreRequest, SeedRequest, SeedResponse,
+    SetParametersRequest, SetParametersResponse, StatusRequest, StatusResponse, StopRequest,
+    StopResponse,
 };
 use pgcluster::agent_clients::AgentClientPool;
 use pgcluster::failover::candidate::pick_live_candidate;
@@ -99,6 +100,9 @@ impl AgentService for FakeAgent {
     }
     async fn restore(&self, _: Request<RestoreRequest>) -> RpcResult<SeedResponse> {
         Err(Status::unimplemented("restore"))
+    }
+    async fn detach(&self, _: Request<DetachRequest>) -> RpcResult<SeedResponse> {
+        Err(Status::unimplemented("detach"))
     }
 }
 
@@ -205,6 +209,32 @@ async fn a_hung_agent_fails_its_health_check_instead_of_blocking() {
         .await
         .expect("a hung agent must not block the monitor");
     assert!(!result.reachable);
+}
+
+#[tokio::test]
+async fn an_external_standby_is_never_a_candidate() {
+    let pg2 = fake_agent(standby_at(100)).await;
+    let pg3 = fake_agent(standby_at(999)).await;
+    let mut t = cluster(&[("pg2", &pg2, 0), ("pg3", &pg3, 0)]);
+    t.node_configs
+        .get_mut("pg3")
+        .unwrap()
+        .tags
+        .insert("role".into(), "external".into());
+    assert_eq!(pick(&t).await, Some(("pg2".into(), 100)));
+}
+
+#[tokio::test]
+async fn sync_strict_does_not_wait_for_an_external_standby() {
+    let pg2 = fake_agent(standby_at(100)).await;
+    let mut t = cluster(&[("pg2", &pg2, 0), ("pg3", "127.0.0.1:1", 0)]);
+    t.replication_mode = ReplicationMode::SyncStrict;
+    t.node_configs
+        .get_mut("pg3")
+        .unwrap()
+        .tags
+        .insert("role".into(), "external".into());
+    assert_eq!(pick(&t).await, Some(("pg2".into(), 100)));
 }
 
 #[tokio::test]

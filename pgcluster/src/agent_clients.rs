@@ -195,6 +195,15 @@ impl AgentClient {
             .map(|r| r.into_inner())
     }
 
+    /// Promote this external standby and have it leave the cluster.
+    pub async fn detach(&mut self) -> Result<agent_proto::SeedResponse> {
+        self.stub
+            .detach(tonic::Request::new(agent_proto::DetachRequest {}))
+            .await
+            .with_context(|| format!("Detach at {}", self.addr))
+            .map(|r| r.into_inner())
+    }
+
     /// Apply settings pgcluster manages on this node.
     pub async fn set_parameters(
         &mut self,

@@ -37,6 +37,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `vk-agent` starts with no Postgres running, and skips self-fencing while there is none to fence.
 
 ### Added
+- External standbys: `"external": true` on `POST /api/nodes/add` adds a node that follows the primary but stays outside failover, synchronous commit, backups and rolling restarts. `POST /api/nodes/:id/detach` promotes it into an independent database.
 - Backups use WAL-G, run by `vk-agent` from the least-lagged standby, falling back to the primary: full and delta backups, retention, WAL archiving from whichever node is primary, and encryption with libsodium.
 - `POST /api/backups/restore` restores to a point in time onto a separate agent, as an independent database. `{"from_backup": true}` on `POST /api/nodes/:id/seed` seeds a node from a backup.
 - `GET /api/backups/verify` checks the WAL archive for gaps.

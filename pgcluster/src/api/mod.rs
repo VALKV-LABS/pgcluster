@@ -86,6 +86,7 @@ pub fn router(state: ApiState) -> Router {
                 )
                 .route("/nodes/add", post(nodes::add_node))
                 .route("/nodes/:node_id/seed", post(nodes::seed_node))
+                .route("/nodes/:node_id/detach", post(nodes::detach_node))
                 .route(
                     "/members",
                     get(members::list_members).post(members::add_member),

@@ -265,3 +265,11 @@ Failover retries until it succeeds. If the primary returns first, it keeps its r
 A node that accepts writes but is not the cluster's primary has diverged, and those writes are lost when it rejoins. After `health_check_failures_before_failover` sightings in a row, outside any failover or switchover, the leader creates its slot and has its agent run `pg_rewind` and restart it as a standby. If the rewind fails, it seeds the node again.
 
 `pg_rewind` needs data checksums or `wal_log_hints`. Seeding and rewinding need an agent that owns Postgres, so an agent with `manage_postgres = false` refuses both.
+
+## External standbys
+
+An external standby follows the primary, typically from another region, and has no pgcluster instance of its own, so it is outside Raft. Failover never promotes it, synchronous commit and `sync_strict` promotion ignore it, and backups and rolling restarts skip it. It is repointed like any other standby when the primary changes.
+
+`POST /api/nodes/:id/detach` promotes it into an independent database. It stops following the primary, stops archiving to the cluster's repository and stops expecting heartbeats, so it never fences itself. The cluster forgets the node and drops its slot.
+
+It needs the same Postgres major version and CPU architecture as the cluster.
