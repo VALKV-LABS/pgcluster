@@ -196,6 +196,7 @@ async fn e2e_switchover_and_failover() {
     eprintln!("==> Triggering switchover to {switchover_target}...");
     let sw_resp = client
         .post(format!("{api}/api/switchover"))
+        .bearer_auth("dev-api-key")
         .json(&serde_json::json!({
             "target_node_id": switchover_target,
             "max_lag_bytes": 10_485_760,
@@ -366,6 +367,7 @@ async fn e2e_switchover_against_running_stack() {
     // Trigger switchover.
     let resp = client
         .post(format!("{api}/api/switchover"))
+        .bearer_auth("dev-api-key")
         .json(&serde_json::json!({
             "target_node_id": target,
             "max_lag_bytes": 10_485_760,

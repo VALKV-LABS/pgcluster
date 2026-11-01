@@ -18,7 +18,7 @@ pub mod tls;
 
 use anyhow::Result;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Start the full pgcluster server from the given config file path.
 pub async fn run_server(config_path: &str) -> Result<()> {
@@ -32,6 +32,9 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
     logging::init();
     info!(cluster = %cfg.cluster.name, node_id = cfg.raft.node_id, "pgcluster starting");
+    if cfg.api.insecure_no_auth {
+        warn!("REST API is running with no credentials (insecure_no_auth = true)");
+    }
 
     // Build TLS manager before Raft so we can share the CA cert for peer connections.
     let tls_mgr: Option<Arc<tls::TlsManager>> = if cfg.tls.auto_generate || cfg.tls.cert.is_some() {

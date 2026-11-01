@@ -8,6 +8,7 @@ pub fn validate(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     validate_raft(cfg)?;
     validate_nodes(cfg)?;
     validate_addresses(cfg)?;
+    validate_api(cfg)?;
     validate_backup(cfg)?;
     Ok(())
 }
@@ -104,6 +105,22 @@ fn validate_addresses(cfg: &PgClusterConfig) -> anyhow::Result<()> {
         parse_host_port(&node.agent_addr).map_err(|e| {
             anyhow::anyhow!("node {:?} agent_addr {:?}: {}", node.id, node.agent_addr, e)
         })?;
+    }
+    Ok(())
+}
+
+fn validate_api(cfg: &PgClusterConfig) -> anyhow::Result<()> {
+    if cfg.api.api_keys.iter().any(|k| k.trim().is_empty()) {
+        anyhow::bail!("[api] api_keys must not contain an empty key");
+    }
+    if cfg.api.api_keys.is_empty() && !cfg.api.insecure_no_auth {
+        anyhow::bail!(
+            "[api] api_keys must contain at least one key. \
+             For local development only, set insecure_no_auth = true"
+        );
+    }
+    if !cfg.api.api_keys.is_empty() && cfg.api.insecure_no_auth {
+        anyhow::bail!("[api] set either api_keys or insecure_no_auth, not both");
     }
     Ok(())
 }
@@ -205,7 +222,10 @@ mod tests {
             failover: FailoverConfig::default(),
             tls: TlsConfig::default(),
             metrics: MetricsConfig::default(),
-            api: ApiConfig::default(),
+            api: ApiConfig {
+                api_keys: vec!["test-key".into()],
+                ..Default::default()
+            },
             backup: None,
         }
     }
@@ -274,6 +294,36 @@ mod tests {
     fn node_addr_invalid_port_fails() {
         let mut cfg = minimal();
         cfg.nodes.node[0].postgres_addr = "postgres:notaport".into();
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn missing_api_keys_fail() {
+        let mut cfg = minimal();
+        cfg.api.api_keys.clear();
+        let err = validate(&cfg).unwrap_err();
+        assert!(err.to_string().contains("api_keys"), "{err}");
+    }
+
+    #[test]
+    fn empty_api_key_fails() {
+        let mut cfg = minimal();
+        cfg.api.api_keys = vec!["  ".into()];
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn development_flag_allows_missing_api_keys() {
+        let mut cfg = minimal();
+        cfg.api.api_keys.clear();
+        cfg.api.insecure_no_auth = true;
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn development_flag_with_api_keys_fails() {
+        let mut cfg = minimal();
+        cfg.api.insecure_no_auth = true;
         assert!(validate(&cfg).is_err());
     }
 

@@ -87,3 +87,4 @@ listen_addr = "0.0.0.0:9090"   # Prometheus /metrics endpoint
 
 [api]
 listen_addr = "0.0.0.0:8080"   # REST API for cluster management
+api_keys    = ["change-me"]    # Required. The server refuses to start without a key.

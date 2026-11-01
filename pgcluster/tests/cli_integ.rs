@@ -345,3 +345,30 @@ async fn cli_switchover_propagates_server_error() {
         "should propagate 409 Conflict as Err"
     );
 }
+
+// ── API key ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn api_client_sends_key_as_bearer_token() {
+    use axum::http::{HeaderMap, StatusCode};
+    let router = Router::new().route(
+        "/api/status",
+        get(|headers: HeaderMap| async move {
+            match headers.get("authorization").map(|v| v.as_bytes()) {
+                Some(b"Bearer secret") => Ok(Json(status_json())),
+                _ => Err(StatusCode::UNAUTHORIZED),
+            }
+        }),
+    );
+    let addr = spawn_mock(router).await;
+
+    let with_key = pgcluster::cli::client::ApiClient::with_key(&addr, Some("secret".into()));
+    let status: serde_json::Value = with_key.get("/api/status").await.expect("accepted");
+    assert_eq!(status["cluster_name"], "test-cluster");
+
+    let without_key = pgcluster::cli::client::ApiClient::with_key(&addr, None);
+    assert!(without_key
+        .get::<serde_json::Value>("/api/status")
+        .await
+        .is_err());
+}

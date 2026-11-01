@@ -17,6 +17,10 @@ api_keys    = ["key1-for-ops", "key2-for-monitoring"]
 public_read_endpoints = false   # true lets GET and HEAD through without a key
 ```
 
+The server refuses to start with no keys. For local development only, `insecure_no_auth = true` runs the API with no credentials, and logs a warning.
+
+The CLI sends the key in the `PGCLUSTER_API_KEY` environment variable.
+
 `/health` is always public, for load balancers and Docker health checks.
 
 ## Endpoints

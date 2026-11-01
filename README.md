@@ -139,13 +139,13 @@ Switchover gracefully hands off the primary role to a replica. Writes are paused
 
 ```bash
 # Switchover to pg2 (replica must be within 1 MiB lag, 30 s timeout)
-curl -s -X POST http://localhost:8009/api/switchover \
+curl -s -X POST -H "Authorization: Bearer dev-api-key" http://localhost:8009/api/switchover \
   -H "Content-Type: application/json" \
   -d '{"target_node_id": "pg2"}' | jq .
 # → { "success": true, "message": "switchover to pg2 initiated" }
 
 # Optional: tighten the lag threshold or extend the timeout
-curl -s -X POST http://localhost:8009/api/switchover \
+curl -s -X POST -H "Authorization: Bearer dev-api-key" http://localhost:8009/api/switchover \
   -H "Content-Type: application/json" \
   -d '{"target_node_id": "pg2", "max_lag_bytes": 65536, "timeout_secs": 60}' | jq .
 
@@ -161,7 +161,7 @@ Failover marks a node offline and triggers automatic promotion of the best repli
 
 ```bash
 # Mark pg1 offline — the monitor will promote the best replica
-curl -s -X POST http://localhost:8009/api/failover \
+curl -s -X POST -H "Authorization: Bearer dev-api-key" http://localhost:8009/api/failover \
   -H "Content-Type: application/json" \
   -d '{"failed_node_id": "pg1"}' | jq .
 # → { "triggered": true, "message": "failover initiated for pg1" }
@@ -174,7 +174,7 @@ curl -s http://localhost:8009/api/status | jq .primary_node_id
 
 ```bash
 # Add a new node to the topology
-curl -s -X POST http://localhost:8009/api/nodes/add \
+curl -s -X POST -H "Authorization: Bearer dev-api-key" http://localhost:8009/api/nodes/add \
   -H "Content-Type: application/json" \
   -d '{
     "node_id":       "pg4",
@@ -184,7 +184,7 @@ curl -s -X POST http://localhost:8009/api/nodes/add \
   }' | jq .
 
 # Remove a node
-curl -s -X DELETE http://localhost:8009/api/nodes/pg4 | jq .
+curl -s -X DELETE -H "Authorization: Bearer dev-api-key" http://localhost:8009/api/nodes/pg4 | jq .
 ```
 
 ### Single binary

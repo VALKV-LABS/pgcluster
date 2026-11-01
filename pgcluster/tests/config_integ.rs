@@ -45,6 +45,7 @@ listen_addr = "0.0.0.0:9090"
 
 [api]
 listen_addr = "0.0.0.0:8080"
+api_keys    = ["test-key"]
 "#;
     let cfg: pgcluster::config::PgClusterConfig = toml::from_str(toml).unwrap();
     pgcluster::config::validate::validate(&cfg).unwrap();
@@ -87,6 +88,7 @@ listen_addr = "0.0.0.0:9090"
 
 [api]
 listen_addr = "0.0.0.0:8080"
+api_keys    = ["test-key"]
 "#;
     let cfg: pgcluster::config::PgClusterConfig = toml::from_str(toml).unwrap();
     assert!(pgcluster::config::validate::validate(&cfg).is_err());
@@ -126,6 +128,7 @@ listen_addr = "0.0.0.0:9090"
 
 [api]
 listen_addr = "0.0.0.0:8080"
+api_keys    = ["test-key"]
 "#;
     let cfg: pgcluster::config::PgClusterConfig = toml::from_str(toml).unwrap();
     assert!(pgcluster::config::validate::validate(&cfg).is_err());
@@ -165,6 +168,7 @@ listen_addr = "0.0.0.0:9090"
 
 [api]
 listen_addr = "0.0.0.0:8080"
+api_keys    = ["test-key"]
 "#;
     let cfg: pgcluster::config::PgClusterConfig = toml::from_str(toml).unwrap();
     // Defaults should be sane values
@@ -217,6 +221,7 @@ listen_addr = "0.0.0.0:9090"
 
 [api]
 listen_addr = "0.0.0.0:8080"
+api_keys    = ["test-key"]
 "#
 }
 
@@ -387,4 +392,47 @@ async fn server_starts_with_valid_config_and_exits_cleanly() {
         stderr.contains("pgcluster") || out.status.success(),
         "expected server startup output in stderr, got: {stderr}"
     );
+}
+
+#[test]
+fn server_refuses_to_start_without_api_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let data_dir = dir.path().join("data");
+    let toml = format!(
+        r#"
+[cluster]
+name     = "test-cluster"
+data_dir = "{}"
+
+[raft]
+node_id   = 1
+bootstrap = true
+
+[[raft.peers]]
+id   = 1
+addr = "127.0.0.1:7000"
+
+[replication]
+replication_user = "replicator"
+
+[proxy]
+listen_addr = "127.0.0.1:0"
+
+[api]
+listen_addr = "127.0.0.1:0"
+"#,
+        data_dir.display()
+    );
+    std::fs::write(&path, toml).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pgcluster"))
+        .args(["server", "--config", path.to_str().unwrap()])
+        .output()
+        .expect("failed to run pgcluster");
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("api_keys"), "stderr: {stderr}");
+    assert!(!data_dir.exists(), "must refuse before touching data_dir");
 }

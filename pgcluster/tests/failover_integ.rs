@@ -275,6 +275,7 @@ async fn switchover_is_zero_data_loss() {
     // Trigger switchover — waits for zero lag before promoting.
     let sw_resp = http
         .post(format!("{api}/api/switchover"))
+        .bearer_auth("dev-api-key")
         .json(&serde_json::json!({
             "target_node_id": target,
             "max_lag_bytes": 0,

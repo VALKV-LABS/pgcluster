@@ -295,11 +295,16 @@ fn default_metrics_listen() -> String {
 pub struct ApiConfig {
     #[serde(default = "default_api_listen")]
     pub listen_addr: String,
+    /// Bearer tokens accepted by the REST API. The server refuses to start
+    /// without at least one, unless `insecure_no_auth` is set.
     #[serde(default)]
     pub api_keys: Vec<String>,
     /// If true, status/metrics endpoints skip auth.
     #[serde(default = "default_public_read")]
     pub public_read_endpoints: bool,
+    /// Development only: run the REST API with no credentials at all.
+    #[serde(default)]
+    pub insecure_no_auth: bool,
 }
 
 impl Default for ApiConfig {
@@ -308,6 +313,7 @@ impl Default for ApiConfig {
             listen_addr: default_api_listen(),
             api_keys: vec![],
             public_read_endpoints: default_public_read(),
+            insecure_no_auth: false,
         }
     }
 }

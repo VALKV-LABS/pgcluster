@@ -404,6 +404,7 @@ async fn post_switchover_executes_and_changes_primary() {
         .expect("at least one non-primary node");
     let resp = c
         .post(format!("{base}/api/switchover"))
+        .bearer_auth("dev-api-key")
         .json(&serde_json::json!({
             "target_node_id": target,
             "max_lag_bytes": 10_485_760,
