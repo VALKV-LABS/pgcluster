@@ -3,7 +3,7 @@ pub mod health_check;
 pub mod replication;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -11,16 +11,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::agent_clients::AgentClientPool;
 use crate::config::{FailoverConfig, ReplicationConfig};
+use crate::failover::seed::SeedPlan;
 use crate::metrics_registry::Metrics;
 use crate::raft::commands::TopologyCommand;
 use crate::raft::lease::QuorumLease;
 use crate::raft::topology::{ClusterTopology, NodeRole};
 use crate::raft::{RaftNode, TopologyWatch};
 use failure_state::FailureTracker;
-#[cfg(test)]
 use health_check::HealthCheckResult;
 use health_check::{check_node, send_heartbeat};
-use replication::DegradeTimer;
+use replication::{DegradeTimer, StalePrimaries};
+
+/// How long to wait before trying again to rejoin an old primary.
+const REJOIN_COOLDOWN: Duration = Duration::from_secs(60);
 
 // ── NodeMonitor ───────────────────────────────────────────────────────────────
 
@@ -42,6 +45,7 @@ pub struct NodeMonitor {
     quorum: Arc<QuorumLease>,
     sync_degrade_timeout_seconds: u64,
     max_slot_wal_keep_size_mb: u64,
+    replication: ReplicationConfig,
     /// How many health-check ticks between orphaned-slot audits on the primary.
     /// Default: 120 ticks × 500 ms interval ≈ once per minute.
     slot_audit_ticks: u64,
@@ -73,6 +77,7 @@ impl NodeMonitor {
             quorum,
             sync_degrade_timeout_seconds: replication.sync_degrade_timeout_seconds,
             max_slot_wal_keep_size_mb: replication.max_slot_wal_keep_size_mb,
+            replication: replication.clone(),
             slot_audit_ticks: 120,
         }
     }
@@ -88,6 +93,7 @@ impl NodeMonitor {
     pub async fn run(&mut self) {
         let mut tracker = FailureTracker::default();
         let mut degrade_timer = DegradeTimer::default();
+        let mut stale_primaries = StalePrimaries::default();
         let interval = Duration::from_millis(self.config.health_check_interval_ms);
         let mut tick = time::interval(interval);
         let mut tick_count: u64 = 0;
@@ -118,8 +124,13 @@ impl NodeMonitor {
             }
 
             let topology = self.topology_rx.current();
-            self.poll_all_nodes(&topology, &mut tracker, &mut degrade_timer)
-                .await;
+            self.poll_all_nodes(
+                &topology,
+                &mut tracker,
+                &mut degrade_timer,
+                &mut stale_primaries,
+            )
+            .await;
 
             // Update topology_version metric
             self.metrics.topology_version.set(topology.version as i64);
@@ -157,6 +168,39 @@ impl NodeMonitor {
                     let pool = pool.clone();
                     tokio::spawn(async move { send_heartbeat(&node_id, &addr, &pool).await });
                 }
+            }
+        });
+    }
+
+    /// A node accepting writes that the cluster does not count as its primary.
+    /// Reads the latest topology, and holds back during a failover or
+    /// switchover, when a new primary can run ahead of the topology.
+    fn is_stale_primary(&self, node_id: &str, result: &HealthCheckResult) -> bool {
+        let primary = self.topology_rx.current().primary_node_id.clone();
+        !result.in_recovery
+            && !primary.is_empty()
+            && primary != node_id
+            && !self.op_in_progress.load(Ordering::SeqCst)
+    }
+
+    /// Rejoin a diverged old primary in the background: a rewind is quick, but
+    /// the re-seed it can fall back to is not.
+    fn spawn_rejoin(&self, node_id: &str) {
+        let topology = self.topology_rx.current();
+        let plan = match SeedPlan::new(&topology, node_id, &self.replication) {
+            Ok(plan) => plan,
+            Err(e) => {
+                warn!(node_id, err = %e, "cannot rejoin the old primary");
+                return;
+            }
+        };
+        warn!(node_id, "old primary diverged: rejoining it as a standby");
+        let node_id = node_id.to_string();
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            match plan.rejoin(&pool).await {
+                Ok(()) => info!(node_id, "old primary rejoined as a standby"),
+                Err(e) => error!(node_id, err = %e, "old primary could not rejoin"),
             }
         });
     }
@@ -202,6 +246,7 @@ impl NodeMonitor {
         topology: &ClusterTopology,
         tracker: &mut FailureTracker,
         degrade_timer: &mut DegradeTimer,
+        stale_primaries: &mut StalePrimaries,
     ) {
         let primary_lsn = topology
             .last_flush_lsns
@@ -244,6 +289,16 @@ impl NodeMonitor {
 
             if result.reachable && result.pg_running {
                 tracker.record_success(node_id);
+
+                if self.is_stale_primary(node_id, &result) {
+                    let threshold = self.config.health_check_failures_before_failover;
+                    if stale_primaries.sighted(node_id, threshold, REJOIN_COOLDOWN, Instant::now())
+                    {
+                        self.spawn_rejoin(node_id);
+                    }
+                    continue;
+                }
+                stale_primaries.cleared(node_id);
 
                 // The primary came back before a failover could complete.
                 if *node_id == topology.primary_node_id

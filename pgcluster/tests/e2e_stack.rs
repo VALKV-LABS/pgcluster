@@ -784,16 +784,9 @@ async fn e2e_dead_standby_past_the_limit_is_flagged() {
     compose(&["down", "-v", "--remove-orphans"]);
 }
 
-/// A new node with an empty data directory seeds from the primary through an
-/// RPC, then streams from it.
-#[tokio::test]
-#[ignore = "requires Docker daemon and sufficient system resources"]
-async fn e2e_new_node_seeds_through_the_agent() {
-    start_stack();
-    create_mode_test_table().await;
-    wait_for_exit(&mut spawn_write(7), Duration::from_secs(10)).await;
-
-    let spare = [
+/// Add the spare node and wait until it streams from the primary.
+async fn add_and_seed_pg4() {
+    compose(&[
         "--profile",
         "spare",
         "up",
@@ -801,8 +794,7 @@ async fn e2e_new_node_seeds_through_the_agent() {
         "--no-deps",
         "--build",
         "vk-agent-4",
-    ];
-    compose(&spare);
+    ]);
 
     let client = reqwest::Client::new();
     let added = client
@@ -837,32 +829,113 @@ async fn e2e_new_node_seeds_through_the_agent() {
         String::from_utf8_lossy(&out.stdout).trim() == "1"
     })
     .await;
+}
 
+fn pg4_query(sql: &str) -> String {
     let out = Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            COMPOSE_FILE,
-            "--profile",
-            "spare",
-            "exec",
-            "-T",
-        ])
-        .args([
-            "vk-agent-4",
-            "psql",
-            "-h",
-            "127.0.0.1",
-            "-U",
-            "postgres",
-            "-Atc",
-        ])
-        .arg("SELECT value FROM mode_test")
-        .env("PGPASSWORD", "test")
+        .args(["compose", "-f", COMPOSE_FILE, "--profile", "spare"])
+        .args(["exec", "-T", "-e", "PGPASSWORD=test", "vk-agent-4"])
+        .args(["psql", "-h", "127.0.0.1", "-U", "postgres", "-Atc", sql])
         .current_dir(project_root())
         .output()
         .expect("query pg4");
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "7");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A new node with an empty data directory seeds from the primary through an
+/// RPC, then streams from it.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_new_node_seeds_through_the_agent() {
+    start_stack();
+    create_mode_test_table().await;
+    wait_for_exit(&mut spawn_write(7), Duration::from_secs(10)).await;
+
+    add_and_seed_pg4().await;
+    assert_eq!(pg4_query("SELECT value FROM mode_test"), "7");
+
+    compose(&["--profile", "spare", "down", "-v", "--remove-orphans"]);
+}
+
+/// An old primary that took writes after losing its role comes back as a
+/// standby of the new primary, with those writes discarded.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_diverged_primary_rejoins_with_rewind() {
+    let majority_api = "http://localhost:18009";
+    start_stack();
+    create_mode_test_table().await;
+    add_and_seed_pg4().await;
+
+    // pg4 is the node vk-agent manages, so make it the primary.
+    let switched = reqwest::Client::new()
+        .post(format!("{DEFAULT_API}/api/switchover"))
+        .bearer_auth("dev-api-key")
+        .json(&serde_json::json!({
+            "target_node_id": "pg4",
+            "max_lag_bytes": 1048576,
+            "timeout_secs": 30,
+        }))
+        .send()
+        .await
+        .expect("POST /api/switchover");
+    assert!(switched.status().is_success(), "{}", switched.status());
+    wait_for_new_primary(majority_api, "pg1", Duration::from_secs(60)).await;
+    wait_until("pg4 to accept writes", Duration::from_secs(20), || async {
+        pg4_query("SELECT pg_is_in_recovery()") == "f"
+    })
+    .await;
+
+    // A standby must follow pg4 first, so that the next promotion gets a new
+    // timeline and this exercises a true rewind.
+    wait_until(
+        "a standby to follow pg4",
+        Duration::from_secs(40),
+        || async {
+            pg4_query("SELECT count(*) > 0 FROM pg_stat_replication WHERE state = 'streaming'")
+                == "t"
+        },
+    )
+    .await;
+
+    // Isolate it, and let it take a write only it will ever have.
+    let id = container_id("vk-agent-4");
+    let network = |args: &[&str]| {
+        let status = Command::new("docker")
+            .arg("network")
+            .args(args)
+            .args(["docker_default", &id])
+            .status()
+            .expect("docker network");
+        assert!(status.success(), "docker network {args:?}");
+    };
+    network(&["disconnect"]);
+    assert_eq!(
+        pg4_query("INSERT INTO mode_test VALUES (999) RETURNING value")
+            .lines()
+            .next(),
+        Some("999")
+    );
+
+    wait_for_new_primary(majority_api, "pg4", Duration::from_secs(30)).await;
+    network(&["connect", "--alias", "vk-agent-4", "--alias", "pg-new"]);
+
+    wait_until(
+        "pg4 to rejoin as a standby",
+        Duration::from_secs(60),
+        || async { pg4_query("SELECT pg_is_in_recovery()") == "t" },
+    )
+    .await;
+    assert_eq!(
+        pg4_query("SELECT count(*) FROM mode_test WHERE value = 999"),
+        "0",
+        "the diverged write must go"
+    );
+    let logs = compose(&["logs"]);
+    assert!(
+        !String::from_utf8_lossy(&logs.stdout).contains("rewind failed"),
+        "this should rewind, without falling back to a seed"
+    );
 
     compose(&["--profile", "spare", "down", "-v", "--remove-orphans"]);
 }

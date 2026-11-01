@@ -121,6 +121,18 @@ impl AgentClient {
             .map(|r| r.into_inner())
     }
 
+    /// Rewind this node to the primary.
+    pub async fn rewind(
+        &mut self,
+        request: agent_proto::SeedRequest,
+    ) -> Result<agent_proto::SeedResponse> {
+        self.stub
+            .rewind(tonic::Request::new(request))
+            .await
+            .with_context(|| format!("Rewind at {}", self.addr))
+            .map(|r| r.into_inner())
+    }
+
     /// Apply settings pgcluster manages on this node.
     pub async fn set_parameters(
         &mut self,

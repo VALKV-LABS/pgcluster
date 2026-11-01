@@ -7,7 +7,7 @@ pub mod agent {
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tonic::transport::{Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
@@ -47,6 +47,27 @@ impl AgentServiceImpl {
             pg_ctl,
             seeding: Mutex::new(()),
         }
+    }
+
+    /// Stop Postgres. When this agent owns the process it starts it again, so a
+    /// demoted primary comes back as a standby. Otherwise its owner restarts it.
+    async fn stop_and_restart(&self) -> anyhow::Result<()> {
+        self.pg_ctl.stop_fast().await?;
+        if self.config.manage_postgres {
+            self.pg_ctl.start().await?;
+        }
+        Ok(())
+    }
+
+    /// Seed and rewind stop Postgres, so they need this agent to own it, and
+    /// only one runs at a time.
+    fn begin_lifecycle_change(&self) -> anyhow::Result<MutexGuard<'_, ()>> {
+        if !self.config.manage_postgres {
+            anyhow::bail!("this agent does not manage Postgres (manage_postgres = false)");
+        }
+        self.seeding
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("a seed or rewind is already running"))
     }
 }
 
@@ -137,22 +158,45 @@ impl AgentService for AgentServiceImpl {
         // Remove promote.signal if present; ignore errors.
         let _ = tokio::fs::remove_file(data_dir.join("promote.signal")).await;
 
+        // primary_conninfo applies on reload, so a running standby switches to
+        // the new primary now. A primary ignores it until it restarts.
+        if result.is_ok() {
+            if let Err(e) = self.pg_ctl.reload().await {
+                tracing::warn!(err = %e, "reload after demote failed");
+            }
+        }
+
         Ok(Response::new(DemoteResponse {
             success: result.is_ok(),
             error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
         }))
     }
 
-    /// Seed this node from the primary. Only one seed runs at a time.
+    /// Seed this node from the primary.
     async fn seed(&self, request: Request<SeedRequest>) -> Result<Response<SeedResponse>, Status> {
-        let Ok(_guard) = self.seeding.try_lock() else {
-            return Ok(Response::new(SeedResponse {
-                success: false,
-                error: "a seed is already running".to_string(),
-            }));
-        };
         let data_dir = Path::new(&self.config.data_dir);
-        let result = crate::seed::seed(&self.pg_ctl, data_dir, &request.into_inner()).await;
+        let req = request.into_inner();
+        let result = match self.begin_lifecycle_change() {
+            Ok(_guard) => crate::seed::seed(&self.pg_ctl, data_dir, &req).await,
+            Err(e) => Err(e),
+        };
+        Ok(Response::new(SeedResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        }))
+    }
+
+    /// Rewind this node to the primary.
+    async fn rewind(
+        &self,
+        request: Request<SeedRequest>,
+    ) -> Result<Response<SeedResponse>, Status> {
+        let data_dir = Path::new(&self.config.data_dir);
+        let req = request.into_inner();
+        let result = match self.begin_lifecycle_change() {
+            Ok(_guard) => crate::seed::rewind(&self.pg_ctl, data_dir, &req).await,
+            Err(e) => Err(e),
+        };
         Ok(Response::new(SeedResponse {
             success: result.is_ok(),
             error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
@@ -292,7 +336,8 @@ impl AgentService for AgentServiceImpl {
         &self,
         _request: Request<StopRequest>,
     ) -> Result<Response<StopResponse>, Status> {
-        match self.pg_ctl.stop_fast().await {
+        let result = self.stop_and_restart().await;
+        match result {
             Ok(()) => Ok(Response::new(StopResponse {
                 success: true,
                 error: String::new(),

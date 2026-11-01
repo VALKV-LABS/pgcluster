@@ -44,6 +44,12 @@ pub struct AgentConfig {
     #[serde(default)]
     pub tls: AgentTlsConfig,
 
+    /// Whether this agent may stop and start Postgres to seed or rewind it.
+    /// Turn it off when something else owns the process, as when Postgres is
+    /// the main process of a neighbouring container.
+    #[serde(default = "default_manage_postgres")]
+    pub manage_postgres: bool,
+
     /// Path to pg_ctl binary (used for stop/start commands).
     #[serde(default = "default_pg_ctl")]
     pub pg_ctl_path: String,
@@ -80,6 +86,9 @@ fn default_pg_dbname() -> String {
 }
 fn default_heartbeat_timeout() -> u64 {
     10
+}
+fn default_manage_postgres() -> bool {
+    true
 }
 fn default_fence_timeout() -> u64 {
     30
@@ -217,6 +226,7 @@ listen_addr = "0.0.0.0:7001"
             heartbeat_timeout_seconds: 10,
             fence_timeout_seconds: 30,
             tls: Default::default(),
+            manage_postgres: true,
             pg_ctl_path: "pg_ctl".into(),
         };
         assert_eq!(

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Result};
+use tracing::warn;
 
 use super::slots;
 use crate::agent_clients::agent_proto::SeedRequest;
@@ -53,29 +54,51 @@ impl SeedPlan {
 
     /// Create the node's slot on the primary, then have its agent seed. Waits
     /// for the whole backup.
-    pub async fn run(self, pool: &AgentClientPool, force: bool) -> Result<()> {
-        let primary_url = format!(
-            "postgres://{}:{}@{}/postgres",
-            self.user, self.password, self.primary_addr
-        );
-        slots::ensure_slot(&primary_url, &self.slot_name).await?;
-
+    pub async fn run(&self, pool: &AgentClientPool, force: bool) -> Result<()> {
+        self.ensure_slot().await?;
         let mut client = pool.get_or_connect(&self.node_id, &self.agent_addr).await?;
-        let response = client
-            .seed(SeedRequest {
-                primary_host: self.primary_host,
-                primary_port: self.primary_port,
-                user: self.user,
-                password: self.password,
-                slot_name: self.slot_name,
-                application_name: self.node_id,
-                force,
-            })
-            .await?;
+        let response = client.seed(self.request(force)).await?;
         if !response.success {
             bail!("{}", response.error);
         }
         Ok(())
+    }
+
+    /// Bring a diverged old primary back as a standby: rewind it, and seed it
+    /// again if that fails.
+    pub async fn rejoin(&self, pool: &AgentClientPool) -> Result<()> {
+        self.ensure_slot().await?;
+        let mut client = pool.get_or_connect(&self.node_id, &self.agent_addr).await?;
+        let response = client.rewind(self.request(false)).await?;
+        if response.success {
+            return Ok(());
+        }
+        warn!(
+            node_id = self.node_id,
+            err = %response.error,
+            "rewind failed, seeding from the primary"
+        );
+        self.run(pool, true).await
+    }
+
+    async fn ensure_slot(&self) -> Result<()> {
+        let primary_url = format!(
+            "postgres://{}:{}@{}/postgres",
+            self.user, self.password, self.primary_addr
+        );
+        slots::ensure_slot(&primary_url, &self.slot_name).await
+    }
+
+    fn request(&self, force: bool) -> SeedRequest {
+        SeedRequest {
+            primary_host: self.primary_host.clone(),
+            primary_port: self.primary_port,
+            user: self.user.clone(),
+            password: self.password.clone(),
+            slot_name: self.slot_name.clone(),
+            application_name: self.node_id.clone(),
+            force,
+        }
     }
 }
 

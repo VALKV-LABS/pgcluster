@@ -11,6 +11,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Breaking:** `[tls] auto_generate` and `pgcluster init --gen-certs` are gone, because they gave each node its own CA. Use `pgcluster certs`.
 
 ### Fixed
+- Switchover stops the old primary before promoting the target, then creates slots on the new primary. Before, standbys could not follow the new primary after a switchover.
+- Repointing a standby applies with a reload, so standbys follow a new primary after a failover without a restart.
+- Health checks time out, so a node that vanishes without a connection reset no longer stalls the monitor and blocks failover.
+- A node that diverged and shares a timeline ID with the new primary is seeded again, instead of rejoining with its diverged commits.
 - An aborted failover is retried. Before, the first attempt marked the primary offline, which stopped later attempts and left the cluster with no primary.
 - Restarting the bootstrap node no longer repeats the bootstrap seed, which moved the primary back to the highest-priority node.
 - Failover chooses the candidate from the live position of reachable standbys, not the last position the health checks recorded, and aborts if none answers.
@@ -29,6 +33,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `vk-agent` starts with no Postgres running, and skips self-fencing while there is none to fence.
 
 ### Added
+- A diverged old primary rejoins by itself as a standby, with `pg_rewind`, and is seeded again if that fails. `manage_postgres = false` opts an agent out, for when something else owns the Postgres process.
 - `POST /api/nodes/:id/seed` seeds a node from the primary through `vk-agent`.
 - Raft membership changes through `/api/members`: add a learner, promote it, and remove a member.
 - `replication_mode` with `async`, `sync` and `sync_strict`, which replaces `synchronous_standby_names`. The config sets the mode of a new cluster, and `POST /api/replication/mode` changes it online. `GET /api/replication` reports it.

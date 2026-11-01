@@ -62,13 +62,14 @@ services:
 
   pg-primary:
     networks: [default, side-a]
-    image: postgres:16
+    image: postgres:16-bookworm
     init: true
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: test
       POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: --data-checksums
     command: >
       postgres
         -c wal_level=replica
@@ -85,6 +86,7 @@ services:
     volumes:
       - pg-primary-data:/var/lib/postgresql/data
       - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./copy-hba.sh:/docker-entrypoint-initdb.d/copy-hba.sh:ro
       - certs:/certs:ro
     depends_on:
       certs:
@@ -97,7 +99,7 @@ services:
 
   pg-replica-1:
     networks: [default, side-b]
-    image: postgres:16
+    image: postgres:16-bookworm
     init: true
     restart: unless-stopped
     environment:
@@ -120,7 +122,7 @@ services:
 
   pg-replica-2:
     networks: [default, side-b]
-    image: postgres:16
+    image: postgres:16-bookworm
     init: true
     restart: unless-stopped
     environment:

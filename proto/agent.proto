@@ -21,6 +21,9 @@ service AgentService {
   // Replace this node's data with a base backup of the primary, then start
   // Postgres as a standby. Runs as long as the backup takes.
   rpc Seed(SeedRequest) returns (SeedResponse);
+  // Rewind this node to the primary with pg_rewind, then start it as a standby.
+  // Uses SeedRequest, ignoring force.
+  rpc Rewind(SeedRequest) returns (SeedResponse);
 }
 
 // ── Promote ──────────────────────────────────────────────────────────────────

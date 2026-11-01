@@ -28,6 +28,7 @@ fn postgres_url_tcp() {
         postgres_dbname: "postgres".into(),
         heartbeat_timeout_seconds: 10,
         fence_timeout_seconds: 0,
+        manage_postgres: true,
         tls: Default::default(),
         pg_ctl_path: "pg_ctl".into(),
     };
@@ -49,6 +50,7 @@ fn postgres_url_with_password() {
         postgres_dbname: "postgres".into(),
         heartbeat_timeout_seconds: 10,
         fence_timeout_seconds: 0,
+        manage_postgres: true,
         tls: Default::default(),
         pg_ctl_path: "pg_ctl".into(),
     };

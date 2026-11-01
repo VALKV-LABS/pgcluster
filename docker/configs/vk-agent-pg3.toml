@@ -8,6 +8,7 @@ postgres_dbname           = "postgres"
 heartbeat_timeout_seconds = 10
 fence_timeout_seconds     = 30
 pg_ctl_path               = "/usr/lib/postgresql/16/bin/pg_ctl"
+manage_postgres           = false
 
 [tls]
 ca_cert = "/certs/ca.crt"

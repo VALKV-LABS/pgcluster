@@ -259,3 +259,9 @@ The fallback is recorded through Raft before the setting is cleared, so a later 
 `max_slot_wal_keep_size_mb` caps the WAL a slot can hold back. A standby past that limit cannot catch up by streaming, and appears under `needs_reseed` in `GET /api/replication`.
 
 Failover retries until it succeeds. If the primary returns first, it keeps its role.
+
+## Old primaries
+
+A node that accepts writes but is not the cluster's primary has diverged, and those writes are lost when it rejoins. After `health_check_failures_before_failover` sightings in a row, outside any failover or switchover, the leader creates its slot and has its agent run `pg_rewind` and restart it as a standby. If the rewind fails, it seeds the node again.
+
+`pg_rewind` needs data checksums or `wal_log_hints`. Seeding and rewinding need an agent that owns Postgres, so an agent with `manage_postgres = false` refuses both.

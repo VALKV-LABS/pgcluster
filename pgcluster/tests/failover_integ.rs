@@ -30,6 +30,19 @@ fn node(id: &str, priority: u32) -> NodeConfig {
 
 struct FakeAgent(StatusResponse);
 
+/// Accepts connections and never answers, like a node behind dropped packets.
+async fn hung_agent() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    addr
+}
+
 #[tonic::async_trait]
 impl AgentService for FakeAgent {
     async fn promote(&self, _: Request<PromoteRequest>) -> RpcResult<PromoteResponse> {
@@ -58,6 +71,9 @@ impl AgentService for FakeAgent {
     }
     async fn seed(&self, _: Request<SeedRequest>) -> RpcResult<SeedResponse> {
         Err(Status::unimplemented("seed"))
+    }
+    async fn rewind(&self, _: Request<SeedRequest>) -> RpcResult<SeedResponse> {
+        Err(Status::unimplemented("rewind"))
     }
 }
 
@@ -153,6 +169,17 @@ async fn node_not_in_recovery_is_skipped() {
     let pg3 = fake_agent(standby_at(100)).await;
     let t = cluster(&[("pg2", &pg2, 0), ("pg3", &pg3, 0)]);
     assert_eq!(pick(&t).await, Some(("pg3".into(), 100)));
+}
+
+#[tokio::test]
+async fn a_hung_agent_fails_its_health_check_instead_of_blocking() {
+    let addr = hung_agent().await;
+    let pool = AgentClientPool::new();
+    let check = pgcluster::node_monitor::health_check::check_node("pg1", &addr, &pool);
+    let result = tokio::time::timeout(Duration::from_secs(5), check)
+        .await
+        .expect("a hung agent must not block the monitor");
+    assert!(!result.reachable);
 }
 
 #[tokio::test]

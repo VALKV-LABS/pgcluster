@@ -34,6 +34,9 @@ pub struct HealthCheckResult {
 
 // ── send_heartbeat ────────────────────────────────────────────────────────────
 
+/// Upper bound on one health check.
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Upper bound on one heartbeat, so a dead agent cannot pile up tasks.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -58,11 +61,25 @@ pub async fn send_heartbeat(node_id: &str, agent_addr: &str, pool: &AgentClientP
 /// Poll the vk-agent at `agent_addr` and return a normalised health-check
 /// result.  Never returns an `Err`; connection / RPC failures are represented
 /// as `reachable: false` so the caller's failure tracker can account for them.
+///
+/// Time-boxed, because a node that vanishes without a connection reset would
+/// otherwise hang the call, and with it the leader's whole monitor loop.
 pub async fn check_node(
     node_id: &str,
     agent_addr: &str,
     pool: &AgentClientPool,
 ) -> HealthCheckResult {
+    match tokio::time::timeout(HEALTH_CHECK_TIMEOUT, query_node(node_id, agent_addr, pool)).await {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(node_id, "health check timed out");
+            pool.remove(node_id);
+            unreachable_result(node_id)
+        }
+    }
+}
+
+async fn query_node(node_id: &str, agent_addr: &str, pool: &AgentClientPool) -> HealthCheckResult {
     let mut client = match pool.get_or_connect(node_id, agent_addr).await {
         Ok(c) => c,
         Err(e) => {

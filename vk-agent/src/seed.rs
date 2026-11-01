@@ -39,6 +39,46 @@ pub async fn seed(pg_ctl: &PgCtl, data_dir: &Path, req: &SeedRequest) -> Result<
     pg_ctl.start().await
 }
 
+/// Rewind this node's timeline to the primary's, and start as a standby.
+///
+/// Leaves the data alone if pg_rewind fails, so the caller can decide to seed.
+/// pg_rewind itself recovers a data directory that was not shut down cleanly.
+pub async fn rewind(pg_ctl: &PgCtl, data_dir: &Path, req: &SeedRequest) -> Result<()> {
+    if pg_ctl.is_running().await.unwrap_or(false) {
+        pg_ctl.stop_fast().await?;
+    }
+
+    let source = format!(
+        "host={} port={} user={} dbname=postgres",
+        req.primary_host, req.primary_port, req.user
+    );
+    let output = Command::new(pg_ctl.tool("pg_rewind"))
+        .arg("--target-pgdata")
+        .arg(data_dir)
+        .arg("--source-server")
+        .arg(&source)
+        .env("PGPASSWORD", &req.password)
+        .output()
+        .await
+        .context("spawn pg_rewind")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        bail!("pg_rewind failed: {}", stderr.trim());
+    }
+    // pg_rewind compares timeline IDs. This node accepted writes as a primary,
+    // so it cannot truly match: two nodes that promoted independently can share
+    // an ID with different histories, and rejoining would keep the diverged
+    // commits. Fail, so the caller seeds it instead.
+    if stdout.contains("no rewind required") || stderr.contains("no rewind required") {
+        bail!("pg_rewind found the same timeline ID on a node that diverged");
+    }
+
+    let conninfo = format!("{source} password={}", req.password);
+    configure_standby(data_dir, &conninfo, &req.slot_name, &req.application_name).await?;
+    pg_ctl.start().await
+}
+
 async fn base_backup(pg_ctl: &PgCtl, data_dir: &Path, req: &SeedRequest) -> Result<()> {
     let mut command = Command::new(pg_ctl.tool("pg_basebackup"));
     command
@@ -139,6 +179,70 @@ mod tests {
             data.to_str().unwrap(),
         );
         (bin, pg_ctl, data)
+    }
+
+    #[tokio::test]
+    async fn rewind_stops_postgres_and_restarts_it_as_a_standby() {
+        let (bin, pg_ctl, data) = fake_tools(0, 0);
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("kept"), "x").unwrap();
+        let script = bin.path().join("pg_rewind");
+        let log = bin.path().join("calls.log");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"pg_rewind $* PGPASSWORD=$PGPASSWORD\" >> {}\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        rewind(&pg_ctl, &data, &request(false)).await.unwrap();
+
+        let calls = calls(&bin);
+        assert!(calls.contains("pg_ctl stop"), "{calls}");
+        assert!(calls.contains("host=pg1 port=5432"), "{calls}");
+        assert!(calls.contains("PGPASSWORD=secret"), "{calls}");
+        assert!(calls.contains("pg_ctl start"), "{calls}");
+        assert!(data.join("kept").exists(), "a rewind keeps the data");
+        assert!(data.join("standby.signal").exists());
+    }
+
+    #[tokio::test]
+    async fn no_rewind_required_counts_as_failure_on_a_diverged_node() {
+        let (bin, pg_ctl, data) = fake_tools(3, 0);
+        std::fs::create_dir_all(&data).unwrap();
+        let script = bin.path().join("pg_rewind");
+        std::fs::write(&script, "#!/bin/sh\necho 'no rewind required' >&2\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = rewind(&pg_ctl, &data, &request(false)).await.unwrap_err();
+
+        assert!(err.to_string().contains("same timeline"), "{err}");
+        assert!(!data.join("standby.signal").exists());
+        assert!(!std::fs::read_to_string(bin.path().join("calls.log"))
+            .unwrap()
+            .contains("pg_ctl start"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_rewind_leaves_postgres_stopped_and_the_data_alone() {
+        let (bin, pg_ctl, data) = fake_tools(3, 0);
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("kept"), "x").unwrap();
+        let script = bin.path().join("pg_rewind");
+        std::fs::write(&script, "#!/bin/sh\necho diverged >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = rewind(&pg_ctl, &data, &request(false)).await.unwrap_err();
+
+        assert!(err.to_string().contains("diverged"), "{err}");
+        assert!(data.join("kept").exists());
+        assert!(!data.join("standby.signal").exists());
+        assert!(!std::fs::read_to_string(bin.path().join("calls.log"))
+            .unwrap()
+            .contains("pg_ctl start"));
     }
 
     fn request(force: bool) -> SeedRequest {

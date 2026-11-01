@@ -62,6 +62,48 @@ impl DegradeTimer {
     }
 }
 
+// ── StalePrimaries ────────────────────────────────────────────────────────────
+
+/// Decides when a node that acts as primary, but is not the cluster's, should
+/// be rewound. A rewind discards its diverged commits, so this waits for
+/// repeated sightings: a node promoted a moment ago also looks like this until
+/// the topology catches up.
+#[derive(Default)]
+pub struct StalePrimaries {
+    sightings: HashMap<String, u32>,
+    last_attempt: HashMap<String, Instant>,
+}
+
+impl StalePrimaries {
+    /// Record one sighting. Returns `true` when it is time to act on the node.
+    pub fn sighted(
+        &mut self,
+        node_id: &str,
+        needed: u32,
+        cooldown: Duration,
+        now: Instant,
+    ) -> bool {
+        let sightings = self.sightings.entry(node_id.to_string()).or_insert(0);
+        *sightings += 1;
+        if *sightings < needed {
+            return false;
+        }
+        let cooled = self
+            .last_attempt
+            .get(node_id)
+            .is_none_or(|last| now.duration_since(*last) >= cooldown);
+        if cooled {
+            self.last_attempt.insert(node_id.to_string(), now);
+        }
+        cooled
+    }
+
+    /// The node no longer looks like a stale primary.
+    pub fn cleared(&mut self, node_id: &str) {
+        self.sightings.remove(node_id);
+    }
+}
+
 // ── Reconcile ─────────────────────────────────────────────────────────────────
 
 /// Node IDs from slots that lost WAL, for slots named `<prefix><node_id>`.
@@ -257,6 +299,35 @@ mod tests {
                 Fallback::Stay
             );
         }
+    }
+
+    const COOLDOWN: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn a_stale_primary_needs_repeated_sightings() {
+        let mut stale = StalePrimaries::default();
+        let now = Instant::now();
+        assert!(!stale.sighted("pg1", 3, COOLDOWN, now));
+        assert!(!stale.sighted("pg1", 3, COOLDOWN, now));
+        assert!(stale.sighted("pg1", 3, COOLDOWN, now));
+    }
+
+    #[test]
+    fn a_node_that_stops_looking_stale_starts_over() {
+        let mut stale = StalePrimaries::default();
+        let now = Instant::now();
+        stale.sighted("pg1", 2, COOLDOWN, now);
+        stale.cleared("pg1");
+        assert!(!stale.sighted("pg1", 2, COOLDOWN, now));
+    }
+
+    #[test]
+    fn attempts_wait_for_the_cooldown() {
+        let mut stale = StalePrimaries::default();
+        let now = Instant::now();
+        assert!(stale.sighted("pg1", 1, COOLDOWN, now));
+        assert!(!stale.sighted("pg1", 1, COOLDOWN, now + COOLDOWN / 2));
+        assert!(stale.sighted("pg1", 1, COOLDOWN, now + COOLDOWN));
     }
 
     #[test]
