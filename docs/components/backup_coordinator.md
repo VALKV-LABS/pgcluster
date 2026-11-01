@@ -262,3 +262,17 @@ pgcluster/src/raft/
   commands.rs      — AddBackupManifest, RemoveBackupManifest
   state_machine.rs — apply_command() handles the two new commands
 ```
+
+---
+
+## Point-in-time restore
+
+WAL-G provides base backups, WAL archiving and restore, and the coordinator keeps the schedule, retention, Raft manifests and REST API. It must provide:
+
+- An engine interface, with nothing WAL-G-specific in the API or topology.
+- `wal-g backup-push` through `vk-agent`, on a standby when one is available: weekly full, daily delta.
+- `archive_command` running `wal-g wal-push` from whichever node is primary.
+- Restore to a point in time with `wal-g backup-fetch` and `wal-fetch`, and seeding a node from a backup.
+- libsodium encryption on the node before upload, with one key per database.
+- Page checksums during backup, and `wal-g wal-verify` for WAL integrity.
+- Retention that keeps every WAL segment a retained base backup needs.
