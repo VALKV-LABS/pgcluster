@@ -41,7 +41,7 @@ SQL-aware router with full SQL parsing and scatter-gather — see `coordinator.m
 
 ## Management Plane (proposed)
 
-Fleet management for many clusters, with `pgcluster-admin` and `pg-hostd`. Not built yet. See [management-plane.md](../management-plane.md).
+Fleet management for many clusters, with `pgcluster-admin` and `vk-agent host`. Not built yet. See [management-plane.md](../management-plane.md).
 
 ## Data Flow Summary
 
