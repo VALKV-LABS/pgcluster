@@ -4,6 +4,7 @@ pub mod config;
 pub mod failover;
 pub mod forward;
 pub mod maintenance;
+pub mod members;
 pub mod metrics;
 pub mod nodes;
 pub mod pg_hba;
@@ -77,6 +78,15 @@ pub fn router(state: ApiState) -> Router {
                     get(nodes::get_node).delete(nodes::remove_node),
                 )
                 .route("/nodes/add", post(nodes::add_node))
+                .route(
+                    "/members",
+                    get(members::list_members).post(members::add_member),
+                )
+                .route(
+                    "/members/:id",
+                    axum::routing::delete(members::remove_member),
+                )
+                .route("/members/:id/promote", post(members::promote_member))
                 .route("/failover", post(failover::trigger_failover))
                 .route("/failover/history", get(failover::failover_history))
                 .route("/switchover", post(switchover::trigger_switchover))

@@ -35,7 +35,7 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 
 ## Part 5: Node lifecycle and backups
 
-- [ ] **5.1 Add Raft membership changes.** Learners, voter promotion and member removal, through the REST API. *Done when:* a member can be replaced with no loss of quorum.
+- [x] **5.1 Add Raft membership changes.** Learners, voter promotion and member removal, through the REST API. *Done when:* a member can be replaced with no loss of quorum.
 - [ ] **5.2 Move node seeding into `vk-agent`.** It lives in `docker/init-replica.sh` today. *Done when:* a new node seeds through an RPC, from the primary.
 - [ ] **5.3 Rejoin an old primary with `pg_rewind`.** Re-seed if rewind fails. *Done when:* a diverged old primary rejoins automatically, by test.
 - [ ] **5.4 Add rolling restart.** Standbys, then switchover, then the old primary. *Done when:* it completes under client load with no failed commits beyond the switchover.

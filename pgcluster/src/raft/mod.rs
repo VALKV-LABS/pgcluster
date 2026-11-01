@@ -11,9 +11,11 @@
 //! | `storage`        | Sled-backed Raft log storage + combined `PgClusterStorage` |
 //! | `network`        | gRPC transport between Raft peers                     |
 //! | `lease`          | Quorum lease that lets a proxy stop when isolated     |
+//! | `membership`     | Add, promote and remove Raft members                  |
 
 pub mod commands;
 pub mod lease;
+pub mod membership;
 pub mod network;
 pub mod state_machine;
 pub mod storage;

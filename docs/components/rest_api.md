@@ -32,6 +32,10 @@ The CLI sends the key in the `PGCLUSTER_API_KEY` environment variable.
 | `GET` | `/api/topology` | `200` | Full topology snapshot |
 | `GET` | `/api/replication` | `200` | Replication mode, fallback state and standbys that need seeding |
 | `POST` | `/api/replication/mode` | `204` | Change the mode online: `{"mode": "async"}`, `"sync"` or `"sync_strict"` |
+| `GET` | `/api/members` | `200` | List Raft voters and learners |
+| `POST` | `/api/members` | `201` | Add a learner, `{"id": 4, "addr": "host:7000"}`, and wait for it to catch up |
+| `POST` | `/api/members/:id/promote` | `204` | Promote a learner to voter |
+| `DELETE` | `/api/members/:id` | `204` | Remove a voter or learner |
 | `GET` | `/api/nodes` | `200` | List nodes |
 | `GET` | `/api/nodes/:node_id` | `200` | One node |
 | `POST` | `/api/nodes/add` | `201` | Register a Postgres node |
@@ -199,3 +203,7 @@ pgcluster/src/api/
   backup.rs       /api/backups
   metrics.rs      /metrics
 ```
+
+Member changes go to the Raft leader. Any other instance answers `503` with the leader's address.
+
+To replace a member, start the new instance with `bootstrap = false`, add it, promote it, then remove the old one. That order keeps the cluster at full strength throughout.
