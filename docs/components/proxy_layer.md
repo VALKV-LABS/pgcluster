@@ -44,6 +44,8 @@ Once a connection is assigned to a backend, it stays there until:
 
 ### Lag-Aware Read Routing
 
+This is the design for read routing, and it is off for now: the proxy routes every statement to the primary, because a session is only authenticated there.
+
 Replicas are ranked by replication lag (bytes behind primary). Replicas exceeding `max_replica_lag_bytes` are excluded from the read pool:
 
 ```rust

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use dashmap::DashMap;
+use tokio_rustls::TlsConnector;
 
 use super::backend::BackendConnection;
 use crate::config::PoolConfig;
@@ -79,14 +80,22 @@ pub struct ConnectionPool {
     // DashMap key is the string form of PoolKey for simpler hashing.
     pools: DashMap<String, Arc<PoolBucket>>,
     config: PoolConfig,
+    /// Encrypts and verifies backend connections. `None` → plain TCP.
+    backend_tls: Option<TlsConnector>,
 }
 
 impl ConnectionPool {
-    pub fn new(config: PoolConfig) -> Self {
+    pub fn new(config: PoolConfig, backend_tls: Option<TlsConnector>) -> Self {
         Self {
             pools: DashMap::new(),
             config,
+            backend_tls,
         }
+    }
+
+    /// Open a new connection to a backend, outside the pool's accounting.
+    pub async fn connect(&self, node_id: &str, addr: &str) -> Result<BackendConnection> {
+        BackendConnection::connect(node_id, addr, self.backend_tls.as_ref()).await
     }
 
     /// Borrow an idle connection for `(database, user, backend_addr)`.
@@ -133,7 +142,7 @@ impl ConnectionPool {
             if prev_total < bucket.max {
                 // Reserve a slot before the async connect
                 bucket.increment();
-                match BackendConnection::connect(node_id, backend_addr).await {
+                match self.connect(node_id, backend_addr).await {
                     Ok(conn) => {
                         conn.mark_in_use();
                         return Ok(Arc::new(conn));

@@ -8,6 +8,7 @@ pub fn validate(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     validate_raft(cfg)?;
     validate_nodes(cfg)?;
     validate_addresses(cfg)?;
+    validate_tls(cfg)?;
     validate_api(cfg)?;
     validate_backup(cfg)?;
     Ok(())
@@ -105,6 +106,25 @@ fn validate_addresses(cfg: &PgClusterConfig) -> anyhow::Result<()> {
         parse_host_port(&node.agent_addr).map_err(|e| {
             anyhow::anyhow!("node {:?} agent_addr {:?}: {}", node.id, node.agent_addr, e)
         })?;
+    }
+    Ok(())
+}
+
+fn validate_tls(cfg: &PgClusterConfig) -> anyhow::Result<()> {
+    let tls = &cfg.tls;
+    let files = [&tls.ca_cert, &tls.cert, &tls.key];
+    if tls.insecure_plaintext {
+        if files.iter().any(|f| f.is_some()) {
+            anyhow::bail!("[tls] set either certificate files or insecure_plaintext, not both");
+        }
+        if cfg.proxy.backend_tls {
+            anyhow::bail!("[proxy] backend_tls needs [tls] certificate files");
+        }
+    } else if files.iter().any(|f| f.is_none()) {
+        anyhow::bail!(
+            "[tls] ca_cert, cert and key are all required. \
+             For local development only, set insecure_plaintext = true"
+        );
     }
     Ok(())
 }
@@ -218,9 +238,15 @@ mod tests {
                 health_listen_addr: "0.0.0.0:8008".into(),
                 pool: Default::default(),
                 read_routing: Default::default(),
+                backend_tls: false,
             },
             failover: FailoverConfig::default(),
-            tls: TlsConfig::default(),
+            tls: TlsConfig {
+                ca_cert: Some("/certs/ca.crt".into()),
+                cert: Some("/certs/node.crt".into()),
+                key: Some("/certs/node.key".into()),
+                insecure_plaintext: false,
+            },
             metrics: MetricsConfig::default(),
             api: ApiConfig {
                 api_keys: vec!["test-key".into()],
@@ -294,6 +320,37 @@ mod tests {
     fn node_addr_invalid_port_fails() {
         let mut cfg = minimal();
         cfg.nodes.node[0].postgres_addr = "postgres:notaport".into();
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn missing_certificates_fail() {
+        for clear in [
+            |t: &mut TlsConfig| t.ca_cert = None,
+            |t: &mut TlsConfig| t.cert = None,
+            |t: &mut TlsConfig| t.key = None,
+        ] {
+            let mut cfg = minimal();
+            clear(&mut cfg.tls);
+            let err = validate(&cfg).unwrap_err();
+            assert!(err.to_string().contains("[tls]"), "{err}");
+        }
+    }
+
+    #[test]
+    fn development_flag_allows_missing_certificates() {
+        let mut cfg = minimal();
+        cfg.tls = TlsConfig {
+            insecure_plaintext: true,
+            ..Default::default()
+        };
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn development_flag_with_certificates_fails() {
+        let mut cfg = minimal();
+        cfg.tls.insecure_plaintext = true;
         assert!(validate(&cfg).is_err());
     }
 

@@ -10,11 +10,11 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::{
-    backend::BackendConnection,
+    backend::{BackendConnection, BackendStream},
     pool::ConnectionPool,
     protocol::{
         self, read_frontend_message, read_startup_message, write_error_response, FrontendMessage,
@@ -119,21 +119,19 @@ impl ProxyConnection {
         // We bypass pool.acquire() here because pooled connections are already
         // authenticated; sending a startup message to them would cause Postgres
         // to log "invalid frontend message type 0" and close the connection.
-        let auth_conn = Arc::new(
-            match BackendConnection::connect(&primary_node_id, &primary_addr).await {
-                Ok(c) => c,
-                Err(e) => {
-                    write_error_response(
-                        &mut client,
-                        "FATAL",
-                        "08006",
-                        &format!("could not connect to primary: {e}"),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            },
-        );
+        let auth_conn = Arc::new(match pool.connect(&primary_node_id, &primary_addr).await {
+            Ok(c) => c,
+            Err(e) => {
+                write_error_response(
+                    &mut client,
+                    "FATAL",
+                    "08006",
+                    &format!("could not connect to primary: {e}"),
+                )
+                .await?;
+                return Ok(());
+            }
+        });
 
         // Forward startup and pipe the auth exchange.
         {
@@ -142,7 +140,7 @@ impl ProxyConnection {
                 .write_all(&startup_bytes)
                 .await
                 .context("forward startup")?;
-            auth_passthrough(&mut client, &mut bstream).await?;
+            auth_passthrough(&mut client, &mut *bstream).await?;
         }
 
         // ── 4. Message routing loop ───────────────────────────────────────
@@ -336,7 +334,10 @@ impl ProxyConnection {
 fn resolve_backend(router: &Router, target: &RouteTarget) -> Option<(String, String)> {
     match target {
         RouteTarget::Primary => router.primary_node_id().zip(router.primary_addr()),
-        RouteTarget::ReplicaOrPrimary => router.read_backend(),
+        // A session is only authenticated on the primary. The proxy holds no
+        // credentials of its own, so it cannot log in to a replica for the
+        // client, and a connection that skips startup is dropped by Postgres.
+        RouteTarget::ReplicaOrPrimary => router.primary_node_id().zip(router.primary_addr()),
     }
 }
 
@@ -392,7 +393,7 @@ async fn forward_and_pipe(
 /// is still detected rather than causing an infinite read loop.
 async fn pipe_until_ready_for_query(
     client: &mut MaybeTlsStream,
-    backend: &mut TcpStream,
+    backend: &mut BackendStream,
 ) -> Result<u8> {
     let mut acc: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 65536];
@@ -446,80 +447,78 @@ async fn pipe_until_ready_for_query(
     }
 }
 
-/// Pipe the auth exchange between `client` and `backend`.
+/// Pipe the auth exchange between `client` and `backend` until the backend
+/// sends `ReadyForQuery`.
 ///
-/// Reads from `backend`, writes to `client`, then reads any response from
-/// `client` and writes it back to `backend` — until the backend sends a
-/// `ReadyForQuery`.  Uses an accumulating buffer so `ReadyForQuery` is
-/// detected even when it spans two TCP reads.
-async fn auth_passthrough(client: &mut MaybeTlsStream, backend: &mut TcpStream) -> Result<()> {
+/// Waits on both directions at once, because either side may be the one
+/// holding up the exchange. SCRAM clients can take many milliseconds to answer
+/// a challenge, and the backend sends nothing until they do.
+async fn auth_passthrough<C, B>(client: &mut C, backend: &mut B) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
     let mut acc: Vec<u8> = Vec::new();
-    let mut buf = vec![0u8; 8192];
+    let mut backend_buf = vec![0u8; 8192];
+    let mut client_buf = vec![0u8; 8192];
 
     loop {
-        // Read from backend.
-        let n = backend.read(&mut buf).await.context("read backend auth")?;
-        if n == 0 {
-            bail!("backend closed during auth");
-        }
+        tokio::select! {
+            read = backend.read(&mut backend_buf) => {
+                let n = read.context("read backend auth")?;
+                if n == 0 {
+                    bail!("backend closed during auth");
+                }
 
-        client
-            .write_all(&buf[..n])
-            .await
-            .context("forward auth to client")?;
-        client.flush().await.context("flush auth to client")?;
+                client
+                    .write_all(&backend_buf[..n])
+                    .await
+                    .context("forward auth to client")?;
+                client.flush().await.context("flush auth to client")?;
 
-        acc.extend_from_slice(&buf[..n]);
+                acc.extend_from_slice(&backend_buf[..n]);
 
-        // Scan for ReadyForQuery across the accumulated buffer.
-        let mut pos = 0usize;
-        let mut last_complete = 0usize;
-        let mut rfq_found = false;
+                // Scan for ReadyForQuery across the accumulated buffer.
+                let mut pos = 0usize;
+                let mut last_complete = 0usize;
 
-        while pos + 5 <= acc.len() {
-            let msg_type = acc[pos];
-            let length =
-                u32::from_be_bytes([acc[pos + 1], acc[pos + 2], acc[pos + 3], acc[pos + 4]])
-                    as usize;
+                while pos + 5 <= acc.len() {
+                    let msg_type = acc[pos];
+                    let length = u32::from_be_bytes([
+                        acc[pos + 1],
+                        acc[pos + 2],
+                        acc[pos + 3],
+                        acc[pos + 4],
+                    ]) as usize;
 
-            if msg_type == b'Z' && length == 5 && pos + 6 <= acc.len() {
-                rfq_found = true;
-                break;
+                    if msg_type == b'Z' && length == 5 && pos + 6 <= acc.len() {
+                        return Ok(());
+                    }
+
+                    let next = pos + 1 + length;
+                    if next <= pos || next > acc.len() {
+                        break;
+                    }
+                    last_complete = next;
+                    pos = next;
+                }
+
+                if last_complete > 0 {
+                    acc.drain(0..last_complete);
+                }
             }
+            read = client.read(&mut client_buf) => {
+                let n = read.context("read client auth")?;
+                if n == 0 {
+                    bail!("client closed during auth");
+                }
 
-            let next = pos + 1 + length;
-            if next <= pos || next > acc.len() {
-                break;
-            }
-            last_complete = next;
-            pos = next;
-        }
-
-        if rfq_found {
-            return Ok(());
-        }
-
-        if last_complete > 0 {
-            acc.drain(0..last_complete);
-        }
-
-        // Check if the client needs to respond (e.g., MD5 password challenge).
-        let mut client_buf = vec![0u8; 8192];
-        let read_result = tokio::time::timeout(
-            std::time::Duration::from_millis(10),
-            client.read(&mut client_buf),
-        )
-        .await;
-
-        match read_result {
-            Ok(Ok(m)) if m > 0 => {
                 backend
-                    .write_all(&client_buf[..m])
+                    .write_all(&client_buf[..n])
                     .await
                     .context("forward client auth")?;
                 backend.flush().await.context("flush client auth")?;
             }
-            _ => {} // Timeout or 0 bytes — nothing to forward.
         }
     }
 }
@@ -654,4 +653,65 @@ fn build_msg(type_byte: u8, body: &[u8]) -> Vec<u8> {
     msg.extend_from_slice(&length);
     msg.extend_from_slice(body);
     msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::duplex;
+
+    const AUTH_CHALLENGE: &[u8] = b"R\x00\x00\x00\x04";
+    const AUTH_DONE: &[u8] = b"Z\x00\x00\x00\x05I";
+
+    /// The backend sends nothing after its challenge until the client answers,
+    /// and a SCRAM client can take far longer than one poll to do that.
+    #[tokio::test]
+    async fn auth_waits_for_a_slow_client() {
+        let (mut client, mut proxy_client) = duplex(64);
+        let (mut proxy_backend, mut backend) = duplex(64);
+
+        let backend_task = tokio::spawn(async move {
+            backend.write_all(AUTH_CHALLENGE).await.unwrap();
+            let mut answer = [0u8; 6];
+            backend.read_exact(&mut answer).await.unwrap();
+            assert_eq!(&answer, b"answer");
+            backend.write_all(AUTH_DONE).await.unwrap();
+            backend
+        });
+
+        let client_task = tokio::spawn(async move {
+            let mut challenge = [0u8; 5];
+            client.read_exact(&mut challenge).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            client.write_all(b"answer").await.unwrap();
+            let mut done = [0u8; 6];
+            client.read_exact(&mut done).await.unwrap();
+            assert_eq!(&done, AUTH_DONE);
+            client
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            auth_passthrough(&mut proxy_client, &mut proxy_backend),
+        )
+        .await
+        .expect("auth must not deadlock")
+        .unwrap();
+
+        backend_task.await.unwrap();
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_that_leaves_during_auth_ends_the_exchange() {
+        let (client, mut proxy_client) = duplex(64);
+        let (mut proxy_backend, _backend) = duplex(64);
+        drop(client);
+
+        let err = auth_passthrough(&mut proxy_client, &mut proxy_backend)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("client closed"), "{err}");
+    }
 }

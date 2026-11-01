@@ -315,6 +315,48 @@ async fn e2e_cluster_forms_and_has_primary() {
     let node_count = status["node_count"].as_u64().unwrap_or(0);
     assert_eq!(node_count, 3, "expected 3 nodes in the cluster");
 
+    // The cluster formed, so Raft and vk-agent accepted mutual TLS. Writes need
+    // a key.
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{api}/api/switchover"))
+        .json(&serde_json::json!({ "target_node_id": "pg2" }))
+        .send()
+        .await
+        .expect("POST /api/switchover");
+    assert_eq!(response.status(), 401, "a write without a key must fail");
+
+    let dsn = "host=localhost port=5432 user=postgres password=test dbname=postgres";
+    let (pg, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect through the proxy");
+    tokio::spawn(connection);
+    pg.simple_query("SELECT 1").await.expect("query the proxy");
+
+    // Heartbeats keep the agents out of safe mode, so nothing self-fences. The
+    // stack's agents would otherwise stop Postgres 40 seconds after starting.
+    tokio::time::sleep(Duration::from_secs(45)).await;
+    let restarts = Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            COMPOSE_FILE,
+            "ps",
+            "--format",
+            "{{.Status}}",
+        ])
+        .current_dir(project_root())
+        .output()
+        .expect("docker compose ps");
+    let restarts = String::from_utf8_lossy(&restarts.stdout);
+    assert!(
+        !restarts.contains("Up 1") && !restarts.contains("Up 2 seconds"),
+        "containers restarted during the wait:\n{restarts}"
+    );
+    pg.simple_query("SELECT 1")
+        .await
+        .expect("the session must outlive the fence timeout");
+
     // Teardown.
     compose(&["down", "-v", "--remove-orphans"]);
 }

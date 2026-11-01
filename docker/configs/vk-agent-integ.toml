@@ -7,3 +7,6 @@ postgres_password         = "test"
 postgres_dbname           = "postgres"
 heartbeat_timeout_seconds = 10
 pg_ctl_path               = "pg_ctl"
+
+[tls]
+insecure_plaintext = true

@@ -8,6 +8,7 @@ pub use agent_proto::{HeartbeatResponse, StatusResponse};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
+use tonic::transport::ClientTlsConfig;
 
 // ── AgentClient ───────────────────────────────────────────────────────────────
 
@@ -30,9 +31,9 @@ impl AgentClient {
         Ok(Self::from_channel(addr, channel))
     }
 
-    /// Open a direct TLS connection, verifying the server cert against `ca_pem`.
-    pub async fn connect_tls(_node_id: &str, addr: &str, ca_pem: &[u8]) -> Result<Self> {
-        let channel = make_channel(addr, Some(ca_pem)).await?;
+    /// Open a direct TLS connection using `tls`.
+    pub async fn connect_tls(_node_id: &str, addr: &str, tls: ClientTlsConfig) -> Result<Self> {
+        let channel = make_channel(addr, Some(tls)).await?;
         Ok(Self::from_channel(addr, channel))
     }
 
@@ -128,29 +129,29 @@ impl AgentClient {
 /// Interior mutability via [`dashmap::DashMap`] makes the pool `Sync` so it can
 /// be shared across tasks behind an `Arc`.
 ///
-/// Optionally constructed with a PEM-encoded CA certificate to verify agent
-/// server certificates (TLS). When no CA is provided, connections are plaintext.
+/// Optionally constructed with a TLS config that verifies agent certificates
+/// and presents this node's client certificate. Without one, connections are
+/// plaintext.
 pub struct AgentClientPool {
     channels: DashMap<String, tonic::transport::Channel>,
-    /// CA certificate PEM used to verify agent TLS certs.
-    /// `None` → plaintext connections (default).
-    ca_pem: Option<Vec<u8>>,
+    /// `None` → plaintext connections.
+    tls: Option<ClientTlsConfig>,
 }
 
 impl AgentClientPool {
-    /// Create a pool that connects to agents over plaintext (default).
+    /// Create a pool that connects to agents over plaintext.
     pub fn new() -> Self {
         Self {
             channels: DashMap::new(),
-            ca_pem: None,
+            tls: None,
         }
     }
 
-    /// Create a pool that uses TLS, verifying agent certs against `ca_pem`.
-    pub fn new_with_ca(ca_pem: Vec<u8>) -> Self {
+    /// Create a pool that connects to agents with `tls`.
+    pub fn new_with_tls(tls: ClientTlsConfig) -> Self {
         Self {
             channels: DashMap::new(),
-            ca_pem: Some(ca_pem),
+            tls: Some(tls),
         }
     }
 
@@ -163,7 +164,7 @@ impl AgentClientPool {
         if let Some(ch) = self.channels.get(node_id) {
             return Ok(AgentClient::from_channel(addr, ch.value().clone()));
         }
-        let channel = make_channel(addr, self.ca_pem.as_deref()).await?;
+        let channel = make_channel(addr, self.tls.clone()).await?;
         self.channels.insert(node_id.to_string(), channel.clone());
         Ok(AgentClient::from_channel(addr, channel))
     }
@@ -184,20 +185,16 @@ impl Default for AgentClientPool {
 
 // ── Channel builder ───────────────────────────────────────────────────────────
 
-async fn make_channel(addr: &str, ca_pem: Option<&[u8]>) -> Result<tonic::transport::Channel> {
-    let (scheme, tls_cfg) = if let Some(pem) = ca_pem {
-        let ca = tonic::transport::Certificate::from_pem(pem);
-        let cfg = tonic::transport::ClientTlsConfig::new().ca_certificate(ca);
-        ("https", Some(cfg))
-    } else {
-        ("http", None)
-    };
-
+async fn make_channel(
+    addr: &str,
+    tls: Option<ClientTlsConfig>,
+) -> Result<tonic::transport::Channel> {
+    let scheme = if tls.is_some() { "https" } else { "http" };
     let url = format!("{scheme}://{addr}");
     let mut endpoint = tonic::transport::Endpoint::from_shared(url)
         .with_context(|| format!("invalid agent addr: {addr}"))?;
 
-    if let Some(cfg) = tls_cfg {
+    if let Some(cfg) = tls {
         endpoint = endpoint
             .tls_config(cfg)
             .with_context(|| format!("set TLS config for {addr}"))?;

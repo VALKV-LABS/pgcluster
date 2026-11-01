@@ -47,7 +47,11 @@ impl ProxyServer {
         tls: Option<Arc<TlsManager>>,
         metrics: Arc<Metrics>,
     ) -> Self {
-        let pool = Arc::new(ConnectionPool::new(config.pool.clone()));
+        let backend_tls = tls
+            .as_ref()
+            .filter(|_| config.backend_tls)
+            .map(|t| t.client_tls_connector());
+        let pool = Arc::new(ConnectionPool::new(config.pool.clone(), backend_tls));
 
         Self {
             config,

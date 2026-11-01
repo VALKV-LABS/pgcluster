@@ -62,7 +62,9 @@ health_check_failures_before_failover = 3
 agent_heartbeat_timeout_seconds       = 10
 
 [tls]
-auto_generate = false
+ca_cert = "/certs/ca.crt"
+cert    = "/certs/pgcluster-1.crt"
+key     = "/certs/pgcluster-1.key"
 
 [metrics]
 listen_addr = "0.0.0.0:9190"

@@ -20,6 +20,13 @@ impl LocalPostgres {
         Ok(Self { pool })
     }
 
+    /// Build a pool that connects on first use.
+    pub fn connect_lazy(url: &str) -> Result<Self> {
+        let pool =
+            PgPool::connect_lazy(url).with_context(|| format!("invalid postgres url {url}"))?;
+        Ok(Self { pool })
+    }
+
     /// Return a reference to the underlying connection pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool

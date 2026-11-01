@@ -8,3 +8,8 @@ postgres_dbname           = "postgres"
 heartbeat_timeout_seconds = 10
 fence_timeout_seconds     = 30
 pg_ctl_path               = "/usr/lib/postgresql/15/bin/pg_ctl"
+
+[tls]
+ca_cert = "/certs/ca.crt"
+cert    = "/certs/vk-agent-3.crt"
+key     = "/certs/vk-agent-3.key"

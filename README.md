@@ -19,8 +19,8 @@ Clients (Postgres wire protocol)
 │          pgcluster  (3 instances, any node)          │
 │  ┌──────────────┐   ┌────────────────────────────┐  │
 │  │  Raft Group  │   │  Proxy + Connection Pool   │  │
-│  │  (embedded)  │   │  writes → primary          │  │
-│  │              │   │  reads  → replica pool     │  │
+│  │  (embedded)  │   │  routes to the primary     │  │
+│  │              │   │                            │  │
 │  └──────────────┘   └────────────────────────────┘  │
 │  ┌───────────────────────────────────────────────┐   │
 │  │  Node Monitor · Failover Engine · Switchover  │   │
@@ -43,9 +43,9 @@ Clients (Postgres wire protocol)
 - **No external DCS** — Raft consensus is embedded; no etcd, ZooKeeper, or Consul
 - **Automatic failover** — detects primary failure in < 5 s, promotes best replica, re-points all standbys
 - **Planned switchover** — zero-data-loss handoff with write pause and lag-wait
-- **Built-in connection proxy** — Postgres-protocol proxy with per-user connection pooling and lag-aware read routing
+- **Built-in connection proxy** — Postgres-protocol proxy with per-user connection pooling
 - **Thin agent** — `vk-agent` sidecar only executes commands; all decisions live in the Raft leader
-- **TLS** — encrypts Raft, vk-agent and client connections; auto-generated dev certs
+- **Secure by default** — the server refuses to start without API keys and certificates; Raft and `vk-agent` gRPC require client certificates from the cluster CA
 - **Prometheus metrics** — failover count, replication lag, leader status, connection pool saturation
 - **REST API** — cluster status, node management, manual failover/switchover
 - **Works with stock Postgres 12+** — no patches, no extensions required
@@ -67,7 +67,7 @@ make status       # show container health and ports
 The stack exposes:
 | Port | Service |
 |------|---------|
-| `5432` | Postgres proxy (writes → primary, reads → replicas) |
+| `5432` | Postgres proxy (routes to the primary) |
 | `8009` | REST API |
 | `9190` | Prometheus metrics |
 | `8008` | HTTP health check (for load balancers) |
@@ -93,7 +93,8 @@ SELECT * FROM users;
 psql postgres://postgres:test@localhost:5491/myapp -c "SELECT * FROM users;"
 psql postgres://postgres:test@localhost:5492/myapp -c "SELECT * FROM users;"
 
-# 3. Check cluster status via the REST API
+# 3. Check cluster status via the REST API. Reads are public in this stack.
+#    Writes need the key: -H "Authorization: Bearer dev-api-key"
 curl http://localhost:8009/api/status | jq .
 curl http://localhost:8009/api/nodes  | jq .
 ```
@@ -257,7 +258,16 @@ health_listen_addr = "0.0.0.0:8008"
 [api]
 listen_addr = "0.0.0.0:8009"
 api_keys    = ["change-me"]
+
+[tls]
+ca_cert = "/etc/pgcluster/ca.crt"
+cert    = "/etc/pgcluster/node.crt"
+key     = "/etc/pgcluster/node.key"
 ```
+
+The server refuses to start without `api_keys` and all three certificate paths. `pgcluster certs` generates a cluster CA and certificates, as described in [`docs/components/tls_manager.md`](docs/components/tls_manager.md). The CLI reads its key from `PGCLUSTER_API_KEY`. `vk-agent` needs its own `[tls]` section.
+
+For local development only, `insecure_no_auth = true` under `[api]` and `insecure_plaintext = true` under `[tls]` turn these checks off.
 
 Full config reference: [`docs/components/config_manager.md`](docs/components/config_manager.md) · Example: [`examples/cluster.toml`](examples/cluster.toml)
 

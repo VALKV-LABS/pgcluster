@@ -14,9 +14,9 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 ## Part 2: Secure defaults
 
 - [x] **2.1 Require credentials on the REST API.** *Done when:* the server refuses to start without API keys, unless an explicit development flag is set.
-- [ ] **2.2 Require client certificates on every gRPC endpoint.** Covers `vk-agent` and Raft, signed by the cluster CA. *Done when:* a connection without a valid client certificate is rejected, by automated test.
+- [x] **2.2 Require client certificates on every gRPC endpoint.** Covers `vk-agent` and Raft, signed by the cluster CA. *Done when:* a connection without a valid client certificate is rejected, by automated test.
 - [ ] **2.3 Use TLS between the proxy and Postgres.** *Done when:* the connection is encrypted and certificates are verified.
-- [ ] **2.4 Update docs.** *Done when:* the README and `docs/components/tls_manager.md` describe what 2.1 to 2.3 deliver.
+- [x] **2.4 Update docs.** *Done when:* the README and `docs/components/tls_manager.md` describe what 2.1 to 2.3 deliver.
 
 ## Part 3: Safe failover
 

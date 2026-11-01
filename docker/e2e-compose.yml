@@ -21,6 +21,7 @@
 #   psql postgres://postgres:test@localhost:5432/postgres -c "SELECT version();"
 #   curl http://localhost:8009/api/status | jq .
 #   curl http://localhost:9190/metrics | grep pgcluster_raft_is_leader
+#   curl -X POST -H "Authorization: Bearer dev-api-key" http://localhost:8009/api/... (writes need the key)
 #   psql postgres://postgres:test@localhost:5490/postgres
 #   psql postgres://postgres:test@localhost:5491/postgres
 
@@ -36,6 +37,25 @@
 # psql postgres://postgres:test@localhost:5492/myapp -c "SELECT * FROM users;"
 
 services:
+
+  # ── Certificates ────────────────────────────────────────────────────────────
+
+  # Issues every certificate in the stack from one CA. Postgres and vk-agent run
+  # as uid 999 and must be able to read their own keys.
+  certs:
+    build:
+      context: ..
+      dockerfile: docker/pgcluster.Dockerfile
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        pgcluster certs --out /certs
+        pg-primary pg-replica-1 pg-replica-2
+        vk-agent-1 vk-agent-2 vk-agent-3
+        pgcluster-1 pgcluster-2 pgcluster-3 &&
+        chown 999:999 /certs/pg-*.key /certs/vk-agent-*.key
+    volumes:
+      - certs:/certs
 
   # ── Postgres nodes ──────────────────────────────────────────────────────────
 
@@ -55,11 +75,18 @@ services:
         -c hot_standby=on
         -c listen_addresses='*'
         -c hba_file=/etc/postgresql/pg_hba.conf
+        -c ssl=on
+        -c ssl_cert_file=/certs/pg-primary.crt
+        -c ssl_key_file=/certs/pg-primary.key
     ports:
       - "5490:5432"
     volumes:
       - pg-primary-data:/var/lib/postgresql/data
       - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      certs:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 2s
@@ -74,6 +101,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: test
       PGDATA: /var/lib/postgresql/data
+      PG_TLS_NAME: pg-replica-1
     depends_on:
       pg-primary:
         condition: service_healthy
@@ -83,6 +111,7 @@ services:
       - pg-replica-1-data:/var/lib/postgresql/data
       - ./init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh:ro
       - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - certs:/certs:ro
     entrypoint: ["/docker-entrypoint-initdb.d/init-replica.sh", "pg-primary"]
 
   pg-replica-2:
@@ -93,6 +122,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: test
       PGDATA: /var/lib/postgresql/data
+      PG_TLS_NAME: pg-replica-2
     depends_on:
       pg-primary:
         condition: service_healthy
@@ -102,6 +132,7 @@ services:
       - pg-replica-2-data:/var/lib/postgresql/data
       - ./init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh:ro
       - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - certs:/certs:ro
     entrypoint: ["/docker-entrypoint-initdb.d/init-replica.sh", "pg-primary"]
 
   # ── vk-agent sidecars ───────────────────────────────────────────────────────
@@ -123,6 +154,7 @@ services:
     volumes:
       - pg-primary-data:/var/lib/postgresql/data
       - ./configs/vk-agent-pg1.toml:/etc/vk-agent/config.toml:ro
+      - certs:/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "grpc_health_probe -addr=:7001 || exit 0"]
       interval: 3s
@@ -143,6 +175,7 @@ services:
     volumes:
       - pg-replica-1-data:/var/lib/postgresql/data
       - ./configs/vk-agent-pg2.toml:/etc/vk-agent/config.toml:ro
+      - certs:/certs:ro
 
   vk-agent-3:
     build:
@@ -158,6 +191,7 @@ services:
     volumes:
       - pg-replica-2-data:/var/lib/postgresql/data
       - ./configs/vk-agent-pg3.toml:/etc/vk-agent/config.toml:ro
+      - certs:/certs:ro
 
   # ── pgcluster nodes ─────────────────────────────────────────────────────────
 
@@ -176,6 +210,7 @@ services:
         condition: service_started
     volumes:
       - ./configs/pgcluster-1.toml:/etc/pgcluster/config.toml:ro
+      - certs:/certs:ro
       - pgcluster-1-data:/var/lib/pgcluster
     ports:
       - "5432:5432"    # proxy
@@ -200,6 +235,7 @@ services:
         condition: service_started
     volumes:
       - ./configs/pgcluster-2.toml:/etc/pgcluster/config.toml:ro
+      - certs:/certs:ro
       - pgcluster-2-data:/var/lib/pgcluster
     ports:
       - "15432:5432"
@@ -224,6 +260,7 @@ services:
         condition: service_started
     volumes:
       - ./configs/pgcluster-3.toml:/etc/pgcluster/config.toml:ro
+      - certs:/certs:ro
       - pgcluster-3-data:/var/lib/pgcluster
     ports:
       - "25432:5432"
@@ -238,6 +275,7 @@ services:
       retries: 20
 
 volumes:
+  certs:
   pg-primary-data:
   pg-replica-1-data:
   pg-replica-2-data:

@@ -7,9 +7,10 @@ pub mod agent {
 use std::path::Path;
 use std::sync::Arc;
 
+use tonic::transport::{Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
-use agent::agent_service_server::AgentService;
+use agent::agent_service_server::{AgentService, AgentServiceServer};
 use agent::{
     DemoteRequest, DemoteResponse, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
     PromoteResponse, ReloadRequest, ReloadResponse, StatusRequest, StatusResponse, StopRequest,
@@ -43,6 +44,24 @@ impl AgentServiceImpl {
             pg_ctl,
         }
     }
+}
+
+/// Serve the agent gRPC service until the server fails. `tls` of `None` means
+/// plaintext, for development.
+pub async fn serve(
+    svc: AgentServiceImpl,
+    addr: std::net::SocketAddr,
+    tls: Option<ServerTlsConfig>,
+) -> anyhow::Result<()> {
+    let mut builder = Server::builder();
+    if let Some(tls) = tls {
+        builder = builder.tls_config(tls)?;
+    }
+    builder
+        .add_service(AgentServiceServer::new(svc))
+        .serve(addr)
+        .await?;
+    Ok(())
 }
 
 #[tonic::async_trait]

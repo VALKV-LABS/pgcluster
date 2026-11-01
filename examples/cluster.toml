@@ -75,12 +75,10 @@ health_check_failures_before_failover = 3     # Consecutive failures before trig
 agent_heartbeat_timeout_seconds       = 10    # vk-agent enters safe mode after this
 
 [tls]
-# Set auto_generate = true for development (generates self-signed certs).
-auto_generate = false
-# For production, provide cert + key paths:
-# ca_cert = "/etc/pgcluster/ca.crt"
-# cert    = "/etc/pgcluster/node.crt"
-# key     = "/etc/pgcluster/node.key"
+# Required. `pgcluster certs` generates a cluster CA and certificates.
+ca_cert = "/etc/pgcluster/ca.crt"
+cert    = "/etc/pgcluster/node.crt"
+key     = "/etc/pgcluster/node.key"
 
 [metrics]
 listen_addr = "0.0.0.0:9090"   # Prometheus /metrics endpoint

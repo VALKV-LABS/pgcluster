@@ -43,6 +43,9 @@ health_listen_addr = "0.0.0.0:8008"
 [metrics]
 listen_addr = "0.0.0.0:9090"
 
+[tls]
+insecure_plaintext = true
+
 [api]
 listen_addr = "0.0.0.0:8080"
 api_keys    = ["test-key"]
@@ -86,6 +89,9 @@ health_listen_addr = "0.0.0.0:8008"
 [metrics]
 listen_addr = "0.0.0.0:9090"
 
+[tls]
+insecure_plaintext = true
+
 [api]
 listen_addr = "0.0.0.0:8080"
 api_keys    = ["test-key"]
@@ -126,6 +132,9 @@ health_listen_addr = "0.0.0.0:8008"
 [metrics]
 listen_addr = "0.0.0.0:9090"
 
+[tls]
+insecure_plaintext = true
+
 [api]
 listen_addr = "0.0.0.0:8080"
 api_keys    = ["test-key"]
@@ -165,6 +174,9 @@ health_listen_addr = "0.0.0.0:8008"
 
 [metrics]
 listen_addr = "0.0.0.0:9090"
+
+[tls]
+insecure_plaintext = true
 
 [api]
 listen_addr = "0.0.0.0:8080"
@@ -218,6 +230,9 @@ health_listen_addr = "0.0.0.0:8008"
 
 [metrics]
 listen_addr = "0.0.0.0:9090"
+
+[tls]
+insecure_plaintext = true
 
 [api]
 listen_addr = "0.0.0.0:8080"
@@ -419,6 +434,9 @@ replication_user = "replicator"
 [proxy]
 listen_addr = "127.0.0.1:0"
 
+[tls]
+insecure_plaintext = true
+
 [api]
 listen_addr = "127.0.0.1:0"
 "#,
@@ -435,4 +453,46 @@ listen_addr = "127.0.0.1:0"
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("api_keys"), "stderr: {stderr}");
     assert!(!data_dir.exists(), "must refuse before touching data_dir");
+}
+
+#[test]
+fn server_refuses_to_start_without_certificates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let toml = format!(
+        r#"
+[cluster]
+name     = "test-cluster"
+data_dir = "{}"
+
+[raft]
+node_id   = 1
+bootstrap = true
+
+[[raft.peers]]
+id   = 1
+addr = "127.0.0.1:7000"
+
+[replication]
+replication_user = "replicator"
+
+[proxy]
+listen_addr = "127.0.0.1:0"
+
+[api]
+listen_addr = "127.0.0.1:0"
+api_keys    = ["test-key"]
+"#,
+        dir.path().join("data").display()
+    );
+    std::fs::write(&path, toml).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pgcluster"))
+        .args(["server", "--config", path.to_str().unwrap()])
+        .output()
+        .expect("failed to run pgcluster");
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("[tls]"), "stderr: {stderr}");
 }

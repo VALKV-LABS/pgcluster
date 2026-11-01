@@ -1,10 +1,9 @@
-//! TLS manager: loads or auto-generates certificates and provides
-//! `TlsAcceptor` / `TlsConnector` handles for the rest of the codebase.
+//! TLS manager: loads certificates and provides `TlsAcceptor` / `TlsConnector`
+//! handles for the rest of the codebase.
 
-pub mod auto_cert;
+pub mod certs;
 
 use std::io::BufReader;
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -31,38 +30,20 @@ pub struct TlsManager {
 }
 
 impl TlsManager {
-    /// Build a `TlsManager` from the supplied config.
-    ///
-    /// Certificate sources, in priority order:
-    /// 1. `config.cert` + `config.key` — load PEM files from these paths.
-    /// 2. `config.auto_generate == true` — call `auto_cert::generate_dev_certs`
-    ///    and write the files to `data_dir/certs/`.
-    pub fn new(config: &TlsConfig, node_id: u64, data_dir: &Path) -> Result<Self> {
-        let (ca_cert_pem, cert_pem, key_pem): (Vec<u8>, Vec<u8>, Vec<u8>) =
-            if let (Some(cert_path), Some(key_path)) = (&config.cert, &config.key) {
-                // ── Load from files ──────────────────────────────────────────
-                let cert_bytes = std::fs::read(cert_path)
-                    .with_context(|| format!("read cert file {cert_path}"))?;
-                let key_bytes =
-                    std::fs::read(key_path).with_context(|| format!("read key file {key_path}"))?;
+    /// Build a `TlsManager` from the PEM files named in the config.
+    pub fn new(config: &TlsConfig) -> Result<Self> {
+        let (Some(ca_path), Some(cert_path), Some(key_path)) =
+            (&config.ca_cert, &config.cert, &config.key)
+        else {
+            bail!("[tls] ca_cert, cert and key are all required");
+        };
 
-                let ca_bytes = if let Some(ca_path) = &config.ca_cert {
-                    std::fs::read(ca_path)
-                        .with_context(|| format!("read CA cert file {ca_path}"))?
-                } else {
-                    // If no explicit CA provided, use the leaf cert itself as the
-                    // trust anchor (self-signed case).
-                    cert_bytes.clone()
-                };
-
-                (ca_bytes, cert_bytes, key_bytes)
-            } else if config.auto_generate {
-                // ── Auto-generate ────────────────────────────────────────────
-                auto_cert::generate_dev_certs(node_id, data_dir)
-                    .context("auto-generate dev TLS certs")?
-            } else {
-                bail!("TLS enabled but neither cert/key paths nor auto_generate=true are set");
-            };
+        let ca_cert_pem =
+            std::fs::read(ca_path).with_context(|| format!("read CA cert file {ca_path}"))?;
+        let cert_pem =
+            std::fs::read(cert_path).with_context(|| format!("read cert file {cert_path}"))?;
+        let key_pem =
+            std::fs::read(key_path).with_context(|| format!("read key file {key_path}"))?;
 
         let server_tls =
             build_server_config(&cert_pem, &key_pem).context("build server TLS config")?;
@@ -104,10 +85,24 @@ impl TlsManager {
         Arc::clone(&self.client_tls)
     }
 
-    /// Build a tonic `ServerTlsConfig` using the stored cert+key PEM.
+    /// Build a tonic `ServerTlsConfig` that requires a client certificate from
+    /// the cluster CA.
     pub fn tonic_server_tls_config(&self) -> tonic::transport::ServerTlsConfig {
         let identity = tonic::transport::Identity::from_pem(&self.cert_pem, &self.key_pem);
-        tonic::transport::ServerTlsConfig::new().identity(identity)
+        let ca = tonic::transport::Certificate::from_pem(&self.ca_pem);
+        tonic::transport::ServerTlsConfig::new()
+            .identity(identity)
+            .client_ca_root(ca)
+    }
+
+    /// Build a tonic `ClientTlsConfig` that verifies the server against the
+    /// cluster CA and presents this node's certificate.
+    pub fn tonic_client_tls_config(&self) -> tonic::transport::ClientTlsConfig {
+        let identity = tonic::transport::Identity::from_pem(&self.cert_pem, &self.key_pem);
+        let ca = tonic::transport::Certificate::from_pem(&self.ca_pem);
+        tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(ca)
+            .identity(identity)
     }
 
     /// Dev-mode: creates configs that skip certificate verification entirely.

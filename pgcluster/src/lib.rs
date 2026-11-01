@@ -36,19 +36,16 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         warn!("REST API is running with no credentials (insecure_no_auth = true)");
     }
 
-    // Build TLS manager before Raft so we can share the CA cert for peer connections.
-    let tls_mgr: Option<Arc<tls::TlsManager>> = if cfg.tls.auto_generate || cfg.tls.cert.is_some() {
-        Some(Arc::new(tls::TlsManager::new(
-            &cfg.tls,
-            cfg.raft.node_id,
-            std::path::Path::new(&cfg.cluster.data_dir),
-        )?))
-    } else {
+    // Build TLS manager before Raft so peer connections can use it.
+    let tls_mgr: Option<Arc<tls::TlsManager>> = if cfg.tls.insecure_plaintext {
+        warn!("gRPC and Postgres connections are in plaintext (insecure_plaintext = true)");
         None
+    } else {
+        Some(Arc::new(tls::TlsManager::new(&cfg.tls)?))
     };
 
-    let raft_ca_pem = tls_mgr.as_ref().map(|t| t.ca_cert_pem().to_vec());
-    let raft_node = Arc::new(raft::RaftNode::start(&cfg, raft_ca_pem).await?);
+    let raft_tls = tls_mgr.as_ref().map(|t| t.tonic_client_tls_config());
+    let raft_node = Arc::new(raft::RaftNode::start(&cfg, raft_tls).await?);
     let topology_rx = raft_node.topology_rx.clone();
 
     // On bootstrap, seed the Raft topology from the TOML [[nodes.node]] list.
@@ -94,9 +91,8 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     }
     let metrics = metrics_registry::Metrics::new()?;
 
-    // Use TLS-verified connections to vk-agents when a CA cert is available.
     let pool = Arc::new(match tls_mgr.as_ref() {
-        Some(t) => agent_clients::AgentClientPool::new_with_ca(t.ca_cert_pem().to_vec()),
+        Some(t) => agent_clients::AgentClientPool::new_with_tls(t.tonic_client_tls_config()),
         None => agent_clients::AgentClientPool::new(),
     });
 
@@ -121,8 +117,6 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         op_in_progress.clone(),
     );
 
-    let raft_grpc = raft::RaftGrpcServer::new(raft_node.raft.clone());
-    let (raft_svc, topo_svc) = raft_grpc.into_services();
     let raft_peer_addr = cfg
         .raft
         .peers
@@ -143,6 +137,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     {
         let addr_str = raft_grpc_addr.clone();
         let raft_tls = tls_mgr.as_ref().map(|t| t.tonic_server_tls_config());
+        let raft = raft_node.raft.clone();
         tasks.push(tokio::spawn(async move {
             let addr: std::net::SocketAddr = match addr_str.parse() {
                 Ok(a) => a,
@@ -151,22 +146,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                     return;
                 }
             };
-            let mut builder = tonic::transport::Server::builder();
-            if let Some(tls_cfg) = raft_tls {
-                builder = match builder.tls_config(tls_cfg) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        error!(err = %e, "Raft gRPC TLS config failed");
-                        return;
-                    }
-                };
-            }
-            if let Err(e) = builder
-                .add_service(raft_svc)
-                .add_service(topo_svc)
-                .serve(addr)
-                .await
-            {
+            if let Err(e) = raft::serve_grpc(raft, addr, raft_tls).await {
                 error!(err = %e, "Raft gRPC server failed");
             }
         }));

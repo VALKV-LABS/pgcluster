@@ -132,6 +132,11 @@ pub struct ProxyConfig {
     pub pool: PoolConfig,
     #[serde(default)]
     pub read_routing: ReadRoutingConfig,
+    /// Use TLS to Postgres, verified against the cluster CA. SCRAM auth
+    /// passthrough cannot work over it, because Postgres then expects channel
+    /// binding to a TLS session the client is not part of.
+    #[serde(default)]
+    pub backend_tls: bool,
 }
 
 fn default_proxy_listen() -> String {
@@ -244,29 +249,16 @@ fn default_repoint_timeout() -> u64 {
 
 // ── [tls] ─────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Certificates for gRPC, the proxy and Postgres, all from one cluster CA.
+/// `pgcluster certs` generates a set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
     pub ca_cert: Option<String>,
     pub cert: Option<String>,
     pub key: Option<String>,
-    /// If true and cert/key are None, generate self-signed dev certs at startup.
-    #[serde(default = "default_auto_cert")]
-    pub auto_generate: bool,
-}
-
-fn default_auto_cert() -> bool {
-    true
-}
-
-impl Default for TlsConfig {
-    fn default() -> Self {
-        Self {
-            ca_cert: None,
-            cert: None,
-            key: None,
-            auto_generate: default_auto_cert(),
-        }
-    }
+    /// Development only: run gRPC and Postgres connections in plaintext.
+    #[serde(default)]
+    pub insecure_plaintext: bool,
 }
 
 // ── [metrics] ─────────────────────────────────────────────────────────────────
@@ -474,6 +466,11 @@ health_check_interval_ms              = 500
 health_check_failures_before_failover = 3
 agent_heartbeat_timeout_seconds       = 10
 
+[tls]
+ca_cert = "/etc/pgcluster/ca.crt"
+cert    = "/etc/pgcluster/node.crt"
+key     = "/etc/pgcluster/node.key"
+
 [api]
 listen_addr = "0.0.0.0:8009"
 api_keys    = ["test-key"]
@@ -495,7 +492,7 @@ api_keys    = ["test-key"]
         assert_eq!(cfg.proxy.pool.max_connections_per_db_user, 25);
         assert!(cfg.proxy.read_routing.enabled);
         assert_eq!(cfg.metrics.listen_addr, "0.0.0.0:9190");
-        assert!(cfg.tls.auto_generate);
+        assert!(!cfg.tls.insecure_plaintext);
     }
 
     #[test]

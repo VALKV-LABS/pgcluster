@@ -40,7 +40,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub fence_timeout_seconds: Option<u64>,
 
-    /// Optional TLS configuration for the gRPC server.
+    /// TLS for the gRPC server. Required unless `insecure_plaintext` is set.
     #[serde(default)]
     pub tls: AgentTlsConfig,
 
@@ -51,17 +51,16 @@ pub struct AgentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentTlsConfig {
-    /// PEM-encoded CA certificate file path used to verify pgcluster client
-    /// certs (mTLS). Leave empty to skip client cert verification.
+    /// PEM-encoded cluster CA certificate. Clients must present a certificate
+    /// it signed.
     pub ca_cert: Option<String>,
     /// PEM-encoded server certificate file path.
     pub cert: Option<String>,
     /// PEM-encoded server private key file path.
     pub key: Option<String>,
-    /// If `true`, generate a self-signed cert in `data_dir/certs/` on first
-    /// start (dev/test mode). Ignored when `cert` + `key` are set.
+    /// Development only: serve gRPC in plaintext with no client certificates.
     #[serde(default)]
-    pub auto_generate: bool,
+    pub insecure_plaintext: bool,
 }
 
 fn default_listen() -> String {
@@ -104,6 +103,18 @@ impl AgentConfig {
         self.listen_addr
             .parse::<SocketAddr>()
             .map_err(|e| anyhow::anyhow!("listen_addr {:?} is invalid: {}", self.listen_addr, e))?;
+        let tls = &self.tls;
+        let files = [&tls.ca_cert, &tls.cert, &tls.key];
+        if tls.insecure_plaintext {
+            if files.iter().any(|f| f.is_some()) {
+                anyhow::bail!("[tls] set either certificate files or insecure_plaintext, not both");
+            }
+        } else if files.iter().any(|f| f.is_none()) {
+            anyhow::bail!(
+                "[tls] ca_cert, cert and key are all required. \
+                 For local development only, set insecure_plaintext = true"
+            );
+        }
         Ok(())
     }
 
@@ -156,6 +167,24 @@ listen_addr = "0.0.0.0:7001"
         assert_eq!(cfg.heartbeat_timeout_seconds, 10);
         assert_eq!(cfg.postgres_user, "postgres");
         assert_eq!(cfg.postgres_dbname, "postgres");
+    }
+
+    fn parse(tls: &str) -> anyhow::Result<()> {
+        let toml = format!("data_dir = \"/pgdata\"\n{tls}");
+        toml::from_str::<AgentConfig>(&toml).unwrap().validate()
+    }
+
+    #[test]
+    fn certificates_are_required() {
+        assert!(parse("").is_err());
+        assert!(parse("[tls]\ncert = \"a\"\nkey = \"b\"").is_err());
+        assert!(parse("[tls]\nca_cert = \"a\"\ncert = \"b\"\nkey = \"c\"").is_ok());
+    }
+
+    #[test]
+    fn development_flag_allows_plaintext() {
+        assert!(parse("[tls]\ninsecure_plaintext = true").is_ok());
+        assert!(parse("[tls]\ninsecure_plaintext = true\ncert = \"a\"").is_err());
     }
 
     #[test]

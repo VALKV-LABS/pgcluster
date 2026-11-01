@@ -1,3 +1,4 @@
+pub mod certs;
 pub mod client;
 pub mod config;
 pub mod failover;
@@ -36,6 +37,8 @@ pub enum Commands {
     Config(config::ConfigArgs),
     /// Initialize a new cluster (bootstrap)
     Init(init::InitArgs),
+    /// Generate a cluster CA and certificates
+    Certs(certs::CertsArgs),
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -49,5 +52,6 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Replication(args) => replication::run(args).await,
         Commands::Config(args) => config::run(args).await,
         Commands::Init(args) => init::run(args).await,
+        Commands::Certs(args) => certs::run(args).await,
     }
 }

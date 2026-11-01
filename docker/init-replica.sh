@@ -8,6 +8,7 @@
 #   PGDATA           — replica data directory (default: /var/lib/postgresql/data)
 #   POSTGRES_USER    — replication user (default: postgres)
 #   POSTGRES_PASSWORD — password (optional; used in .pgpass if set)
+#   PG_TLS_NAME      — serve TLS with /certs/<name>.crt and .key (optional)
 #
 # The script is idempotent: if PGDATA/PG_VERSION already exists the backup step
 # is skipped and Postgres is started directly.
@@ -93,6 +94,12 @@ echo "[init-replica] Starting Postgres in standby mode ..."
 # Do NOT pass "$@" — script args are <primary-host> [port], not postgres flags.
 # Use the same hba_file as pg-primary so that after promotion replication is allowed from all nodes.
 HBA_FILE="/etc/postgresql/pg_hba.conf"
+TLS_ARGS=()
+if [ -n "${PG_TLS_NAME:-}" ]; then
+  TLS_ARGS=(-c ssl=on
+    -c "ssl_cert_file=/certs/${PG_TLS_NAME}.crt"
+    -c "ssl_key_file=/certs/${PG_TLS_NAME}.key")
+fi
 if [ -f "${HBA_FILE}" ]; then
   exec gosu postgres postgres -D "${PGDATA}" \
     -c hba_file="${HBA_FILE}" \
@@ -100,7 +107,8 @@ if [ -f "${HBA_FILE}" ]; then
     -c max_wal_senders=10 \
     -c max_replication_slots=10 \
     -c hot_standby=on \
-    -c listen_addresses='*'
+    -c listen_addresses='*' \
+    "${TLS_ARGS[@]}"
 else
-  exec gosu postgres postgres -D "${PGDATA}"
+  exec gosu postgres postgres -D "${PGDATA}" "${TLS_ARGS[@]}"
 fi
