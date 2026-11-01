@@ -9,6 +9,7 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 - [x] **1.3 Add `CONTRIBUTING.md`, `SECURITY.md` and `CHANGELOG.md`, and choose a CLA or DCO.** The project uses the DCO. *Done when:* contributors have a documented path and security reports have a private route.
 - [x] **1.4 Fix documentation drift.** *Done when:* every README link resolves and the API doc matches the routes.
 - [x] **1.5 Run the Docker integration and end-to-end tests in CI.** *Done when:* they run on every PR.
+- [ ] **1.6 Build release images natively.** Each architecture builds on its own runner, with dependencies in a cached layer, and pushes to `main` keep the cache warm. *Done when:* a push to `main` publishes `edge` for both architectures, and a release takes under 15 minutes.
 
 ## Part 2: Secure defaults
 

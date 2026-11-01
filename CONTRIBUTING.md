@@ -39,4 +39,4 @@ Please report vulnerabilities privately, as described in [`SECURITY.md`](SECURIT
 
 ## Releasing
 
-A release is made by pushing a tag `vX.Y.Z` that matches the workspace version in `Cargo.toml`. The tag runs CI, publishes `valkvlabs/pgcluster` and `valkvlabs/vk-agent` to Docker Hub, and creates the GitHub release.
+A release is made by pushing a tag `vX.Y.Z` that matches the workspace version in `Cargo.toml`. The tag runs CI, publishes `valkvlabs/pgcluster` and `valkvlabs/vk-agent` to Docker Hub for amd64 and arm64, and creates the GitHub release from the matching `CHANGELOG.md` section. Every push to `main` publishes the `edge` tag.

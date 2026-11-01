@@ -8,18 +8,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY Cargo.toml Cargo.lock ./
 COPY pgcluster/Cargo.toml pgcluster/Cargo.toml
 COPY vk-agent/Cargo.toml vk-agent/Cargo.toml
-# Create stub lib files so cargo can fetch deps
+# Create stub lib files so cargo can build deps
 RUN mkdir -p pgcluster/src vk-agent/src && \
     echo 'fn main() {}' > pgcluster/src/main.rs && \
     echo '' > pgcluster/src/lib.rs && \
     echo 'fn main() {}' > vk-agent/src/main.rs && \
     echo '' > vk-agent/src/lib.rs
-RUN cargo fetch
-# Copy actual source
+# Compile dependencies against the stubs, as their own cached layer.
+RUN cargo build --release --bin vk-agent
 COPY proto ./proto
 COPY pgcluster ./pgcluster
 COPY vk-agent ./vk-agent
-RUN cargo build --release --bin vk-agent
+# COPY keeps old timestamps, so touch the sources or cargo keeps the stub binary.
+RUN touch pgcluster/src/main.rs pgcluster/src/lib.rs vk-agent/src/main.rs vk-agent/src/lib.rs && \
+    cargo build --release --bin vk-agent
 
 # Stage 2: runtime
 FROM debian:bookworm-slim

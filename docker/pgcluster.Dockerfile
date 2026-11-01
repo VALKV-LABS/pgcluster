@@ -11,11 +11,14 @@ RUN mkdir -p pgcluster/src vk-agent/src && \
     echo '' > pgcluster/src/lib.rs && \
     echo 'fn main() {}' > vk-agent/src/main.rs && \
     echo '' > vk-agent/src/lib.rs
-RUN cargo fetch
+# Compile dependencies against the stubs, as their own cached layer.
+RUN cargo build --release --bin pgcluster
 COPY proto ./proto
 COPY pgcluster ./pgcluster
 COPY vk-agent ./vk-agent
-RUN cargo build --release --bin pgcluster
+# COPY keeps old timestamps, so touch the sources or cargo keeps the stub binary.
+RUN touch pgcluster/src/main.rs pgcluster/src/lib.rs vk-agent/src/main.rs vk-agent/src/lib.rs && \
+    cargo build --release --bin pgcluster
 
 # Stage 2: runtime
 FROM debian:bookworm-slim
