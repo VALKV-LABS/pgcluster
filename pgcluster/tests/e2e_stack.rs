@@ -784,6 +784,89 @@ async fn e2e_dead_standby_past_the_limit_is_flagged() {
     compose(&["down", "-v", "--remove-orphans"]);
 }
 
+/// A new node with an empty data directory seeds from the primary through an
+/// RPC, then streams from it.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_new_node_seeds_through_the_agent() {
+    start_stack();
+    create_mode_test_table().await;
+    wait_for_exit(&mut spawn_write(7), Duration::from_secs(10)).await;
+
+    let spare = [
+        "--profile",
+        "spare",
+        "up",
+        "-d",
+        "--no-deps",
+        "--build",
+        "vk-agent-4",
+    ];
+    compose(&spare);
+
+    let client = reqwest::Client::new();
+    let added = client
+        .post(format!("{DEFAULT_API}/api/nodes/add"))
+        .bearer_auth("dev-api-key")
+        .json(&serde_json::json!({
+            "node_id": "pg4",
+            "agent_addr": "vk-agent-4:7001",
+            "postgres_addr": "pg-new:5432",
+        }))
+        .send()
+        .await
+        .expect("POST /api/nodes/add");
+    assert_eq!(added.status(), 201);
+
+    let seeded = client
+        .post(format!("{DEFAULT_API}/api/nodes/pg4/seed"))
+        .bearer_auth("dev-api-key")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("POST /api/nodes/pg4/seed");
+    assert_eq!(seeded.status(), 202);
+
+    wait_until("pg4 to stream", Duration::from_secs(60), || async {
+        let out = psql(
+            "pg-primary",
+            "pgcluster-1",
+            "SELECT count(*) FROM pg_stat_replication \
+             WHERE application_name = 'pg4' AND state = 'streaming'",
+        );
+        String::from_utf8_lossy(&out.stdout).trim() == "1"
+    })
+    .await;
+
+    let out = Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            COMPOSE_FILE,
+            "--profile",
+            "spare",
+            "exec",
+            "-T",
+        ])
+        .args([
+            "vk-agent-4",
+            "psql",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            "postgres",
+            "-Atc",
+        ])
+        .arg("SELECT value FROM mode_test")
+        .env("PGPASSWORD", "test")
+        .current_dir(project_root())
+        .output()
+        .expect("query pg4");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "7");
+
+    compose(&["--profile", "spare", "down", "-v", "--remove-orphans"]);
+}
+
 /// Runs switchover only — useful when the stack is already up (E2E_SKIP_BUILD=1).
 #[tokio::test]
 #[ignore = "requires Docker e2e stack (make start) with E2E_STACK_ADDR or localhost:8009"]

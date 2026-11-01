@@ -7,27 +7,30 @@ pub mod agent {
 use std::path::Path;
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
 use tonic::transport::{Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
 use agent::agent_service_server::{AgentService, AgentServiceServer};
 use agent::{
     DemoteRequest, DemoteResponse, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
-    PromoteResponse, ReloadRequest, ReloadResponse, SetParametersRequest, SetParametersResponse,
-    StatusRequest, StatusResponse, StopRequest, StopResponse,
+    PromoteResponse, ReloadRequest, ReloadResponse, SeedRequest, SeedResponse,
+    SetParametersRequest, SetParametersResponse, StatusRequest, StatusResponse, StopRequest,
+    StopResponse,
 };
 
 use crate::config::AgentConfig;
-use crate::files::write_signal_file;
 use crate::heartbeat::HeartbeatTracker;
 use crate::postgres::LocalPostgres;
 use crate::process::PgCtl;
+use crate::standby::configure_standby;
 
 pub struct AgentServiceImpl {
     config: Arc<AgentConfig>,
     heartbeat: Arc<HeartbeatTracker>,
     pg: Arc<LocalPostgres>,
     pg_ctl: Arc<PgCtl>,
+    seeding: Mutex<()>,
 }
 
 impl AgentServiceImpl {
@@ -42,6 +45,7 @@ impl AgentServiceImpl {
             heartbeat,
             pg,
             pg_ctl,
+            seeding: Mutex::new(()),
         }
     }
 }
@@ -122,80 +126,36 @@ impl AgentService for AgentServiceImpl {
         let req = request.into_inner();
         let data_dir = Path::new(&self.config.data_dir);
 
-        if let Err(e) = write_signal_file(data_dir, "standby.signal").await {
-            return Ok(Response::new(DemoteResponse {
-                success: false,
-                error: e.to_string(),
-            }));
-        }
-
-        // Write new primary_conninfo and slot_name to postgresql.auto.conf.
-        if !req.new_primary_conninfo.is_empty() {
-            let (mut conninfo, maybe_password) =
-                extract_conninfo_password(&req.new_primary_conninfo);
-            if !req.application_name.is_empty() {
-                conninfo = format!("{conninfo} application_name={}", req.application_name);
-            }
-
-            // If the conninfo carried a password, persist it to .pgpass and use
-            // passfile= so the password is never stored in the config file.
-            let final_conninfo = if let Some(password) = maybe_password {
-                let host = conninfo_value(&req.new_primary_conninfo, "host")
-                    .unwrap_or_else(|| "*".to_string());
-                let port = conninfo_value(&req.new_primary_conninfo, "port")
-                    .unwrap_or_else(|| "5432".to_string());
-                let user = conninfo_value(&req.new_primary_conninfo, "user")
-                    .unwrap_or_else(|| "*".to_string());
-
-                if let Err(e) = crate::files::write_pgpass(
-                    data_dir,
-                    &host,
-                    &port,
-                    "replication",
-                    &user,
-                    &password,
-                )
-                .await
-                {
-                    return Ok(Response::new(DemoteResponse {
-                        success: false,
-                        error: format!("write_pgpass failed: {e}"),
-                    }));
-                }
-
-                let passfile = data_dir.join(".pgpass");
-                format!("{} passfile={}", conninfo, passfile.display())
-            } else {
-                conninfo
-            };
-
-            if let Err(e) =
-                crate::files::update_auto_conf(data_dir, "primary_conninfo", &final_conninfo).await
-            {
-                return Ok(Response::new(DemoteResponse {
-                    success: false,
-                    error: e.to_string(),
-                }));
-            }
-        }
-
-        if !req.slot_name.is_empty() {
-            if let Err(e) =
-                crate::files::update_auto_conf(data_dir, "primary_slot_name", &req.slot_name).await
-            {
-                return Ok(Response::new(DemoteResponse {
-                    success: false,
-                    error: e.to_string(),
-                }));
-            }
-        }
+        let result = configure_standby(
+            data_dir,
+            &req.new_primary_conninfo,
+            &req.slot_name,
+            &req.application_name,
+        )
+        .await;
 
         // Remove promote.signal if present; ignore errors.
         let _ = tokio::fs::remove_file(data_dir.join("promote.signal")).await;
 
         Ok(Response::new(DemoteResponse {
-            success: true,
-            error: String::new(),
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        }))
+    }
+
+    /// Seed this node from the primary. Only one seed runs at a time.
+    async fn seed(&self, request: Request<SeedRequest>) -> Result<Response<SeedResponse>, Status> {
+        let Ok(_guard) = self.seeding.try_lock() else {
+            return Ok(Response::new(SeedResponse {
+                success: false,
+                error: "a seed is already running".to_string(),
+            }));
+        };
+        let data_dir = Path::new(&self.config.data_dir);
+        let result = crate::seed::seed(&self.pg_ctl, data_dir, &request.into_inner()).await;
+        Ok(Response::new(SeedResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
         }))
     }
 
@@ -359,90 +319,5 @@ impl AgentService for AgentServiceImpl {
                 error: e.to_string(),
             })),
         }
-    }
-}
-
-/// Split `password=<value>` out of a libpq keyword/value conninfo string.
-///
-/// Returns `(conninfo_without_password, Some(password))` when a `password`
-/// keyword is present, or `(original, None)` otherwise.
-///
-/// This handles the plain-token format we generate internally
-/// (`key=value` pairs separated by whitespace). Values may be surrounded by
-/// single quotes; the returned password has those quotes stripped.
-fn extract_conninfo_password(conninfo: &str) -> (String, Option<String>) {
-    let mut password: Option<String> = None;
-    let filtered: Vec<&str> = conninfo
-        .split_whitespace()
-        .filter(|token| {
-            if let Some(raw) = token.strip_prefix("password=") {
-                let pw = raw.trim_matches('\'').to_string();
-                password = Some(pw);
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
-    (filtered.join(" "), password)
-}
-
-/// Extract a single keyword value from a libpq conninfo string.
-///
-/// Returns `Some(value)` for the first `key=value` or `key='value'` token
-/// that matches `key`, stripping surrounding single quotes from the value.
-fn conninfo_value(conninfo: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}=");
-    conninfo.split_whitespace().find_map(|token| {
-        token
-            .strip_prefix(&prefix)
-            .map(|v| v.trim_matches('\'').to_string())
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_password_removes_token_and_returns_value() {
-        let conninfo = "host=pg-primary port=5432 user=replicator password=s3cr3t";
-        let (new, pw) = extract_conninfo_password(conninfo);
-        assert_eq!(pw, Some("s3cr3t".to_string()));
-        assert!(!new.contains("password="), "password must be stripped");
-        assert!(new.contains("host=pg-primary"));
-        assert!(new.contains("port=5432"));
-        assert!(new.contains("user=replicator"));
-    }
-
-    #[test]
-    fn extract_password_no_password_returns_none() {
-        let conninfo = "host=pg-primary port=5432 user=replicator";
-        let (new, pw) = extract_conninfo_password(conninfo);
-        assert_eq!(pw, None);
-        assert_eq!(new, conninfo);
-    }
-
-    #[test]
-    fn extract_password_strips_surrounding_quotes() {
-        // Single-quoted unspaced value (e.g. password='p@ss!').
-        let conninfo = "host=pg-primary password='p@ss!'";
-        let (_, pw) = extract_conninfo_password(conninfo);
-        assert_eq!(pw, Some("p@ss!".to_string()));
-    }
-
-    #[test]
-    fn conninfo_value_finds_host() {
-        let conninfo = "host=pg-primary port=5432 user=replicator";
-        assert_eq!(
-            conninfo_value(conninfo, "host"),
-            Some("pg-primary".to_string())
-        );
-    }
-
-    #[test]
-    fn conninfo_value_missing_key_returns_none() {
-        let conninfo = "host=pg-primary port=5432";
-        assert_eq!(conninfo_value(conninfo, "user"), None);
     }
 }

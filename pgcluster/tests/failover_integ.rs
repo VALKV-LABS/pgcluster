@@ -5,8 +5,9 @@ use pgcluster::agent_clients::agent_proto::agent_service_server::{
 };
 use pgcluster::agent_clients::agent_proto::{
     DemoteRequest, DemoteResponse, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
-    PromoteResponse, ReloadRequest, ReloadResponse, SetParametersRequest, SetParametersResponse,
-    StatusRequest, StatusResponse, StopRequest, StopResponse,
+    PromoteResponse, ReloadRequest, ReloadResponse, SeedRequest, SeedResponse,
+    SetParametersRequest, SetParametersResponse, StatusRequest, StatusResponse, StopRequest,
+    StopResponse,
 };
 use pgcluster::agent_clients::AgentClientPool;
 use pgcluster::failover::candidate::pick_live_candidate;
@@ -54,6 +55,9 @@ impl AgentService for FakeAgent {
         _: Request<SetParametersRequest>,
     ) -> RpcResult<SetParametersResponse> {
         Err(Status::unimplemented("set_parameters"))
+    }
+    async fn seed(&self, _: Request<SeedRequest>) -> RpcResult<SeedResponse> {
+        Err(Status::unimplemented("seed"))
     }
 }
 

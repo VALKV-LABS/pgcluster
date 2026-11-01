@@ -18,6 +18,9 @@ service AgentService {
   rpc ReloadConfig(ReloadRequest) returns (ReloadResponse);
   // Apply settings pgcluster manages, with ALTER SYSTEM and a reload
   rpc SetParameters(SetParametersRequest) returns (SetParametersResponse);
+  // Replace this node's data with a base backup of the primary, then start
+  // Postgres as a standby. Runs as long as the backup takes.
+  rpc Seed(SeedRequest) returns (SeedResponse);
 }
 
 // ── Promote ──────────────────────────────────────────────────────────────────
@@ -127,6 +130,26 @@ message SetParametersRequest {
 }
 
 message SetParametersResponse {
+  bool   success = 1;
+  string error   = 2;
+}
+
+// ── Seed ─────────────────────────────────────────────────────────────────────
+
+message SeedRequest {
+  string primary_host     = 1;
+  uint32 primary_port     = 2;
+  string user             = 3;
+  string password         = 4;
+  // Replication slot to hold WAL for this node. It must already exist.
+  string slot_name        = 5;
+  // application_name for the WAL receiver. Pass the node ID.
+  string application_name = 6;
+  // Discard an existing data directory. Without this, a node with data refuses.
+  bool   force            = 7;
+}
+
+message SeedResponse {
   bool   success = 1;
   string error   = 2;
 }

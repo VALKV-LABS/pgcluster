@@ -24,11 +24,10 @@ RUN touch pgcluster/src/main.rs pgcluster/src/lib.rs vk-agent/src/main.rs vk-age
     cargo build --release --bin vk-agent
 
 # Stage 2: runtime
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates postgresql && rm -rf /var/lib/apt/lists/*
+# The Postgres image, so pg_ctl, pg_basebackup and pg_rewind match the server.
+# It already has the postgres user, with uid 999.
+FROM postgres:16-bookworm
 COPY --from=builder /build/target/release/vk-agent /usr/local/bin/vk-agent
-RUN groupmod -g 999 postgres && usermod -u 999 -g 999 postgres
 USER postgres
 EXPOSE 7001
 ENTRYPOINT ["/usr/local/bin/vk-agent"]

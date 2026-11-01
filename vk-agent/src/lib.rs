@@ -3,5 +3,7 @@ pub mod files;
 pub mod heartbeat;
 pub mod postgres;
 pub mod process;
+pub mod seed;
 pub mod server;
+pub mod standby;
 pub mod tls;

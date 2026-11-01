@@ -39,26 +39,8 @@ async fn main() -> Result<()> {
     let config = AgentConfig::from_file(&config_path)?;
     info!(listen = %config.listen_addr, "vk-agent starting");
 
-    // Connect to postgres (retry up to 30 times with 1s sleep)
-    let pg_url = config.postgres_url();
-    let pg = {
-        let mut last_err = None;
-        let mut pg_opt = None;
-        for attempt in 1..=30u32 {
-            match LocalPostgres::connect(&pg_url).await {
-                Ok(p) => {
-                    pg_opt = Some(p);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(attempt, "postgres not ready: {e}");
-                    last_err = Some(e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
-        pg_opt.ok_or_else(|| last_err.unwrap())?
-    };
+    // Connect on first use: a node waiting to be seeded has no Postgres yet.
+    let pg = LocalPostgres::connect_lazy(&config.postgres_url())?;
 
     let heartbeat = HeartbeatTracker::new(Duration::from_secs(config.heartbeat_timeout_seconds));
     heartbeat.clone().spawn_watchdog();
@@ -78,7 +60,8 @@ async fn main() -> Result<()> {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 if let Some(elapsed) = hb.time_in_safe_mode() {
-                    if elapsed >= fence_timeout {
+                    // No Postgres means nothing to fence, as on an unseeded node.
+                    if elapsed >= fence_timeout && ctl.is_running().await.unwrap_or(false) {
                         tracing::error!(
                             elapsed_secs = elapsed.as_secs(),
                             fence_timeout_secs = fence_secs,

@@ -1,4 +1,5 @@
 use super::ApiState;
+use crate::failover::seed::SeedPlan;
 use crate::raft::{commands::TopologyCommand, topology::NodeConfig};
 use axum::{
     extract::{Path, State},
@@ -116,4 +117,31 @@ pub async fn remove_node(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SeedNodeRequest {
+    /// Discard data already on the node.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Start seeding a node from the primary. The backup can take hours, so this
+/// returns at once, and the node appears as `replica` when it finishes.
+pub async fn seed_node(
+    State(s): State<ApiState>,
+    Path(node_id): Path<String>,
+    Json(req): Json<SeedNodeRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let topology = s.topology.borrow();
+    let plan = SeedPlan::new(&topology, &node_id, &s.config.replication)
+        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    let pool = s.pool.clone();
+    tokio::spawn(async move {
+        match plan.run(&pool, req.force).await {
+            Ok(()) => tracing::info!(node_id, "node seeded from the primary"),
+            Err(e) => tracing::error!(node_id, err = %e, "seeding failed"),
+        }
+    });
+    Ok(StatusCode::ACCEPTED)
 }

@@ -109,6 +109,18 @@ impl AgentClient {
             .map(|r| r.into_inner())
     }
 
+    /// Seed this node from the primary. Runs as long as the backup takes.
+    pub async fn seed(
+        &mut self,
+        request: agent_proto::SeedRequest,
+    ) -> Result<agent_proto::SeedResponse> {
+        self.stub
+            .seed(tonic::Request::new(request))
+            .await
+            .with_context(|| format!("Seed at {}", self.addr))
+            .map(|r| r.into_inner())
+    }
+
     /// Apply settings pgcluster manages on this node.
     pub async fn set_parameters(
         &mut self,

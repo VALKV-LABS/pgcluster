@@ -1,9 +1,15 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
 use crate::server::agent::ReplicaStatus;
+
+/// How long a query waits for a connection. Short, so that a status call on a
+/// node with no Postgres answers quickly.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The settings pgcluster may change through `set_parameters`.
 pub const MANAGED_PARAMETERS: &[&str] = &["synchronous_standby_names", "max_slot_wal_keep_size"];
@@ -31,10 +37,13 @@ impl LocalPostgres {
         Ok(Self { pool })
     }
 
-    /// Build a pool that connects on first use.
+    /// Build a pool that connects on first use, because a node waiting to be
+    /// seeded has no Postgres yet.
     pub fn connect_lazy(url: &str) -> Result<Self> {
-        let pool =
-            PgPool::connect_lazy(url).with_context(|| format!("invalid postgres url {url}"))?;
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(ACQUIRE_TIMEOUT)
+            .connect_lazy(url)
+            .with_context(|| format!("invalid postgres url {url}"))?;
         Ok(Self { pool })
     }
 

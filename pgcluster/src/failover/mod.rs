@@ -2,6 +2,7 @@ pub mod candidate;
 pub mod events;
 pub mod promote;
 pub mod repoint;
+pub mod seed;
 pub mod slots;
 
 use std::sync::Arc;

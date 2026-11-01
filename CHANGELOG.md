@@ -24,7 +24,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Every push to `main` publishes `valkvlabs/pgcluster:edge` and `valkvlabs/vk-agent:edge`.
 - A release skips CI when it already passed on `main` for the tagged commit.
 
+### Changed
+- The `vk-agent` image is built on `postgres:16-bookworm`, so its tools match the server. It shipped Postgres 15 tools before.
+- `vk-agent` starts with no Postgres running, and skips self-fencing while there is none to fence.
+
 ### Added
+- `POST /api/nodes/:id/seed` seeds a node from the primary through `vk-agent`.
 - Raft membership changes through `/api/members`: add a learner, promote it, and remove a member.
 - `replication_mode` with `async`, `sync` and `sync_strict`, which replaces `synchronous_standby_names`. The config sets the mode of a new cluster, and `POST /api/replication/mode` changes it online. `GET /api/replication` reports it.
 - `sync` falls back to async after `sync_degrade_timeout_seconds` with no standby, recording that through Raft first, and the failover history shows `ran_degraded`. `sync_strict` never falls back, and promotes only if every standby answers.

@@ -52,6 +52,7 @@ services:
         pgcluster certs --out /certs
         pg-primary pg-replica-1 pg-replica-2
         vk-agent-1 vk-agent-2 vk-agent-3
+        vk-agent-4 pg-new
         pgcluster-1 pgcluster-2 pgcluster-3 &&
         chown 999:999 /certs/pg-*.key /certs/vk-agent-*.key
     volumes:
@@ -201,6 +202,22 @@ services:
       - ./configs/vk-agent-pg3.toml:/etc/vk-agent/config.toml:ro
       - certs:/certs:ro
 
+  # A spare node for tests of seeding. It runs only vk-agent, with an empty data
+  # directory, and the agent starts Postgres once it has seeded.
+  vk-agent-4:
+    profiles: [spare]
+    build:
+      context: ..
+      dockerfile: docker/vk-agent.Dockerfile
+    hostname: pg-new
+    networks:
+      default:
+        aliases: [pg-new]
+    volumes:
+      - pg-new-data:/var/lib/postgresql/data
+      - ./configs/vk-agent-pg4.toml:/etc/vk-agent/config.toml:ro
+      - certs:/certs:ro
+
   # ── pgcluster nodes ─────────────────────────────────────────────────────────
 
   pgcluster-1:
@@ -296,6 +313,7 @@ volumes:
   pg-primary-data:
   pg-replica-1-data:
   pg-replica-2-data:
+  pg-new-data:
   pgcluster-1-data:
   pgcluster-2-data:
   pgcluster-3-data:
