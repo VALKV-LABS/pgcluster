@@ -15,12 +15,12 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 
 - [x] **2.1 Require credentials on the REST API.** *Done when:* the server refuses to start without API keys, unless an explicit development flag is set.
 - [x] **2.2 Require client certificates on every gRPC endpoint.** Covers `vk-agent` and Raft, signed by the cluster CA. *Done when:* a connection without a valid client certificate is rejected, by automated test.
-- [ ] **2.3 Use TLS between the proxy and Postgres.** *Done when:* the connection is encrypted and certificates are verified.
+- [ ] **2.3 Use TLS between the proxy and Postgres.** *Done when:* the connection is encrypted and certificates are verified. **Pending decision:** how logins work over this link. `[proxy] backend_tls` is built and tested, but off by default, because SCRAM passthrough fails once this link uses TLS: Postgres binds the login to a TLS session the client is not part of. Replica read routing has the same cause, since the proxy cannot log in to a replica for a client, so reads go to the primary for now. Options: (a) `pg_hba` method `password` with TLS required at the proxy, which works today but shows the proxy every password and conflicts with 6.10 generating passwords locally; (b) the proxy terminates SCRAM from stored verifiers, as PgBouncer does, which needs a privileged role to read them and also makes replica reads possible. Recommended: (b).
 - [x] **2.4 Update docs.** *Done when:* the README and `docs/components/tls_manager.md` describe what 2.1 to 2.3 deliver.
 
 ## Part 3: Safe failover
 
-- [ ] **3.1 Choose the failover candidate from live status.** Query reachable standbys at failover time. *Done when:* a test with a stale cached position promotes the most current standby.
+- [x] **3.1 Choose the failover candidate from live status.** Query reachable standbys at failover time. *Done when:* a test with a stale cached position promotes the most current standby.
 - [ ] **3.2 Stop writes on a proxy without quorum.** It must stop before a new primary can be promoted. *Done when:* a partition test shows no writes accepted on both sides.
 - [ ] **3.3 Turn self-fencing on by default.** Align its timeout with 3.2 and with failover timing, and validate the settings at startup. *Done when:* an invalid timing combination fails config validation.
 - [ ] **3.4 Add a partition test to the end-to-end suite.** *Done when:* it runs in CI and passes for 3.2 and 3.3.

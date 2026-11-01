@@ -20,7 +20,8 @@ use crate::raft::RaftNode;
 /// consecutive health checks.
 ///
 /// Steps:
-/// 1. Pick the best replica candidate (highest LSN, then priority).
+/// 1. Ask reachable replicas for their position and pick the best (highest
+///    LSN, then priority).
 /// 2. Promote the candidate via the Promote RPC.
 /// 3. Propose `SetPrimary` to Raft so all cluster members update their view.
 /// 4. Record the failover event in Raft history.
@@ -40,15 +41,14 @@ pub async fn trigger_failover(
     info!(failed_primary, "starting automatic failover");
 
     // ── 1. Pick candidate ────────────────────────────────────────────────────
-    let candidate = match candidate::pick_candidate(topology, failed_primary) {
-        Some(c) => c,
-        None => {
-            error!(
-                failed_primary,
-                "failover aborted: no eligible replica found"
-            );
-            return;
-        }
+    let Some((candidate, at_lsn)) =
+        candidate::pick_live_candidate(topology, failed_primary, pool).await
+    else {
+        error!(
+            failed_primary,
+            "failover aborted: no eligible replica answered"
+        );
+        return;
     };
 
     let candidate_cfg = match topology.node_configs.get(&candidate) {
@@ -92,11 +92,6 @@ pub async fn trigger_failover(
     }
 
     // ── 3. Propose SetPrimary ────────────────────────────────────────────────
-    let at_lsn = topology
-        .last_flush_lsns
-        .get(&candidate)
-        .copied()
-        .unwrap_or(0);
     let new_timeline = 1u32; // will be refreshed by the next health-check poll
     if let Err(e) = raft
         .raft

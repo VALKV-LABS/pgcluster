@@ -10,6 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Breaking:** `[tls] auto_generate` and `pgcluster init --gen-certs` are gone, because they gave each node its own CA. Use `pgcluster certs`.
 
 ### Fixed
+- Failover chooses the candidate from the live position of reachable standbys, not the last position the health checks recorded, and aborts if none answers.
 - `pgcluster` now sends the heartbeats `vk-agent` expects. Without them every agent entered safe mode, and with `fence_timeout_seconds` set it stopped Postgres.
 - Logging in through the proxy no longer hangs when a client takes more than 10 ms to answer an authentication challenge, as SCRAM clients do.
 - The proxy routes reads to the primary. Sending them to a replica dropped the client's connection.
