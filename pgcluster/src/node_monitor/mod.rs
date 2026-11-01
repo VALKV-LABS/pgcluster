@@ -15,9 +15,9 @@ use crate::raft::commands::TopologyCommand;
 use crate::raft::topology::{ClusterTopology, NodeRole};
 use crate::raft::{RaftNode, TopologyWatch};
 use failure_state::FailureTracker;
-use health_check::check_node;
 #[cfg(test)]
 use health_check::HealthCheckResult;
+use health_check::{check_node, send_heartbeat};
 
 // ── NodeMonitor ───────────────────────────────────────────────────────────────
 
@@ -81,6 +81,7 @@ impl NodeMonitor {
         let mut tick_count: u64 = 0;
 
         info!("node monitor started");
+        self.spawn_heartbeats(interval);
 
         loop {
             tick.tick().await;
@@ -113,6 +114,32 @@ impl NodeMonitor {
                 self.audit_slots(&topology).await;
             }
         }
+    }
+
+    /// Heartbeat every agent while this instance is the Raft leader.
+    ///
+    /// Runs apart from the health checks, because a status call that hangs on
+    /// one busy Postgres must not starve the others and fence them.
+    fn spawn_heartbeats(&self, interval: Duration) {
+        let raft = self.raft.clone();
+        let topology_rx = self.topology_rx.clone();
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let mut tick = time::interval(interval);
+            loop {
+                tick.tick().await;
+                let metrics = raft.raft.metrics().borrow().clone();
+                if metrics.current_leader != Some(metrics.id) {
+                    continue;
+                }
+                for (node_id, cfg) in &topology_rx.current().node_configs {
+                    let node_id = node_id.clone();
+                    let addr = cfg.agent_addr.clone();
+                    let pool = pool.clone();
+                    tokio::spawn(async move { send_heartbeat(&node_id, &addr, &pool).await });
+                }
+            }
+        });
     }
 
     async fn audit_slots(&self, topology: &ClusterTopology) {

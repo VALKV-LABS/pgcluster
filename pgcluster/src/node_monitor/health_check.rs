@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tracing::warn;
 
 use crate::agent_clients::AgentClientPool;
@@ -21,6 +23,27 @@ pub struct HealthCheckResult {
     /// The `conninfo` string from `pg_stat_wal_receiver` (standby only; empty on primary).
     /// Used to detect a stale `primary_conninfo` after failover.
     pub replication_conninfo: String,
+}
+
+// ── send_heartbeat ────────────────────────────────────────────────────────────
+
+/// Upper bound on one heartbeat, so a dead agent cannot pile up tasks.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Tell the agent at `agent_addr` that a Raft leader can see it. Without
+/// heartbeats an agent enters safe mode and then self-fences.
+pub async fn send_heartbeat(node_id: &str, agent_addr: &str, pool: &AgentClientPool) {
+    let attempt = async {
+        let mut client = pool.get_or_connect(node_id, agent_addr).await?;
+        client.heartbeat().await
+    };
+    let err = match tokio::time::timeout(HEARTBEAT_TIMEOUT, attempt).await {
+        Ok(Ok(_)) => return,
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => "timed out".to_string(),
+    };
+    warn!(node_id, err, "Heartbeat RPC failed");
+    pool.remove(node_id);
 }
 
 // ── check_node ────────────────────────────────────────────────────────────────
