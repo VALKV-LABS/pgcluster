@@ -7,9 +7,9 @@ use sqlx::PgPool;
 
 use crate::server::agent::ReplicaStatus;
 
-/// How long a query waits for a connection. Short, so that a status call on a
-/// node with no Postgres answers quickly.
-const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a query waits for a connection. A status call on a node with no
+/// Postgres must answer well inside pgcluster's two-second health check.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The settings pgcluster may change through `set_parameters`.
 pub const MANAGED_PARAMETERS: &[&str] = &["synchronous_standby_names", "max_slot_wal_keep_size"];

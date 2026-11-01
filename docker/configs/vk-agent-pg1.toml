@@ -1,6 +1,6 @@
 listen_addr               = "0.0.0.0:7001"
 data_dir                  = "/var/lib/postgresql/data"
-postgres_host             = "pg-primary"
+postgres_host             = "127.0.0.1"
 postgres_port             = 5432
 postgres_user             = "postgres"
 postgres_password         = "test"
@@ -8,7 +8,6 @@ postgres_dbname           = "postgres"
 heartbeat_timeout_seconds = 10
 fence_timeout_seconds     = 30
 pg_ctl_path               = "/usr/lib/postgresql/16/bin/pg_ctl"
-manage_postgres           = false
 
 [tls]
 ca_cert = "/certs/ca.crt"

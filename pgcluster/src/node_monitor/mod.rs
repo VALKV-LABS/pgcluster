@@ -94,6 +94,7 @@ impl NodeMonitor {
         let mut tracker = FailureTracker::default();
         let mut degrade_timer = DegradeTimer::default();
         let mut stale_primaries = StalePrimaries::default();
+        let mut unseeded = StalePrimaries::default();
         let interval = Duration::from_millis(self.config.health_check_interval_ms);
         let mut tick = time::interval(interval);
         let mut tick_count: u64 = 0;
@@ -129,6 +130,7 @@ impl NodeMonitor {
                 &mut tracker,
                 &mut degrade_timer,
                 &mut stale_primaries,
+                &mut unseeded,
             )
             .await;
 
@@ -181,6 +183,27 @@ impl NodeMonitor {
             && !primary.is_empty()
             && primary != node_id
             && !self.op_in_progress.load(Ordering::SeqCst)
+    }
+
+    /// Seed an empty node in the background, which can take hours.
+    fn spawn_seed(&self, node_id: &str) {
+        let topology = self.topology_rx.current();
+        let plan = match SeedPlan::new(&topology, node_id, &self.replication) {
+            Ok(plan) => plan,
+            Err(e) => {
+                warn!(node_id, err = %e, "cannot seed the node");
+                return;
+            }
+        };
+        info!(node_id, "seeding an empty node from the primary");
+        let node_id = node_id.to_string();
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            match plan.run(&pool, false).await {
+                Ok(()) => info!(node_id, "node seeded from the primary"),
+                Err(e) => error!(node_id, err = %e, "seeding failed"),
+            }
+        });
     }
 
     /// Rejoin a diverged old primary in the background: a rewind is quick, but
@@ -247,6 +270,7 @@ impl NodeMonitor {
         tracker: &mut FailureTracker,
         degrade_timer: &mut DegradeTimer,
         stale_primaries: &mut StalePrimaries,
+        unseeded: &mut StalePrimaries,
     ) {
         let primary_lsn = topology
             .last_flush_lsns
@@ -286,6 +310,15 @@ impl NodeMonitor {
                 Some(c) => c,
                 None => continue,
             };
+
+            // An empty node has nothing to lose, so seed it without being asked.
+            if result.reachable && !result.has_data && *node_id != topology.primary_node_id {
+                let threshold = self.config.health_check_failures_before_failover;
+                if unseeded.sighted(node_id, threshold, REJOIN_COOLDOWN, Instant::now()) {
+                    self.spawn_seed(node_id);
+                }
+                continue;
+            }
 
             if result.reachable && result.pg_running {
                 tracker.record_success(node_id);
@@ -532,6 +565,7 @@ mod tests {
             streaming_standbys: Vec::new(),
             parameters: Default::default(),
             lost_slots: Vec::new(),
+            has_data: true,
         };
         let primary_host = "pg-replica-1"; // new primary after failover
         assert!(
@@ -555,6 +589,7 @@ mod tests {
             streaming_standbys: Vec::new(),
             parameters: Default::default(),
             lost_slots: Vec::new(),
+            has_data: true,
         };
         let primary_host = "pg-replica-1";
         assert!(
@@ -578,6 +613,7 @@ mod tests {
             streaming_standbys: Vec::new(),
             parameters: Default::default(),
             lost_slots: Vec::new(),
+            has_data: true,
         };
         let primary_host = "pg-replica-1";
         assert!(
@@ -601,6 +637,7 @@ mod tests {
             streaming_standbys: Vec::new(),
             parameters: Default::default(),
             lost_slots: Vec::new(),
+            has_data: true,
         };
         let primary_host = ""; // no primary elected yet
         assert!(

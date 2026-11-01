@@ -33,6 +33,8 @@ The CLI sends the key in the `PGCLUSTER_API_KEY` environment variable.
 | `GET` | `/api/replication` | `200` | Replication mode, fallback state and standbys that need seeding |
 | `POST` | `/api/replication/mode` | `204` | Change the mode online: `{"mode": "async"}`, `"sync"` or `"sync_strict"` |
 | `POST` | `/api/nodes/:node_id/seed` | `202` | Seed a node from the primary. `{"force": true}` discards data already on it |
+| `POST` | `/api/restart` | `202` | Start a rolling restart, on the Raft leader |
+| `GET` | `/api/restart` | `200` | Whether a rolling restart is running on this instance, and any error |
 | `GET` | `/api/members` | `200` | List Raft voters and learners |
 | `POST` | `/api/members` | `201` | Add a learner, `{"id": 4, "addr": "host:7000"}`, and wait for it to catch up |
 | `POST` | `/api/members/:id/promote` | `204` | Promote a learner to voter |

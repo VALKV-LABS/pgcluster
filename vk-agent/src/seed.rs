@@ -106,7 +106,7 @@ async fn base_backup(pg_ctl: &PgCtl, data_dir: &Path, req: &SeedRequest) -> Resu
     Ok(())
 }
 
-async fn has_data(data_dir: &Path) -> Result<bool> {
+pub async fn has_data(data_dir: &Path) -> Result<bool> {
     tokio::fs::try_exists(data_dir.join("PG_VERSION"))
         .await
         .context("check data directory")

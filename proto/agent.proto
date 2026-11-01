@@ -82,6 +82,9 @@ message StatusResponse {
   map<string, string> parameters = 11;
   // Replication slots whose WAL has been removed (wal_status = 'lost').
   repeated string lost_slots = 12;
+  // Whether the data directory holds a cluster. A reachable node without one
+  // is waiting to be seeded.
+  bool has_data = 13;
 }
 
 message ReplicaStatus {

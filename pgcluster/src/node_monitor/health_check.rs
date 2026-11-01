@@ -30,6 +30,8 @@ pub struct HealthCheckResult {
     pub parameters: HashMap<String, String>,
     /// Primary only: slots whose WAL has been removed.
     pub lost_slots: Vec<String>,
+    /// Whether the node has a data directory. Assumed true until it answers.
+    pub has_data: bool,
 }
 
 // ── send_heartbeat ────────────────────────────────────────────────────────────
@@ -118,6 +120,7 @@ async fn query_node(node_id: &str, agent_addr: &str, pool: &AgentClientPool) -> 
                     .collect(),
                 parameters: status.parameters,
                 lost_slots: status.lost_slots,
+                has_data: status.has_data,
             }
         }
         Err(e) => {
@@ -142,5 +145,6 @@ fn unreachable_result(node_id: &str) -> HealthCheckResult {
         streaming_standbys: Vec::new(),
         parameters: HashMap::new(),
         lost_slots: Vec::new(),
+        has_data: true,
     }
 }

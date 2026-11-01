@@ -362,7 +362,7 @@ async fn e2e_cluster_forms_and_has_primary() {
 }
 
 /// The containers on the minority side, which starts with the primary.
-const MINORITY: [&str; 3] = ["pg-primary", "vk-agent-1", "pgcluster-1"];
+const MINORITY: [&str; 2] = ["pg-primary", "pgcluster-1"];
 
 fn psql(service: &str, proxy: &str, sql: &str) -> std::process::Output {
     let conninfo =
@@ -499,7 +499,7 @@ async fn e2e_partition_stops_writes_on_both_sides() {
     // heartbeat_timeout_seconds + fence_timeout_seconds, plus a margin.
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let logs = compose(&["logs", "--no-log-prefix", "vk-agent-1"]);
+        let logs = compose(&["logs", "--no-log-prefix", "pg-primary"]);
         if String::from_utf8_lossy(&logs.stdout).contains("self-fencing") {
             eprintln!("==> Isolated agent self-fenced");
             break;
@@ -690,8 +690,8 @@ async fn e2e_sync_strict_promotes_only_when_both_standbys_answer() {
     set_mode("sync_strict").await;
     wait_for_standby_names(STANDBY_NAMES).await;
 
-    // pg3 keeps running, but its agent cannot answer.
-    docker("stop", "vk-agent-3");
+    // pg3 is frozen, so its agent cannot answer.
+    docker("pause", "pg-replica-2");
     docker("stop", "pg-primary");
     tokio::time::sleep(Duration::from_secs(12)).await;
     let status: serde_json::Value = reqwest::get(format!("{majority_api}/api/status"))
@@ -702,7 +702,7 @@ async fn e2e_sync_strict_promotes_only_when_both_standbys_answer() {
         .expect("parse status");
     assert_eq!(status["primary_node_id"], "pg1", "must not promote yet");
 
-    docker("start", "vk-agent-3");
+    docker("unpause", "pg-replica-2");
     let new_primary = wait_for_new_primary(majority_api, "pg1", Duration::from_secs(60)).await;
     eprintln!("==> Promoted {new_primary} once both standbys answered");
 
@@ -725,10 +725,8 @@ async fn e2e_failover_after_fallback_is_recorded() {
     })
     .await;
 
-    // Stopping Postgres takes its agent with it, because they share a PID
-    // namespace, so each standby's agent needs starting too.
     docker("stop", "pg-primary");
-    for service in ["pg-replica-1", "vk-agent-2", "pg-replica-2", "vk-agent-3"] {
+    for service in ["pg-replica-1", "pg-replica-2"] {
         docker("start", service);
     }
     wait_for_new_primary(majority_api, "pg1", Duration::from_secs(60)).await;
@@ -867,7 +865,6 @@ async fn e2e_diverged_primary_rejoins_with_rewind() {
     create_mode_test_table().await;
     add_and_seed_pg4().await;
 
-    // pg4 is the node vk-agent manages, so make it the primary.
     let switched = reqwest::Client::new()
         .post(format!("{DEFAULT_API}/api/switchover"))
         .bearer_auth("dev-api-key")
@@ -938,6 +935,137 @@ async fn e2e_diverged_primary_rejoins_with_rewind() {
     );
 
     compose(&["--profile", "spare", "down", "-v", "--remove-orphans"]);
+}
+
+/// A rolling restart under client load interrupts commits only around the
+/// switchover, and loses none that were acknowledged.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_rolling_restart_under_load() {
+    let api = "http://localhost:18009";
+    start_stack();
+    create_mode_test_table().await;
+
+    // An application: one connection, reconnecting after any failure.
+    let dsn = "host=localhost port=15432 user=postgres password=test dbname=postgres";
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut acknowledged = Vec::new();
+            let mut failures = Vec::new();
+            let mut session = None;
+            let mut value = 10_000u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                value += 1;
+                if session.is_none() {
+                    match tokio_postgres::connect(dsn, tokio_postgres::NoTls).await {
+                        Ok((client, connection)) => {
+                            tokio::spawn(connection);
+                            session = Some(client);
+                        }
+                        Err(_) => {
+                            failures.push(Instant::now());
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    }
+                }
+                let sql = format!("INSERT INTO mode_test VALUES ({value})");
+                match session.as_ref().unwrap().simple_query(&sql).await {
+                    Ok(_) => acknowledged.push(value),
+                    Err(_) => {
+                        failures.push(Instant::now());
+                        session = None;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            (acknowledged, failures)
+        })
+    };
+
+    // The leader runs it, and any of the three may lead.
+    let client = reqwest::Client::new();
+    let mut leader = None;
+    for port in [8009, 18009, 28009] {
+        let response = client
+            .post(format!("http://localhost:{port}/api/restart"))
+            .bearer_auth("dev-api-key")
+            .send()
+            .await
+            .expect("POST /api/restart");
+        if response.status() == 202 {
+            leader = Some(port);
+            break;
+        }
+    }
+    let leader = leader.expect("one instance must lead");
+
+    wait_until("the rolling restart", Duration::from_secs(240), || {
+        let client = client.clone();
+        async move {
+            let status: serde_json::Value = client
+                .get(format!("http://localhost:{leader}/api/restart"))
+                .send()
+                .await
+                .expect("GET /api/restart")
+                .json()
+                .await
+                .expect("parse restart status");
+            assert!(status["error"].is_null(), "restart stopped: {status}");
+            status["running"] == false
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (acknowledged, failures) = writer.await.expect("writer");
+    eprintln!(
+        "==> {} commits, {} failures",
+        acknowledged.len(),
+        failures.len()
+    );
+    assert!(acknowledged.len() > 100, "the load must have run");
+
+    // Failures must be one short window, the switchover.
+    if let (Some(first), Some(last)) = (failures.first(), failures.last()) {
+        let window = last.duration_since(*first);
+        eprintln!("==> Failures spanned {window:?}");
+        assert!(
+            window < Duration::from_secs(15),
+            "commits failed for {window:?}"
+        );
+    }
+
+    let status: serde_json::Value = reqwest::get(format!("{api}/api/status"))
+        .await
+        .expect("GET /api/status")
+        .json()
+        .await
+        .expect("parse status");
+    assert_ne!(status["primary_node_id"], "pg1", "the primary must move");
+
+    let (pg, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect after the restart");
+    tokio::spawn(connection);
+    let rows = pg
+        .simple_query("SELECT value FROM mode_test WHERE value > 10000")
+        .await
+        .expect("read the writes back");
+    let stored: std::collections::HashSet<u32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    let lost = acknowledged.iter().filter(|v| !stored.contains(v)).count();
+    assert_eq!(lost, 0, "acknowledged commits were lost");
+
+    compose(&["down", "-v", "--remove-orphans"]);
 }
 
 /// Runs switchover only — useful when the stack is already up (E2E_SKIP_BUILD=1).

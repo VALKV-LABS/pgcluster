@@ -10,6 +10,7 @@ pub mod nodes;
 pub mod pg_hba;
 pub mod replication;
 pub mod replication_mode;
+pub mod restart;
 pub mod status;
 pub mod switchover;
 
@@ -39,6 +40,8 @@ pub struct ApiState {
     pub proxy_drain: Option<Arc<ProxyRouter>>,
     /// TLS-aware agent client pool shared by all API handlers.
     pub pool: Arc<AgentClientPool>,
+    /// The most recent rolling restart run from this instance.
+    pub restart_status: Arc<std::sync::Mutex<restart::RestartStatus>>,
 }
 
 impl ApiState {
@@ -59,6 +62,7 @@ impl ApiState {
             op_in_progress,
             proxy_drain,
             pool,
+            restart_status: Default::default(),
         }
     }
 }
@@ -91,6 +95,10 @@ pub fn router(state: ApiState) -> Router {
                 .route("/failover", post(failover::trigger_failover))
                 .route("/failover/history", get(failover::failover_history))
                 .route("/switchover", post(switchover::trigger_switchover))
+                .route(
+                    "/restart",
+                    get(restart::get_restart).post(restart::start_restart),
+                )
                 .route("/replication", get(replication_mode::get_replication))
                 .route("/replication/mode", post(replication_mode::set_mode))
                 .route("/replication/slots", get(replication::list_slots))

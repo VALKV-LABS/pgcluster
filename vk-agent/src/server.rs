@@ -49,6 +49,12 @@ impl AgentServiceImpl {
         }
     }
 
+    async fn has_data(&self) -> bool {
+        crate::seed::has_data(Path::new(&self.config.data_dir))
+            .await
+            .unwrap_or(false)
+    }
+
     /// Stop Postgres. When this agent owns the process it starts it again, so a
     /// demoted primary comes back as a standby. Otherwise its owner restarts it.
     async fn stop_and_restart(&self) -> anyhow::Result<()> {
@@ -227,6 +233,7 @@ impl AgentService for AgentServiceImpl {
                 replication_conninfo: String::new(),
                 parameters: Default::default(),
                 lost_slots: vec![],
+                has_data: self.has_data().await,
             }));
         }
 
@@ -248,6 +255,7 @@ impl AgentService for AgentServiceImpl {
                     replication_conninfo: String::new(),
                     parameters: Default::default(),
                     lost_slots: vec![],
+                    has_data: self.has_data().await,
                 }));
             }
         };
@@ -302,6 +310,7 @@ impl AgentService for AgentServiceImpl {
             replication_conninfo,
             parameters,
             lost_slots,
+            has_data: true,
         }))
     }
 

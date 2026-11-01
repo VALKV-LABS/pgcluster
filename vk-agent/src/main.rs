@@ -77,6 +77,20 @@ async fn main() -> Result<()> {
         });
     }
 
+    // After a restart, bring back the Postgres this agent owns. An unseeded node
+    // has none yet, and pgcluster seeds it.
+    if config.manage_postgres
+        && vk_agent::seed::has_data(std::path::Path::new(&config.data_dir)).await?
+        && !pg_ctl.is_running().await.unwrap_or(false)
+    {
+        let ctl = pg_ctl.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ctl.start().await {
+                tracing::error!(err = %e, "could not start postgres");
+            }
+        });
+    }
+
     let svc = AgentServiceImpl::new(Arc::new(config.clone()), heartbeat, Arc::new(pg), pg_ctl);
 
     let addr: SocketAddr = config.listen_addr.parse()?;

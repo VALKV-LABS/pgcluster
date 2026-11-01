@@ -1,5 +1,6 @@
 pub mod handoff;
 pub mod lag_wait;
+pub mod rolling;
 
 use anyhow::Result;
 use std::sync::Arc;

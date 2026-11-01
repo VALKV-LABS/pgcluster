@@ -36,12 +36,20 @@
 # Read from replica-2 directly
 # psql postgres://postgres:test@localhost:5492/myapp -c "SELECT * FROM users;"
 
+x-node: &node
+  build:
+    context: ..
+    dockerfile: docker/vk-agent.Dockerfile
+  init: true
+  restart: unless-stopped
+  entrypoint: ["/bin/sh", "/usr/local/bin/node-entry.sh"]
+
 services:
 
   # ── Certificates ────────────────────────────────────────────────────────────
 
-  # Issues every certificate in the stack from one CA. Postgres and vk-agent run
-  # as uid 999 and must be able to read their own keys.
+  # Issues every certificate in the stack from one CA. Nodes run as uid 999 and
+  # must be able to read their own keys.
   certs:
     build:
       context: ..
@@ -50,9 +58,8 @@ services:
     command:
       - >-
         pgcluster certs --out /certs
-        pg-primary pg-replica-1 pg-replica-2
-        vk-agent-1 vk-agent-2 vk-agent-3
-        vk-agent-4 pg-new
+        pg-primary pg-replica-1 pg-replica-2 pg-new
+        vk-agent-1 vk-agent-2 vk-agent-3 vk-agent-4
         pgcluster-1 pgcluster-2 pgcluster-3 &&
         chown 999:999 /certs/pg-*.key /certs/vk-agent-*.key
     volumes:
@@ -60,163 +67,107 @@ services:
 
   # ── Postgres nodes ──────────────────────────────────────────────────────────
 
+  # One container per node, in which vk-agent owns Postgres. pg-primary creates
+  # the first primary, and the others start empty until the leader seeds them.
   pg-primary:
-    networks: [default, side-a]
-    image: postgres:16-bookworm
-    init: true
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: test
-      POSTGRES_DB: postgres
-      POSTGRES_INITDB_ARGS: --data-checksums
-    command: >
-      postgres
-        -c wal_level=replica
-        -c max_wal_senders=10
-        -c max_replication_slots=10
-        -c hot_standby=on
-        -c listen_addresses='*'
-        -c hba_file=/etc/postgresql/pg_hba.conf
-        -c ssl=on
-        -c ssl_cert_file=/certs/pg-primary.crt
-        -c ssl_key_file=/certs/pg-primary.key
-    ports:
-      - "5490:5432"
-    volumes:
-      - pg-primary-data:/var/lib/postgresql/data
-      - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
-      - ./copy-hba.sh:/docker-entrypoint-initdb.d/copy-hba.sh:ro
-      - certs:/certs:ro
+    <<: *node
     depends_on:
       certs:
         condition: service_completed_successfully
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 2s
-      timeout: 5s
-      retries: 15
-
-  pg-replica-1:
-    networks: [default, side-b]
-    image: postgres:16-bookworm
-    init: true
-    restart: unless-stopped
+    networks:
+      default:
+        aliases: [vk-agent-1]
+      side-a:
+        aliases: [vk-agent-1]
     environment:
-      POSTGRES_USER: postgres
       POSTGRES_PASSWORD: test
-      PGDATA: /var/lib/postgresql/data
-      PG_TLS_NAME: pg-replica-1
-      PG_NODE_ID: pg2
-    depends_on:
-      pg-primary:
-        condition: service_healthy
+      PG_TLS_NAME: pg-primary
+      PG_BOOTSTRAP: "1"
     ports:
-      - "5491:5432"
-    volumes:
-      - pg-replica-1-data:/var/lib/postgresql/data
-      - ./init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh:ro
-      - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
-      - certs:/certs:ro
-    entrypoint: ["/docker-entrypoint-initdb.d/init-replica.sh", "pg-primary"]
-
-  pg-replica-2:
-    networks: [default, side-b]
-    image: postgres:16-bookworm
-    init: true
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: test
-      PGDATA: /var/lib/postgresql/data
-      PG_TLS_NAME: pg-replica-2
-      PG_NODE_ID: pg3
-    depends_on:
-      pg-primary:
-        condition: service_healthy
-    ports:
-      - "5492:5432"
-    volumes:
-      - pg-replica-2-data:/var/lib/postgresql/data
-      - ./init-replica.sh:/docker-entrypoint-initdb.d/init-replica.sh:ro
-      - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
-      - certs:/certs:ro
-    entrypoint: ["/docker-entrypoint-initdb.d/init-replica.sh", "pg-primary"]
-
-  # ── vk-agent sidecars ───────────────────────────────────────────────────────
-
-  vk-agent-1:
-    networks: [default, side-a]
-    build:
-      context: ..
-      dockerfile: docker/vk-agent.Dockerfile
-    pid: "service:pg-primary"
-    # restart: on-failure ensures that when pg-primary restarts (and its PID
-    # namespace changes), Docker also restarts vk-agent-1 to re-attach to the
-    # new namespace. "unless-stopped" would suppress this auto-restart.
-    restart: on-failure
-    depends_on:
-      pg-primary:
-        condition: service_healthy
-    ports:
+      - "5490:5432"
       - "7001:7001"
     volumes:
       - pg-primary-data:/var/lib/postgresql/data
+      - ./node-entry.sh:/usr/local/bin/node-entry.sh:ro
+      - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
       - ./configs/vk-agent-pg1.toml:/etc/vk-agent/config.toml:ro
       - certs:/certs:ro
     healthcheck:
-      test: ["CMD-SHELL", "grpc_health_probe -addr=:7001 || exit 0"]
-      interval: 3s
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
+      interval: 2s
       timeout: 5s
-      retries: 10
+      retries: 60
 
-  vk-agent-2:
-    networks: [default, side-b]
-    build:
-      context: ..
-      dockerfile: docker/vk-agent.Dockerfile
-    pid: "service:pg-replica-1"
-    restart: on-failure
+  pg-replica-1:
+    <<: *node
     depends_on:
-      pg-replica-1:
-        condition: service_started
+      pg-primary:
+        condition: service_healthy
+    networks:
+      default:
+        aliases: [vk-agent-2]
+      side-b:
+        aliases: [vk-agent-2]
+    environment:
+      POSTGRES_PASSWORD: test
+      PG_TLS_NAME: pg-replica-1
     ports:
+      - "5491:5432"
       - "17001:7001"
     volumes:
       - pg-replica-1-data:/var/lib/postgresql/data
+      - ./node-entry.sh:/usr/local/bin/node-entry.sh:ro
+      - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
       - ./configs/vk-agent-pg2.toml:/etc/vk-agent/config.toml:ro
       - certs:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
 
-  vk-agent-3:
-    networks: [default, side-b]
-    build:
-      context: ..
-      dockerfile: docker/vk-agent.Dockerfile
-    pid: "service:pg-replica-2"
-    restart: on-failure
+  pg-replica-2:
+    <<: *node
     depends_on:
-      pg-replica-2:
-        condition: service_started
+      pg-primary:
+        condition: service_healthy
+    networks:
+      default:
+        aliases: [vk-agent-3]
+      side-b:
+        aliases: [vk-agent-3]
+    environment:
+      POSTGRES_PASSWORD: test
+      PG_TLS_NAME: pg-replica-2
     ports:
+      - "5492:5432"
       - "27001:7001"
     volumes:
       - pg-replica-2-data:/var/lib/postgresql/data
+      - ./node-entry.sh:/usr/local/bin/node-entry.sh:ro
+      - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
       - ./configs/vk-agent-pg3.toml:/etc/vk-agent/config.toml:ro
       - certs:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
 
-  # A spare node for tests of seeding. It runs only vk-agent, with an empty data
-  # directory, and the agent starts Postgres once it has seeded.
+  # A spare node for tests of seeding. It has an empty data directory.
   vk-agent-4:
+    <<: *node
     profiles: [spare]
-    build:
-      context: ..
-      dockerfile: docker/vk-agent.Dockerfile
     hostname: pg-new
     networks:
       default:
         aliases: [pg-new]
+    environment:
+      POSTGRES_PASSWORD: test
+      PG_TLS_NAME: pg-new
     volumes:
       - pg-new-data:/var/lib/postgresql/data
+      - ./node-entry.sh:/usr/local/bin/node-entry.sh:ro
       - ./configs/vk-agent-pg4.toml:/etc/vk-agent/config.toml:ro
       - certs:/certs:ro
 
@@ -230,12 +181,8 @@ services:
     environment:
       POSTGRES_PASSWORD: test
     depends_on:
-      vk-agent-1:
-        condition: service_started
-      vk-agent-2:
-        condition: service_started
-      vk-agent-3:
-        condition: service_started
+      pg-primary:
+        condition: service_healthy
     volumes:
       - ./configs/pgcluster-1.toml:/etc/pgcluster/config.toml:ro
       - certs:/certs:ro

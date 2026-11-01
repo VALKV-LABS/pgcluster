@@ -231,6 +231,12 @@ impl ConnectionPool {
         conn.mark_idle();
         let _ = conn.touch().await;
         let mut idle = bucket.idle.lock().await;
+        // Every login brings its own connection, so short-lived clients would
+        // otherwise pile up backends until Postgres runs out.
+        if idle.len() >= bucket.max {
+            idle.remove(0);
+            bucket.decrement();
+        }
         idle.push(conn);
         drop(idle);
         bucket.released.notify_one();

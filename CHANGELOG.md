@@ -11,6 +11,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Breaking:** `[tls] auto_generate` and `pgcluster init --gen-certs` are gone, because they gave each node its own CA. Use `pgcluster certs`.
 
 ### Fixed
+- The proxy caps the idle backends it keeps per database and user. Each login added one, so short-lived clients could exhaust Postgres connections.
 - Switchover stops the old primary before promoting the target, then creates slots on the new primary. Before, standbys could not follow the new primary after a switchover.
 - Repointing a standby applies with a reload, so standbys follow a new primary after a failover without a restart.
 - Health checks time out, so a node that vanishes without a connection reset no longer stalls the monitor and blocks failover.
@@ -33,6 +34,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `vk-agent` starts with no Postgres running, and skips self-fencing while there is none to fence.
 
 ### Added
+- Rolling restart through `POST /api/restart`: standbys one at a time, then a switchover, which restarts the old primary as a standby.
+- An empty node seeds itself from the primary as soon as the leader can reach its agent.
+- `vk-agent` starts the Postgres it manages when it starts.
 - A diverged old primary rejoins by itself as a standby, with `pg_rewind`, and is seeded again if that fails. `manage_postgres = false` opts an agent out, for when something else owns the Postgres process.
 - `POST /api/nodes/:id/seed` seeds a node from the primary through `vk-agent`.
 - Raft membership changes through `/api/members`: add a learner, promote it, and remove a member.

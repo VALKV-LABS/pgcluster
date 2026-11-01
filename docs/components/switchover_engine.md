@@ -195,3 +195,7 @@ match *write_pause.lock().await {
 - `vk_agent` receives Promote and Demote gRPC calls.
 - `raft_consensus` commits the `SetPrimary` topology change at step 8.
 - `event_tx` channel delivers the event to REST API push and alerting webhook.
+
+## Rolling restart
+
+`POST /api/restart` restarts every node: each standby in turn, waiting until it streams again, then a switchover to the most current standby, which restarts the old primary as a standby. The primary moves, and stays moved. It stops at the first failure, and refuses to start if a standby is already unhealthy.
