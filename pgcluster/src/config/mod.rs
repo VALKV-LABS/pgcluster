@@ -343,31 +343,6 @@ fn default_public_read() -> bool {
 
 // ── [backup] ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum BackupFrequency {
-    Daily,
-    Weekly,
-    Monthly,
-}
-
-impl std::fmt::Display for BackupFrequency {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Daily => write!(f, "daily"),
-            Self::Weekly => write!(f, "weekly"),
-            Self::Monthly => write!(f, "monthly"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackupScheduleEntry {
-    pub frequency: BackupFrequency,
-    /// Number of completed backups of this frequency to retain.
-    pub retain: u32,
-}
-
 /// S3-compatible object storage configuration.
 /// Credentials are read from the environment: AWS_ACCESS_KEY_ID,
 /// AWS_SECRET_ACCESS_KEY, and optionally AWS_SESSION_TOKEN.
@@ -388,19 +363,40 @@ pub struct S3Config {
     pub path_style: bool,
 }
 
-/// Backup policy configuration. When this section is present, [backup.s3]
-/// is mandatory — pgcluster refuses to start without a valid S3 destination.
+/// A directory for backups, such as a mounted network share. It must be
+/// reachable at the same path from every node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PosixConfig {
+    pub path: String,
+}
+
+/// Backup policy configuration. Set exactly one of `[backup.s3]` and
+/// `[backup.posix]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupConfig {
     #[serde(default = "default_backup_enabled")]
     pub enabled: bool,
-    pub s3: S3Config,
-    /// Prefer running pg_basebackup against a replica (reduces primary load).
-    /// Falls back to the primary if no healthy replica is available.
+    #[serde(default)]
+    pub s3: Option<S3Config>,
+    #[serde(default)]
+    pub posix: Option<PosixConfig>,
+    /// Back up from a standby when one is healthy.
     #[serde(default = "default_prefer_replica")]
     pub prefer_replica: bool,
-    /// One entry per frequency tier. At least one entry is required.
-    pub schedule: Vec<BackupScheduleEntry>,
+    /// Seconds between backups.
+    #[serde(default = "default_backup_interval")]
+    pub interval_seconds: u64,
+    /// Delta backups between full ones: 6 with a daily interval gives a weekly
+    /// full backup.
+    #[serde(default = "default_delta_steps")]
+    pub delta_steps: u32,
+    /// Full backups to keep, with the deltas and WAL that depend on them.
+    #[serde(default = "default_retain_full")]
+    pub retain_full: u32,
+    /// Environment variable holding a base64 32-byte key. When set, data is
+    /// encrypted on the node before upload. Losing the key loses the backups.
+    #[serde(default)]
+    pub encryption_key_env: Option<String>,
 }
 
 fn default_backup_enabled() -> bool {
@@ -408,6 +404,15 @@ fn default_backup_enabled() -> bool {
 }
 fn default_prefer_replica() -> bool {
     true
+}
+fn default_backup_interval() -> u64 {
+    24 * 3600
+}
+fn default_delta_steps() -> u32 {
+    6
+}
+fn default_retain_full() -> u32 {
+    4
 }
 
 // ── Load helper ───────────────────────────────────────────────────────────────

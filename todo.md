@@ -39,9 +39,9 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 - [x] **5.2 Move node seeding into `vk-agent`.** It lives in `docker/init-replica.sh` today. *Done when:* a new node seeds through an RPC, from the primary.
 - [x] **5.3 Rejoin an old primary with `pg_rewind`.** Re-seed if rewind fails. *Done when:* a diverged old primary rejoins automatically, by test.
 - [x] **5.4 Add rolling restart.** Standbys, then switchover, then the old primary. *Done when:* it completes under client load with no failed commits beyond the switchover.
-- [ ] **5.5 Add a WAL-G engine to the backup coordinator.** Behind a small engine interface, run by `vk-agent`, with data checksums and a pinned version. Weekly full, daily delta. *Done when:* scheduled backups run from a standby and survive a leader change.
-- [ ] **5.6 Add WAL archiving.** `archive_command` runs `wal-g wal-push`. *Done when:* archiving works from whichever node is primary, including after failover, and `wal-g wal-verify` finds no gaps.
-- [ ] **5.7 Add restore.** Seed from backup, and restore to a point in time with `wal-g backup-fetch` and `wal-fetch`. *Done when:* a point-in-time restore is verified by automated test, and 5.2 can seed from backup.
+- [x] **5.5 Add a WAL-G engine to the backup coordinator.** Behind backup RPCs that name no tool, run by `vk-agent`, with data checksums and a pinned version. Weekly full, daily delta. *Done when:* scheduled backups run from a standby and survive a leader change.
+- [x] **5.6 Add WAL archiving.** `archive_command` runs `wal-g wal-push`. *Done when:* archiving works from whichever node is primary, including after failover, and `wal-g wal-verify` finds no gaps.
+- [x] **5.7 Add restore.** Seed from backup, and restore to a point in time with `wal-g backup-fetch` and `wal-fetch`. *Done when:* a point-in-time restore is verified by automated test, and 5.2 can seed from backup.
 - [ ] **5.8 Test one-node recovery.** *Done when:* a one-node cluster recovers after its VM is replaced and its volume reattached.
 - [ ] **5.9 Add an external standby role.** Excluded from failover and from Raft. *Done when:* it follows the primary and can be promoted into an independent cluster.
 - [ ] **5.10 Release `v0.2.0`.** *Done when:* the full end-to-end suite passes and images are published.

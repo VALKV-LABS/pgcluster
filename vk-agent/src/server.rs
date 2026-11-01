@@ -13,10 +13,11 @@ use tonic::{Request, Response, Status};
 
 use agent::agent_service_server::{AgentService, AgentServiceServer};
 use agent::{
-    DemoteRequest, DemoteResponse, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
-    PromoteResponse, ReloadRequest, ReloadResponse, SeedRequest, SeedResponse,
-    SetParametersRequest, SetParametersResponse, StatusRequest, StatusResponse, StopRequest,
-    StopResponse,
+    BackupDeleteRequest, BackupDeleteResponse, BackupPushRequest, BackupPushResponse,
+    BackupVerifyRequest, BackupVerifyResponse, ConfigureBackupsRequest, DemoteRequest,
+    DemoteResponse, HeartbeatRequest, HeartbeatResponse, PromoteRequest, PromoteResponse,
+    ReloadRequest, ReloadResponse, RestoreRequest, SeedRequest, SeedResponse, SetParametersRequest,
+    SetParametersResponse, StatusRequest, StatusResponse, StopRequest, StopResponse,
 };
 
 use crate::config::AgentConfig;
@@ -24,6 +25,7 @@ use crate::heartbeat::HeartbeatTracker;
 use crate::postgres::LocalPostgres;
 use crate::process::PgCtl;
 use crate::standby::configure_standby;
+use crate::walg::WalG;
 
 pub struct AgentServiceImpl {
     config: Arc<AgentConfig>,
@@ -31,6 +33,7 @@ pub struct AgentServiceImpl {
     pg: Arc<LocalPostgres>,
     pg_ctl: Arc<PgCtl>,
     seeding: Mutex<()>,
+    walg: WalG,
 }
 
 impl AgentServiceImpl {
@@ -40,12 +43,14 @@ impl AgentServiceImpl {
         pg: Arc<LocalPostgres>,
         pg_ctl: Arc<PgCtl>,
     ) -> Self {
+        let walg = WalG::new(&config);
         Self {
             config,
             heartbeat,
             pg,
             pg_ctl,
             seeding: Mutex::new(()),
+            walg,
         }
     }
 
@@ -209,6 +214,96 @@ impl AgentService for AgentServiceImpl {
         }))
     }
 
+    async fn configure_backups(
+        &self,
+        request: Request<ConfigureBackupsRequest>,
+    ) -> Result<Response<SeedResponse>, Status> {
+        let req = request.into_inner();
+        let result = self
+            .walg
+            .configure(&self.pg, &req.settings, &req.version)
+            .await;
+        Ok(Response::new(SeedResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        }))
+    }
+
+    async fn backup_push(
+        &self,
+        _request: Request<BackupPushRequest>,
+    ) -> Result<Response<BackupPushResponse>, Status> {
+        let data_dir = Path::new(&self.config.data_dir);
+        Ok(Response::new(match self.walg.backup_push(data_dir).await {
+            Ok((backup_name, size_bytes)) => BackupPushResponse {
+                success: true,
+                error: String::new(),
+                backup_name,
+                size_bytes,
+            },
+            Err(e) => BackupPushResponse {
+                success: false,
+                error: format!("{e:#}"),
+                ..Default::default()
+            },
+        }))
+    }
+
+    async fn backup_delete(
+        &self,
+        request: Request<BackupDeleteRequest>,
+    ) -> Result<Response<BackupDeleteResponse>, Status> {
+        let req = request.into_inner();
+        Ok(Response::new(
+            match self.walg.delete(req.retain_full, &req.target).await {
+                Ok(remaining) => BackupDeleteResponse {
+                    success: true,
+                    error: String::new(),
+                    remaining,
+                },
+                Err(e) => BackupDeleteResponse {
+                    success: false,
+                    error: format!("{e:#}"),
+                    remaining: vec![],
+                },
+            },
+        ))
+    }
+
+    async fn backup_verify(
+        &self,
+        _request: Request<BackupVerifyRequest>,
+    ) -> Result<Response<BackupVerifyResponse>, Status> {
+        Ok(Response::new(match self.walg.verify().await {
+            Ok(report) => BackupVerifyResponse {
+                success: true,
+                error: String::new(),
+                report,
+            },
+            Err(e) => BackupVerifyResponse {
+                success: false,
+                error: format!("{e:#}"),
+                report: String::new(),
+            },
+        }))
+    }
+
+    async fn restore(
+        &self,
+        request: Request<RestoreRequest>,
+    ) -> Result<Response<SeedResponse>, Status> {
+        let data_dir = Path::new(&self.config.data_dir);
+        let req = request.into_inner();
+        let result = match self.begin_lifecycle_change() {
+            Ok(_guard) => self.walg.restore(&self.pg_ctl, data_dir, &req).await,
+            Err(e) => Err(e),
+        };
+        Ok(Response::new(SeedResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        }))
+    }
+
     /// Return current node status: role, LSNs, timeline, version, connection
     /// count, and replication info.
     async fn get_status(
@@ -234,6 +329,7 @@ impl AgentService for AgentServiceImpl {
                 parameters: Default::default(),
                 lost_slots: vec![],
                 has_data: self.has_data().await,
+                backup_config_version: self.walg.config_version().await,
             }));
         }
 
@@ -256,6 +352,7 @@ impl AgentService for AgentServiceImpl {
                     parameters: Default::default(),
                     lost_slots: vec![],
                     has_data: self.has_data().await,
+                    backup_config_version: self.walg.config_version().await,
                 }));
             }
         };
@@ -311,6 +408,7 @@ impl AgentService for AgentServiceImpl {
             parameters,
             lost_slots,
             has_data: true,
+            backup_config_version: self.walg.config_version().await,
         }))
     }
 

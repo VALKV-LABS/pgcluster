@@ -22,6 +22,7 @@ if [ -n "${PG_BOOTSTRAP:-}" ] && [ ! -f "${PGDATA}/PG_VERSION" ]; then
   cat >> "${PGDATA}/postgresql.conf" <<CONF
 listen_addresses = '*'
 wal_level = replica
+archive_mode = on
 max_wal_senders = 10
 max_replication_slots = 10
 hot_standby = on

@@ -4,10 +4,11 @@ use pgcluster::agent_clients::agent_proto::agent_service_server::{
     AgentService, AgentServiceServer,
 };
 use pgcluster::agent_clients::agent_proto::{
-    DemoteRequest, DemoteResponse, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
-    PromoteResponse, ReloadRequest, ReloadResponse, SeedRequest, SeedResponse,
-    SetParametersRequest, SetParametersResponse, StatusRequest, StatusResponse, StopRequest,
-    StopResponse,
+    BackupDeleteRequest, BackupDeleteResponse, BackupPushRequest, BackupPushResponse,
+    BackupVerifyRequest, BackupVerifyResponse, ConfigureBackupsRequest, DemoteRequest,
+    DemoteResponse, HeartbeatRequest, HeartbeatResponse, PromoteRequest, PromoteResponse,
+    ReloadRequest, ReloadResponse, RestoreRequest, SeedRequest, SeedResponse, SetParametersRequest,
+    SetParametersResponse, StatusRequest, StatusResponse, StopRequest, StopResponse,
 };
 use pgcluster::agent_clients::AgentClientPool;
 use pgcluster::failover::candidate::pick_live_candidate;
@@ -74,6 +75,30 @@ impl AgentService for FakeAgent {
     }
     async fn rewind(&self, _: Request<SeedRequest>) -> RpcResult<SeedResponse> {
         Err(Status::unimplemented("rewind"))
+    }
+    async fn configure_backups(
+        &self,
+        _: Request<ConfigureBackupsRequest>,
+    ) -> RpcResult<SeedResponse> {
+        Err(Status::unimplemented("configure_backups"))
+    }
+    async fn backup_push(&self, _: Request<BackupPushRequest>) -> RpcResult<BackupPushResponse> {
+        Err(Status::unimplemented("backup_push"))
+    }
+    async fn backup_delete(
+        &self,
+        _: Request<BackupDeleteRequest>,
+    ) -> RpcResult<BackupDeleteResponse> {
+        Err(Status::unimplemented("backup_delete"))
+    }
+    async fn backup_verify(
+        &self,
+        _: Request<BackupVerifyRequest>,
+    ) -> RpcResult<BackupVerifyResponse> {
+        Err(Status::unimplemented("backup_verify"))
+    }
+    async fn restore(&self, _: Request<RestoreRequest>) -> RpcResult<SeedResponse> {
+        Err(Status::unimplemented("restore"))
     }
 }
 

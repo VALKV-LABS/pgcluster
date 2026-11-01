@@ -256,6 +256,11 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         let fcfg = cfg.failover.clone();
         let mon_metrics = metrics.clone();
         let replication = cfg.replication.clone();
+        let backup_settings = cfg
+            .backup
+            .as_ref()
+            .filter(|b| b.enabled)
+            .map(backup::walg::settings);
         let repl_password =
             std::env::var(&cfg.replication.replication_password_env).unwrap_or_default();
         tasks.push(tokio::spawn(async move {
@@ -266,6 +271,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                 fcfg,
                 mon_metrics,
                 &replication,
+                backup_settings,
                 repl_password,
                 op_in_progress.clone(),
                 quorum,
@@ -276,19 +282,13 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
     // Backup scheduler (only started when [backup] section is present in config)
     if let Some(backup_cfg) = cfg.backup.clone() {
-        let raft = raft_node.clone();
-        let topo = topology_rx.clone();
-        let repl_user = cfg.replication.replication_user.clone();
-        let repl_password =
-            std::env::var(&cfg.replication.replication_password_env).unwrap_or_default();
-        tasks.push(tokio::spawn(async move {
-            match backup::BackupScheduler::new(raft, topo, backup_cfg, repl_user, repl_password) {
-                Ok(mut scheduler) => scheduler.run().await,
-                Err(e) => {
-                    error!(err = %e, "backup scheduler failed to initialize (check S3 config)")
-                }
-            }
-        }));
+        let mut scheduler = backup::BackupScheduler::new(
+            raft_node.clone(),
+            topology_rx.clone(),
+            backup_cfg,
+            pool.clone(),
+        );
+        tasks.push(tokio::spawn(async move { scheduler.run().await }));
     }
 
     info!(raft_grpc = %raft_grpc_addr, api = %cfg.api.listen_addr,

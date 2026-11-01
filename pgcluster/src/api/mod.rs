@@ -42,6 +42,8 @@ pub struct ApiState {
     pub pool: Arc<AgentClientPool>,
     /// The most recent rolling restart run from this instance.
     pub restart_status: Arc<std::sync::Mutex<restart::RestartStatus>>,
+    /// The most recent restore run from this instance.
+    pub restore_status: Arc<std::sync::Mutex<restart::RestartStatus>>,
 }
 
 impl ApiState {
@@ -63,6 +65,7 @@ impl ApiState {
             proxy_drain,
             pool,
             restart_status: Default::default(),
+            restore_status: Default::default(),
         }
     }
 }
@@ -111,6 +114,11 @@ pub fn router(state: ApiState) -> Router {
                 .route(
                     "/backups",
                     get(backup::list_backups).post(backup::trigger_backup),
+                )
+                .route("/backups/verify", get(backup::verify_backups))
+                .route(
+                    "/backups/restore",
+                    get(backup::get_restore).post(backup::start_restore),
                 )
                 .route(
                     "/backups/:backup_id",

@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use anyhow::{anyhow, bail, Result};
 use tracing::warn;
 
 use super::slots;
-use crate::agent_clients::agent_proto::SeedRequest;
+use crate::agent_clients::agent_proto::{RestoreRequest, SeedRequest};
 use crate::agent_clients::AgentClientPool;
 use crate::config::ReplicationConfig;
 use crate::raft::topology::ClusterTopology;
@@ -58,6 +60,32 @@ impl SeedPlan {
         self.ensure_slot().await?;
         let mut client = pool.get_or_connect(&self.node_id, &self.agent_addr).await?;
         let response = client.seed(self.request(force)).await?;
+        if !response.success {
+            bail!("{}", response.error);
+        }
+        Ok(())
+    }
+
+    /// Create the node's slot on the primary, then have its agent restore the
+    /// latest backup and follow the primary. This spares the primary the load
+    /// of a base backup.
+    pub async fn run_from_backup(
+        &self,
+        pool: &AgentClientPool,
+        settings: HashMap<String, String>,
+        force: bool,
+    ) -> Result<()> {
+        self.ensure_slot().await?;
+        let mut client = pool.get_or_connect(&self.node_id, &self.agent_addr).await?;
+        let response = client
+            .restore(RestoreRequest {
+                backup_name: String::new(),
+                target_time: String::new(),
+                force,
+                standby: Some(self.request(false)),
+                settings,
+            })
+            .await?;
         if !response.success {
             bail!("{}", response.error);
         }

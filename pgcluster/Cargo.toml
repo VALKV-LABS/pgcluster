@@ -63,7 +63,6 @@ prometheus = { version = "0.13", features = ["process"] }
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "chrono"] }
 
 # Backup
-object_store = { version = "0.10", features = ["aws"] }
 tempfile     = "3"
 tokio-stream = { version = "0.1", features = ["net"] }
 

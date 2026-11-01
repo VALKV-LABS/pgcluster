@@ -784,6 +784,10 @@ async fn e2e_dead_standby_past_the_limit_is_flagged() {
 
 /// Add the spare node and wait until it streams from the primary.
 async fn add_and_seed_pg4() {
+    add_and_seed_pg4_from(false).await;
+}
+
+async fn add_and_seed_pg4_from(from_backup: bool) {
     compose(&[
         "--profile",
         "spare",
@@ -811,7 +815,7 @@ async fn add_and_seed_pg4() {
     let seeded = client
         .post(format!("{DEFAULT_API}/api/nodes/pg4/seed"))
         .bearer_auth("dev-api-key")
-        .json(&serde_json::json!({}))
+        .json(&serde_json::json!({ "from_backup": from_backup }))
         .send()
         .await
         .expect("POST /api/nodes/pg4/seed");
@@ -1066,6 +1070,299 @@ async fn e2e_rolling_restart_under_load() {
     assert_eq!(lost, 0, "acknowledged commits were lost");
 
     compose(&["down", "-v", "--remove-orphans"]);
+}
+
+// ── Backups ───────────────────────────────────────────────────────────────────
+
+async fn backups(api: &str) -> Vec<serde_json::Value> {
+    let Ok(response) = reqwest::get(format!("{api}/api/backups")).await else {
+        return Vec::new();
+    };
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    body["backups"].as_array().cloned().unwrap_or_default()
+}
+
+async fn wait_for_backup(api: &str) -> serde_json::Value {
+    wait_until("a backup", Duration::from_secs(90), || async {
+        !backups(api).await.is_empty()
+    })
+    .await;
+    backups(api).await.remove(0)
+}
+
+fn service_of(node_id: &str) -> &'static str {
+    match node_id {
+        "pg1" => "pg-primary",
+        "pg2" => "pg-replica-1",
+        "pg3" => "pg-replica-2",
+        other => panic!("unknown node {other}"),
+    }
+}
+
+fn exec_sql(service: &str, sql: &str) -> String {
+    let out = Command::new("docker")
+        .args(["compose", "-f", COMPOSE_FILE, "exec", "-T", service])
+        .args(["psql", "-U", "postgres", "-Atc", sql])
+        .current_dir(project_root())
+        .output()
+        .expect("docker compose exec psql");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Scheduled backups come from a standby, and carry on under a new leader.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_backups_run_from_a_standby_and_survive_a_leader_change() {
+    start_stack();
+    create_mode_test_table().await;
+
+    wait_until(
+        "a backup from a standby",
+        Duration::from_secs(90),
+        || async {
+            backups(DEFAULT_API)
+                .await
+                .iter()
+                .any(|b| b["source_node"] != "pg1")
+        },
+    )
+    .await;
+
+    let status: serde_json::Value = reqwest::get(format!("{DEFAULT_API}/api/status"))
+        .await
+        .expect("GET /api/status")
+        .json()
+        .await
+        .expect("parse status");
+    let leader = status["raft_leader_id"].as_u64().expect("a leader");
+    let survivor = if leader == 1 {
+        "http://localhost:18009"
+    } else {
+        DEFAULT_API
+    };
+    let newest_before = backups(survivor).await[0]["completed_at"].clone();
+    docker("stop", &format!("pgcluster-{leader}"));
+    eprintln!("==> Stopped the leader, pgcluster-{leader}");
+
+    wait_until(
+        "a backup under the new leader",
+        Duration::from_secs(90),
+        || {
+            let newest_before = newest_before.as_i64();
+            async move {
+                backups(survivor)
+                    .await
+                    .first()
+                    .is_some_and(|b| b["completed_at"].as_i64() > newest_before)
+            }
+        },
+    )
+    .await;
+
+    compose(&["down", "-v", "--remove-orphans"]);
+}
+
+/// WAL keeps archiving from whichever node is primary, with no gaps.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_wal_archiving_follows_failover() {
+    let api = "http://localhost:18009";
+    start_stack();
+    create_mode_test_table().await;
+    wait_for_backup(api).await;
+
+    exec_sql(
+        "pg-primary",
+        "INSERT INTO mode_test VALUES (1); SELECT pg_switch_wal()",
+    );
+    wait_until(
+        "the old primary to archive",
+        Duration::from_secs(30),
+        || async {
+            exec_sql(
+                "pg-primary",
+                "SELECT archived_count > 0 FROM pg_stat_archiver",
+            ) == "t"
+        },
+    )
+    .await;
+
+    docker("stop", "pg-primary");
+    let new_primary = wait_for_new_primary(api, "pg1", Duration::from_secs(60)).await;
+    let service = service_of(&new_primary);
+    eprintln!("==> Promoted {new_primary}");
+
+    exec_sql(
+        service,
+        "INSERT INTO mode_test VALUES (2); SELECT pg_switch_wal()",
+    );
+    wait_until(
+        "the new primary to archive",
+        Duration::from_secs(60),
+        || async { exec_sql(service, "SELECT archived_count > 0 FROM pg_stat_archiver") == "t" },
+    )
+    .await;
+    assert_eq!(
+        exec_sql(service, "SELECT failed_count FROM pg_stat_archiver"),
+        "0"
+    );
+
+    // Archived WAL must be unreadable without the key. With it, the same fetch
+    // proves the file is there.
+    let fetch = |config: &str| {
+        let script = format!(
+            "{config} wal-g wal-fetch \
+             \"$(ls /backups/wal_005 | head -1 | cut -d. -f1)\" /tmp/fetched"
+        );
+        Command::new("docker")
+            .args(["compose", "-f", COMPOSE_FILE, "exec", "-T", service])
+            .args(["sh", "-c", &script])
+            .current_dir(project_root())
+            .output()
+            .expect("docker compose exec wal-g")
+    };
+    let with_key = fetch("WALG_CONFIG_PATH=/var/lib/postgresql/walg.json");
+    assert!(
+        with_key.status.success(),
+        "{}",
+        String::from_utf8_lossy(&with_key.stderr)
+    );
+    let without_key = fetch("WALG_CONFIG_PATH=/nonexistent WALG_FILE_PREFIX=/backups");
+    assert!(
+        !without_key.status.success(),
+        "archived WAL was readable without the key"
+    );
+
+    // The control file names the new timeline after the first checkpoint. A
+    // WARNING only covers segments still on their way, and FAILURE means a gap.
+    exec_sql(service, "CHECKPOINT");
+    let report: serde_json::Value = reqwest::get(format!("{api}/api/backups/verify"))
+        .await
+        .expect("GET /api/backups/verify")
+        .json()
+        .await
+        .expect("parse the verify report");
+    eprintln!("==> Verify: {report}");
+    assert_ne!(report["integrity"]["status"], "FAILURE", "{report}");
+    assert!(!report.to_string().contains("MISSING_LOST"), "{report}");
+    assert_eq!(report["timeline"]["status"], "OK", "{report}");
+
+    compose(&["down", "-v", "--remove-orphans"]);
+}
+
+/// A restore to a chosen time holds what was committed before it and nothing
+/// after, accepts writes, and leaves the source running.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_point_in_time_restore() {
+    start_stack();
+    create_mode_test_table().await;
+    exec_sql("pg-primary", "INSERT INTO mode_test VALUES (100)");
+    // The restore starts from a backup taken before the target time.
+    let since = backups(DEFAULT_API).await.len();
+    wait_until(
+        "a backup after the first write",
+        Duration::from_secs(90),
+        || async { backups(DEFAULT_API).await.len() > since },
+    )
+    .await;
+
+    exec_sql("pg-primary", "INSERT INTO mode_test VALUES (200)");
+    let target = exec_sql("pg-primary", "SELECT now()::text");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    exec_sql("pg-primary", "INSERT INTO mode_test VALUES (300)");
+    let segment = exec_sql("pg-primary", "SELECT pg_walfile_name(pg_switch_wal())");
+    wait_until("the WAL to archive", Duration::from_secs(90), || async {
+        exec_sql(
+            "pg-primary",
+            "SELECT last_archived_wal FROM pg_stat_archiver",
+        ) >= segment
+    })
+    .await;
+
+    compose(&[
+        "--profile",
+        "spare",
+        "up",
+        "-d",
+        "--no-deps",
+        "--build",
+        "vk-agent-4",
+    ]);
+    let response = reqwest::Client::new()
+        .post(format!("{DEFAULT_API}/api/backups/restore"))
+        .bearer_auth("dev-api-key")
+        .json(&serde_json::json!({
+            "agent_addr": "vk-agent-4:7001",
+            "target_time": target,
+        }))
+        .send()
+        .await
+        .expect("POST /api/backups/restore");
+    assert_eq!(response.status(), 202);
+
+    wait_until("the restore", Duration::from_secs(120), || async {
+        let status: serde_json::Value = reqwest::get(format!("{DEFAULT_API}/api/backups/restore"))
+            .await
+            .expect("GET /api/backups/restore")
+            .json()
+            .await
+            .expect("parse restore status");
+        assert!(status["error"].is_null(), "restore failed: {status}");
+        status["running"] == false
+    })
+    .await;
+
+    wait_until("the restored database", Duration::from_secs(30), || async {
+        pg4_query("SELECT pg_is_in_recovery()") == "f"
+    })
+    .await;
+    assert_eq!(
+        pg4_query("SELECT string_agg(value::text, ',' ORDER BY value) FROM mode_test"),
+        "100,200",
+        "the restore must stop at the target time"
+    );
+    assert_eq!(
+        pg4_query("INSERT INTO mode_test VALUES (400) RETURNING value")
+            .lines()
+            .next(),
+        Some("400"),
+        "a restored database must accept writes"
+    );
+    assert_eq!(
+        exec_sql(
+            "pg-primary",
+            "SELECT count(*) FROM mode_test WHERE value = 300"
+        ),
+        "1",
+        "the source must stay up"
+    );
+
+    compose(&["--profile", "spare", "down", "-v", "--remove-orphans"]);
+}
+
+/// A new node can seed from a backup instead of from the primary.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_new_node_seeds_from_a_backup() {
+    start_stack();
+    create_mode_test_table().await;
+    exec_sql("pg-primary", "INSERT INTO mode_test VALUES (7)");
+    let since = backups(DEFAULT_API).await.len();
+    wait_until("a backup", Duration::from_secs(90), || async {
+        backups(DEFAULT_API).await.len() > since
+    })
+    .await;
+
+    add_and_seed_pg4_from(true).await;
+
+    assert_eq!(pg4_query("SELECT value FROM mode_test"), "7");
+    assert!(
+        pg4_query("SHOW restore_command").contains("wal-fetch"),
+        "pg4 must have come from a backup"
+    );
+
+    compose(&["--profile", "spare", "down", "-v", "--remove-orphans"]);
 }
 
 /// Runs switchover only — useful when the stack is already up (E2E_SKIP_BUILD=1).

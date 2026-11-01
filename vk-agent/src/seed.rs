@@ -113,7 +113,7 @@ pub async fn has_data(data_dir: &Path) -> Result<bool> {
 }
 
 /// Empty `data_dir`, keeping the directory itself, which may be a mount point.
-async fn clear_contents(data_dir: &Path) -> Result<()> {
+pub(crate) async fn clear_contents(data_dir: &Path) -> Result<()> {
     tokio::fs::create_dir_all(data_dir)
         .await
         .with_context(|| format!("create {}", data_dir.display()))?;
@@ -129,7 +129,7 @@ async fn clear_contents(data_dir: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-async fn set_owner_only(data_dir: &Path) -> Result<()> {
+pub(crate) async fn set_owner_only(data_dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     tokio::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))
         .await
@@ -137,7 +137,7 @@ async fn set_owner_only(data_dir: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn set_owner_only(_data_dir: &Path) -> Result<()> {
+pub(crate) async fn set_owner_only(_data_dir: &Path) -> Result<()> {
     Ok(())
 }
 

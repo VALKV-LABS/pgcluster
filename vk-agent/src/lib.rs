@@ -7,3 +7,4 @@ pub mod seed;
 pub mod server;
 pub mod standby;
 pub mod tls;
+pub mod walg;

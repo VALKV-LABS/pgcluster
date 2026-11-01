@@ -201,19 +201,21 @@ fn validate_backup(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     let Some(backup) = &cfg.backup else {
         return Ok(());
     };
-    if backup.s3.bucket.is_empty() {
-        anyhow::bail!("[backup.s3] bucket must not be empty");
-    }
-    if backup.schedule.is_empty() {
-        anyhow::bail!("[backup] schedule must have at least one [[backup.schedule]] entry");
-    }
-    for entry in &backup.schedule {
-        if entry.retain == 0 {
-            anyhow::bail!(
-                "[backup] schedule retain must be >= 1 (frequency: {})",
-                entry.frequency
-            );
+    match (&backup.s3, &backup.posix) {
+        (Some(s3), None) if s3.bucket.is_empty() => {
+            anyhow::bail!("[backup.s3] bucket must not be empty");
         }
+        (None, Some(posix)) if !posix.path.starts_with('/') => {
+            anyhow::bail!("[backup.posix] path must be absolute");
+        }
+        (Some(_), None) | (None, Some(_)) => {}
+        _ => anyhow::bail!("[backup] set exactly one of [backup.s3] and [backup.posix]"),
+    }
+    if backup.interval_seconds == 0 {
+        anyhow::bail!("[backup] interval_seconds must be > 0");
+    }
+    if backup.retain_full == 0 {
+        anyhow::bail!("[backup] retain_full must be >= 1");
     }
     Ok(())
 }

@@ -240,132 +240,43 @@ api_keys    = ["test-key"]
 "#
 }
 
-#[test]
-fn backup_config_valid_passes_validation() {
-    let toml = format!(
-        "{}\n{}",
-        base_config_toml(),
-        r#"
-[backup]
-enabled        = true
-prefer_replica = true
-
-[backup.s3]
-bucket = "my-backups"
-region = "us-east-1"
-
-[[backup.schedule]]
-frequency = "daily"
-retain    = 7
-
-[[backup.schedule]]
-frequency = "weekly"
-retain    = 4
-"#
-    );
-    let cfg: pgcluster::config::PgClusterConfig = toml::from_str(&toml).unwrap();
-    assert!(
-        pgcluster::config::validate::validate(&cfg).is_ok(),
-        "valid backup config should pass validation"
-    );
-    let backup = cfg.backup.unwrap();
-    assert_eq!(backup.s3.bucket, "my-backups");
-    assert_eq!(backup.schedule.len(), 2);
+fn with_backup(section: &str) -> anyhow::Result<()> {
+    let toml = format!("{}\n{section}", base_config_toml());
+    let cfg: pgcluster::config::PgClusterConfig = toml::from_str(&toml)?;
+    pgcluster::config::validate::validate(&cfg)
 }
 
 #[test]
-fn backup_config_without_s3_section_fails_toml_parse() {
-    let toml = format!(
-        "{}\n{}",
-        base_config_toml(),
-        r#"
-[backup]
-enabled = true
-
-[[backup.schedule]]
-frequency = "daily"
-retain    = 7
-"#
-    );
-    // `s3` is a required (non-Option) field, so parsing must fail.
-    let result: Result<pgcluster::config::PgClusterConfig, _> = toml::from_str(&toml);
-    assert!(
-        result.is_err(),
-        "[backup] without [backup.s3] must fail TOML parsing"
-    );
+fn backup_config_with_s3_passes() {
+    assert!(with_backup("[backup]\n[backup.s3]\nbucket = \"b\"").is_ok());
 }
 
 #[test]
-fn backup_config_empty_bucket_fails_validation() {
-    let toml = format!(
-        "{}\n{}",
-        base_config_toml(),
-        r#"
-[backup]
-enabled = true
-
-[backup.s3]
-bucket = ""
-
-[[backup.schedule]]
-frequency = "daily"
-retain    = 7
-"#
-    );
-    let cfg: pgcluster::config::PgClusterConfig = toml::from_str(&toml).unwrap();
-    let err = pgcluster::config::validate::validate(&cfg).unwrap_err();
-    assert!(
-        err.to_string().contains("bucket"),
-        "error should mention 'bucket': {err}"
-    );
+fn backup_config_with_posix_passes() {
+    assert!(with_backup("[backup]\n[backup.posix]\npath = \"/backups\"").is_ok());
 }
 
 #[test]
-fn backup_config_empty_schedule_fails_validation() {
-    // `schedule = []` parses successfully (empty vec) but must fail validation.
-    let toml = format!(
-        "{}\n{}",
-        base_config_toml(),
-        r#"
-[backup]
-enabled   = true
-schedule  = []
-
-[backup.s3]
-bucket = "my-backups"
-"#
-    );
-    let cfg: pgcluster::config::PgClusterConfig = toml::from_str(&toml).unwrap();
-    let err = pgcluster::config::validate::validate(&cfg).unwrap_err();
-    assert!(
-        err.to_string().contains("schedule"),
-        "error should mention 'schedule': {err}"
-    );
+fn backup_config_needs_exactly_one_store() {
+    assert!(with_backup("[backup]").is_err());
+    let both = "[backup]\n[backup.s3]\nbucket = \"b\"\n[backup.posix]\npath = \"/x\"";
+    assert!(with_backup(both).is_err());
 }
 
 #[test]
-fn backup_config_retain_zero_fails_validation() {
-    let toml = format!(
-        "{}\n{}",
-        base_config_toml(),
-        r#"
-[backup]
-enabled = true
+fn backup_config_empty_bucket_fails() {
+    assert!(with_backup("[backup]\n[backup.s3]\nbucket = \"\"").is_err());
+}
 
-[backup.s3]
-bucket = "my-backups"
+#[test]
+fn backup_config_relative_path_fails() {
+    assert!(with_backup("[backup]\n[backup.posix]\npath = \"backups\"").is_err());
+}
 
-[[backup.schedule]]
-frequency = "daily"
-retain    = 0
-"#
-    );
-    let cfg: pgcluster::config::PgClusterConfig = toml::from_str(&toml).unwrap();
-    let err = pgcluster::config::validate::validate(&cfg).unwrap_err();
-    assert!(
-        err.to_string().contains("retain"),
-        "error should mention 'retain': {err}"
-    );
+#[test]
+fn backup_config_zero_retention_fails() {
+    let section = "[backup]\nretain_full = 0\n[backup.posix]\npath = \"/x\"";
+    assert!(with_backup(section).is_err());
 }
 
 #[test]

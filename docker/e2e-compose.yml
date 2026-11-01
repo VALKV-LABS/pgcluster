@@ -36,6 +36,9 @@
 # Read from replica-2 directly
 # psql postgres://postgres:test@localhost:5492/myapp -c "SELECT * FROM users;"
 
+# A throwaway key for the stack's encrypted backups.
+x-backup-key: &backup-key "nvQ1nHZ3hYkq0m4oGQ3p3k5u2u8Zt7y6vX1cR0eJm9U="
+
 x-node: &node
   build:
     context: ..
@@ -61,9 +64,10 @@ services:
         pg-primary pg-replica-1 pg-replica-2 pg-new
         vk-agent-1 vk-agent-2 vk-agent-3 vk-agent-4
         pgcluster-1 pgcluster-2 pgcluster-3 &&
-        chown 999:999 /certs/pg-*.key /certs/vk-agent-*.key
+        chown 999:999 /certs/pg-*.key /certs/vk-agent-*.key /backups
     volumes:
       - certs:/certs
+      - backups:/backups
 
   # ── Postgres nodes ──────────────────────────────────────────────────────────
 
@@ -89,6 +93,7 @@ services:
     volumes:
       - pg-primary-data:/var/lib/postgresql/data
       - ./node-entry.sh:/usr/local/bin/node-entry.sh:ro
+      - backups:/backups
       - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
       - ./configs/vk-agent-pg1.toml:/etc/vk-agent/config.toml:ro
       - certs:/certs:ro
@@ -117,6 +122,7 @@ services:
     volumes:
       - pg-replica-1-data:/var/lib/postgresql/data
       - ./node-entry.sh:/usr/local/bin/node-entry.sh:ro
+      - backups:/backups
       - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
       - ./configs/vk-agent-pg2.toml:/etc/vk-agent/config.toml:ro
       - certs:/certs:ro
@@ -145,6 +151,7 @@ services:
     volumes:
       - pg-replica-2-data:/var/lib/postgresql/data
       - ./node-entry.sh:/usr/local/bin/node-entry.sh:ro
+      - backups:/backups
       - ./pg-hba.conf:/etc/postgresql/pg_hba.conf:ro
       - ./configs/vk-agent-pg3.toml:/etc/vk-agent/config.toml:ro
       - certs:/certs:ro
@@ -168,6 +175,7 @@ services:
     volumes:
       - pg-new-data:/var/lib/postgresql/data
       - ./node-entry.sh:/usr/local/bin/node-entry.sh:ro
+      - backups:/backups
       - ./configs/vk-agent-pg4.toml:/etc/vk-agent/config.toml:ro
       - certs:/certs:ro
 
@@ -180,6 +188,7 @@ services:
       dockerfile: docker/pgcluster.Dockerfile
     environment:
       POSTGRES_PASSWORD: test
+      BACKUP_KEY: *backup-key
     depends_on:
       pg-primary:
         condition: service_healthy
@@ -206,6 +215,7 @@ services:
       dockerfile: docker/pgcluster.Dockerfile
     environment:
       POSTGRES_PASSWORD: test
+      BACKUP_KEY: *backup-key
     depends_on:
       pgcluster-1:
         condition: service_started
@@ -232,6 +242,7 @@ services:
       dockerfile: docker/pgcluster.Dockerfile
     environment:
       POSTGRES_PASSWORD: test
+      BACKUP_KEY: *backup-key
     depends_on:
       pgcluster-1:
         condition: service_started
@@ -259,6 +270,7 @@ networks:
 
 volumes:
   certs:
+  backups:
   pg-primary-data:
   pg-replica-1-data:
   pg-replica-2-data:

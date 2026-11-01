@@ -50,6 +50,15 @@ pub struct AgentConfig {
     #[serde(default = "default_manage_postgres")]
     pub manage_postgres: bool,
 
+    /// Path to the WAL-G binary.
+    #[serde(default = "default_walg_path")]
+    pub walg_path: String,
+
+    /// Where to keep WAL-G's config, which holds repository credentials. Keep it
+    /// outside `data_dir`, or base backups would copy it.
+    #[serde(default = "default_backup_config_path")]
+    pub backup_config_path: String,
+
     /// Path to pg_ctl binary (used for stop/start commands).
     #[serde(default = "default_pg_ctl")]
     pub pg_ctl_path: String,
@@ -86,6 +95,12 @@ fn default_pg_dbname() -> String {
 }
 fn default_heartbeat_timeout() -> u64 {
     10
+}
+fn default_walg_path() -> String {
+    "wal-g".into()
+}
+fn default_backup_config_path() -> String {
+    "/var/lib/postgresql/walg.json".into()
 }
 fn default_manage_postgres() -> bool {
     true
@@ -227,6 +242,8 @@ listen_addr = "0.0.0.0:7001"
             fence_timeout_seconds: 30,
             tls: Default::default(),
             manage_postgres: true,
+            walg_path: default_walg_path(),
+            backup_config_path: default_backup_config_path(),
             pg_ctl_path: "pg_ctl".into(),
         };
         assert_eq!(

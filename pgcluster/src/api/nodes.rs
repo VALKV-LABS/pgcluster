@@ -124,6 +124,9 @@ pub struct SeedNodeRequest {
     /// Discard data already on the node.
     #[serde(default)]
     pub force: bool,
+    /// Seed from the latest backup rather than from the primary.
+    #[serde(default)]
+    pub from_backup: bool,
 }
 
 /// Start seeding a node from the primary. The backup can take hours, so this
@@ -136,9 +139,20 @@ pub async fn seed_node(
     let topology = s.topology.borrow();
     let plan = SeedPlan::new(&topology, &node_id, &s.config.replication)
         .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    let settings = match (req.from_backup, &s.config.backup) {
+        (true, Some(backup)) => Some(crate::backup::walg::settings(backup)),
+        (true, None) => {
+            return Err((StatusCode::NOT_FOUND, "backup not configured".to_string()));
+        }
+        (false, _) => None,
+    };
     let pool = s.pool.clone();
     tokio::spawn(async move {
-        match plan.run(&pool, req.force).await {
+        let result = match settings {
+            Some(settings) => plan.run_from_backup(&pool, settings, req.force).await,
+            None => plan.run(&pool, req.force).await,
+        };
+        match result {
             Ok(()) => tracing::info!(node_id, "node seeded from the primary"),
             Err(e) => tracing::error!(node_id, err = %e, "seeding failed"),
         }

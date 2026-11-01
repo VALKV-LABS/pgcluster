@@ -133,6 +133,68 @@ impl AgentClient {
             .map(|r| r.into_inner())
     }
 
+    /// Replace this node's data from a backup and start Postgres.
+    pub async fn restore(
+        &mut self,
+        request: agent_proto::RestoreRequest,
+    ) -> Result<agent_proto::SeedResponse> {
+        self.stub
+            .restore(tonic::Request::new(request))
+            .await
+            .with_context(|| format!("Restore at {}", self.addr))
+            .map(|r| r.into_inner())
+    }
+
+    /// Write the backup tool's config on this node and turn on WAL archiving.
+    pub async fn configure_backups(
+        &mut self,
+        settings: std::collections::HashMap<String, String>,
+        version: String,
+    ) -> Result<agent_proto::SeedResponse> {
+        self.stub
+            .configure_backups(tonic::Request::new(agent_proto::ConfigureBackupsRequest {
+                settings,
+                version,
+            }))
+            .await
+            .with_context(|| format!("ConfigureBackups at {}", self.addr))
+            .map(|r| r.into_inner())
+    }
+
+    /// Take a base backup of this node. Runs as long as the backup takes.
+    pub async fn backup_push(&mut self) -> Result<agent_proto::BackupPushResponse> {
+        self.stub
+            .backup_push(tonic::Request::new(agent_proto::BackupPushRequest {}))
+            .await
+            .with_context(|| format!("BackupPush at {}", self.addr))
+            .map(|r| r.into_inner())
+    }
+
+    /// Apply retention, or delete the backup named `target`.
+    pub async fn backup_delete(
+        &mut self,
+        retain_full: u32,
+        target: &str,
+    ) -> Result<agent_proto::BackupDeleteResponse> {
+        self.stub
+            .backup_delete(tonic::Request::new(agent_proto::BackupDeleteRequest {
+                retain_full,
+                target: target.to_string(),
+            }))
+            .await
+            .with_context(|| format!("BackupDelete at {}", self.addr))
+            .map(|r| r.into_inner())
+    }
+
+    /// Check the WAL archive for gaps.
+    pub async fn backup_verify(&mut self) -> Result<agent_proto::BackupVerifyResponse> {
+        self.stub
+            .backup_verify(tonic::Request::new(agent_proto::BackupVerifyRequest {}))
+            .await
+            .with_context(|| format!("BackupVerify at {}", self.addr))
+            .map(|r| r.into_inner())
+    }
+
     /// Apply settings pgcluster manages on this node.
     pub async fn set_parameters(
         &mut self,

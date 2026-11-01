@@ -2,6 +2,7 @@ pub mod failure_state;
 pub mod health_check;
 pub mod replication;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time;
@@ -46,6 +47,8 @@ pub struct NodeMonitor {
     sync_degrade_timeout_seconds: u64,
     max_slot_wal_keep_size_mb: u64,
     replication: ReplicationConfig,
+    /// The backup tool's settings and their version, when backups are on.
+    backup_settings: Option<(HashMap<String, String>, String)>,
     /// How many health-check ticks between orphaned-slot audits on the primary.
     /// Default: 120 ticks × 500 ms interval ≈ once per minute.
     slot_audit_ticks: u64,
@@ -60,6 +63,7 @@ impl NodeMonitor {
         config: FailoverConfig,
         metrics: Arc<Metrics>,
         replication: &ReplicationConfig,
+        backup_settings: Option<HashMap<String, String>>,
         repl_password: String,
         op_in_progress: Arc<AtomicBool>,
         quorum: Arc<QuorumLease>,
@@ -78,6 +82,10 @@ impl NodeMonitor {
             sync_degrade_timeout_seconds: replication.sync_degrade_timeout_seconds,
             max_slot_wal_keep_size_mb: replication.max_slot_wal_keep_size_mb,
             replication: replication.clone(),
+            backup_settings: backup_settings.map(|settings| {
+                let version = crate::backup::walg::version(&settings);
+                (settings, version)
+            }),
             slot_audit_ticks: 120,
         }
     }
@@ -183,6 +191,37 @@ impl NodeMonitor {
             && !primary.is_empty()
             && primary != node_id
             && !self.op_in_progress.load(Ordering::SeqCst)
+    }
+
+    /// Bring a node's backup settings up to date. Every node gets them, so that
+    /// archiving works the moment one is promoted.
+    async fn push_backup_settings(
+        &self,
+        node_id: &str,
+        agent_addr: &str,
+        result: &HealthCheckResult,
+    ) {
+        let Some((settings, version)) = &self.backup_settings else {
+            return;
+        };
+        if result.backup_config_version == *version {
+            return;
+        }
+        let pushed = match self.pool.get_or_connect(node_id, agent_addr).await {
+            Ok(mut client) => {
+                client
+                    .configure_backups(settings.clone(), version.clone())
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        match pushed {
+            Ok(response) if response.success => {
+                info!(node_id, "backup settings applied");
+            }
+            Ok(response) => warn!(node_id, err = %response.error, "backup settings refused"),
+            Err(e) => warn!(node_id, err = %e, "could not apply backup settings"),
+        }
     }
 
     /// Seed an empty node in the background, which can take hours.
@@ -332,6 +371,8 @@ impl NodeMonitor {
                     continue;
                 }
                 stale_primaries.cleared(node_id);
+                self.push_backup_settings(node_id, &cfg.agent_addr, &result)
+                    .await;
 
                 // The primary came back before a failover could complete.
                 if *node_id == topology.primary_node_id
@@ -566,6 +607,7 @@ mod tests {
             parameters: Default::default(),
             lost_slots: Vec::new(),
             has_data: true,
+            backup_config_version: String::new(),
         };
         let primary_host = "pg-replica-1"; // new primary after failover
         assert!(
@@ -590,6 +632,7 @@ mod tests {
             parameters: Default::default(),
             lost_slots: Vec::new(),
             has_data: true,
+            backup_config_version: String::new(),
         };
         let primary_host = "pg-replica-1";
         assert!(
@@ -614,6 +657,7 @@ mod tests {
             parameters: Default::default(),
             lost_slots: Vec::new(),
             has_data: true,
+            backup_config_version: String::new(),
         };
         let primary_host = "pg-replica-1";
         assert!(
@@ -638,6 +682,7 @@ mod tests {
             parameters: Default::default(),
             lost_slots: Vec::new(),
             has_data: true,
+            backup_config_version: String::new(),
         };
         let primary_host = ""; // no primary elected yet
         assert!(

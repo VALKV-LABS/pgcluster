@@ -71,8 +71,9 @@ pub struct BackupManifest {
     pub completed_at: i64,
     /// Total bytes uploaded across all tar files.
     pub size_bytes: u64,
-    /// S3 URI prefix for this backup, e.g. "s3://bucket/prefix/daily/backup-id/".
-    pub s3_uri: String,
+    /// Where the backup engine keeps this backup.
+    #[serde(alias = "s3_uri")]
+    pub location: String,
     pub status: BackupStatus,
 }
 

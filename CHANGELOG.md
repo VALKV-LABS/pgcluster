@@ -4,6 +4,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** `[backup]` takes `interval_seconds`, `delta_steps`, `retain_full`, `encryption_key_env` and exactly one of `[backup.s3]` and `[backup.posix]`, replacing `[[backup.schedule]]`. Nodes need `archive_mode = on`.
+
 ### Security
 - **Breaking:** self-fencing is on by default. `fence_timeout_seconds` defaults to 30, and 0 turns it off. It was previously off unless set, and 0 fenced immediately.
 - **Breaking:** `pgcluster server` refuses to start without `api_keys`. `insecure_no_auth = true` opts out, for local development only.
@@ -34,6 +37,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `vk-agent` starts with no Postgres running, and skips self-fencing while there is none to fence.
 
 ### Added
+- Backups use WAL-G, run by `vk-agent` from the least-lagged standby, falling back to the primary: full and delta backups, retention, WAL archiving from whichever node is primary, and encryption with libsodium.
+- `POST /api/backups/restore` restores to a point in time onto a separate agent, as an independent database. `{"from_backup": true}` on `POST /api/nodes/:id/seed` seeds a node from a backup.
+- `GET /api/backups/verify` checks the WAL archive for gaps.
 - Rolling restart through `POST /api/restart`: standbys one at a time, then a switchover, which restarts the old primary as a standby.
 - An empty node seeds itself from the primary as soon as the leader can reach its agent.
 - `vk-agent` starts the Postgres it manages when it starts.

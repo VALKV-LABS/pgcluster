@@ -32,9 +32,12 @@ The CLI sends the key in the `PGCLUSTER_API_KEY` environment variable.
 | `GET` | `/api/topology` | `200` | Full topology snapshot |
 | `GET` | `/api/replication` | `200` | Replication mode, fallback state and standbys that need seeding |
 | `POST` | `/api/replication/mode` | `204` | Change the mode online: `{"mode": "async"}`, `"sync"` or `"sync_strict"` |
-| `POST` | `/api/nodes/:node_id/seed` | `202` | Seed a node from the primary. `{"force": true}` discards data already on it |
+| `POST` | `/api/nodes/:node_id/seed` | `202` | Seed a node from the primary. `{"force": true}` discards data already on it, and `{"from_backup": true}` uses the latest backup |
 | `POST` | `/api/restart` | `202` | Start a rolling restart, on the Raft leader |
 | `GET` | `/api/restart` | `200` | Whether a rolling restart is running on this instance, and any error |
+| `GET` | `/api/backups/verify` | `200` | Check the WAL archive for gaps |
+| `POST` | `/api/backups/restore` | `202` | Restore onto a separate agent, optionally to a point in time |
+| `GET` | `/api/backups/restore` | `200` | Whether a restore is running on this instance, and any error |
 | `GET` | `/api/members` | `200` | List Raft voters and learners |
 | `POST` | `/api/members` | `201` | Add a learner, `{"id": 4, "addr": "host:7000"}`, and wait for it to catch up |
 | `POST` | `/api/members/:id/promote` | `204` | Promote a learner to voter |

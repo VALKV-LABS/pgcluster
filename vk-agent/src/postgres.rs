@@ -157,6 +157,23 @@ impl LocalPostgres {
         Ok(())
     }
 
+    /// Point `archive_command` at `command`, with a `archive_timeout` so a quiet
+    /// database still archives. `archive_mode` must already be on, because
+    /// changing it needs a restart.
+    pub async fn set_archive_command(&self, command: &str) -> Result<()> {
+        for (name, value) in [("archive_command", command), ("archive_timeout", "60")] {
+            sqlx::query(&alter_system_sql(name, value))
+                .execute(&self.pool)
+                .await
+                .with_context(|| format!("ALTER SYSTEM SET {name} failed"))?;
+        }
+        sqlx::query("SELECT pg_reload_conf()")
+            .execute(&self.pool)
+            .await
+            .context("pg_reload_conf failed")?;
+        Ok(())
+    }
+
     /// Returns replication slots whose WAL has been removed. Their standbys
     /// can no longer catch up by streaming.
     pub async fn get_lost_slots(&self) -> Result<Vec<String>> {

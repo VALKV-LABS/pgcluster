@@ -1,45 +1,33 @@
-//! Scheduled backup coordinator.
+//! Backup coordinator.
 //!
-//! # How it works
+//! A `BackupScheduler` runs on every pgcluster node but acts only on the Raft
+//! leader, with quorum. Each backup runs on a node's agent, preferring the
+//! least-lagged standby, and its manifest goes through Raft, so a new leader
+//! knows when the next is due. Scheduling, retention and manifests live here;
+//! the agent's backup RPCs carry out the work and name no tool.
 //!
-//! A `BackupScheduler` task runs on every pgcluster node but acts only when
-//! the node is the Raft leader.  It wakes once per hour, checks each configured
-//! frequency tier (daily / weekly / monthly) against the last completed backup
-//! timestamp stored in Raft topology, and runs pg_basebackup when a tier is due.
-//!
-//! ## Backup execution
-//!
-//! pgcluster invokes `pg_basebackup` as a subprocess, connecting directly to the
-//! selected Postgres node's address over the standard replication protocol.
-//! pg_basebackup must be installed on the pgcluster host
-//! (available in the `postgresql-client` package).
-//!
-//! The preferred source is the replica with the smallest replication lag;
-//! the primary is used as a fallback to avoid interfering with read traffic.
-//!
-//! Output is written to a temporary directory in tar+gzip format
-//! (`base.tar.gz` + `pg_wal.tar.gz`) and then uploaded to S3 before the
-//! temp dir is cleaned up.
-//!
-//! ## Credentials
-//!
-//! S3 credentials are read from the environment:
-//!   `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` (optional).
-//! IAM instance roles / IRSA are also supported — no env vars needed in that case.
+//! WAL archiving runs inside Postgres, from whichever node is primary, so it
+//! keeps going without this module. The leader only pushes the configuration.
+
+pub mod walg;
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
-use futures::StreamExt as _;
-use object_store::aws::AmazonS3Builder;
-use object_store::ObjectStore;
+use anyhow::{anyhow, bail, Result};
 use tracing::{error, info, warn};
 
-use crate::config::{BackupConfig, BackupFrequency, S3Config};
+use crate::agent_clients::AgentClientPool;
+use crate::config::BackupConfig;
 use crate::raft::commands::TopologyCommand;
 use crate::raft::topology::{BackupManifest, BackupStatus, ClusterTopology, NodeRole};
 use crate::raft::{RaftNode, TopologyWatch};
+
+/// How often to check whether a backup is due.
+const CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long to wait after a failed backup.
+const RETRY_DELAY: Duration = Duration::from_secs(60);
 
 // ── BackupScheduler ────────────────────────────────────────────────────────────
 
@@ -47,9 +35,7 @@ pub struct BackupScheduler {
     raft: Arc<RaftNode>,
     topology_rx: TopologyWatch,
     config: BackupConfig,
-    repl_user: String,
-    repl_password: String,
-    store: Arc<dyn ObjectStore>,
+    pool: Arc<AgentClientPool>,
 }
 
 impl BackupScheduler {
@@ -57,24 +43,21 @@ impl BackupScheduler {
         raft: Arc<RaftNode>,
         topology_rx: TopologyWatch,
         config: BackupConfig,
-        repl_user: String,
-        repl_password: String,
-    ) -> Result<Self> {
-        let store = build_s3_store(&config.s3)?;
-        Ok(Self {
+        pool: Arc<AgentClientPool>,
+    ) -> Self {
+        Self {
             raft,
             topology_rx,
             config,
-            repl_user,
-            repl_password,
-            store,
-        })
+            pool,
+        }
     }
 
     /// Run the scheduler loop.  Spawn this as a background task.
     pub async fn run(&mut self) {
-        let mut tick = tokio::time::interval(Duration::from_secs(3600));
+        let mut tick = tokio::time::interval(CHECK_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_failure: Option<Instant> = None;
 
         info!("backup scheduler started");
 
@@ -84,103 +67,48 @@ impl BackupScheduler {
             if !self.config.enabled {
                 continue;
             }
+            if last_failure.is_some_and(|at| at.elapsed() < RETRY_DELAY) {
+                continue;
+            }
 
             // Only the Raft leader runs backups to avoid duplicate uploads.
-            let my_id = self.raft.raft.metrics().borrow().id;
-            let Some(leader) = self.raft.raft.current_leader().await else {
-                continue;
-            };
-            if leader != my_id {
+            let metrics = self.raft.raft.metrics().borrow().clone();
+            if metrics.current_leader != Some(metrics.id) {
                 continue;
             }
 
             let topology = self.topology_rx.current();
-            let schedules = self.config.schedule.clone();
-
-            for entry in &schedules {
-                let freq_str = entry.frequency.to_string();
-                let last = last_backup_ts(&topology, &freq_str);
-
-                if !is_due(&entry.frequency, last) {
-                    continue;
-                }
-
-                let Some((source_node, source_addr)) =
-                    select_source(&topology, self.config.prefer_replica)
-                else {
-                    warn!(
-                        frequency = %freq_str,
-                        "no suitable backup source — skipping scheduled backup"
-                    );
-                    continue;
-                };
-
-                let label = format!("{}-{}", freq_str, chrono::Utc::now().format("%Y-%m-%d"));
-
-                info!(frequency = %freq_str, source_node, label, "starting scheduled backup");
-
-                match execute_backup(
-                    &source_node,
-                    &source_addr,
-                    &self.repl_user,
-                    &self.repl_password,
-                    &freq_str,
-                    &label,
-                    &self.config,
-                    &self.store,
-                )
-                .await
-                {
-                    Ok(manifest) => {
-                        let backup_id = manifest.backup_id.clone();
-                        if let Err(e) = self
-                            .raft
-                            .raft
-                            .client_write(TopologyCommand::AddBackupManifest(manifest))
-                            .await
-                        {
-                            error!(err = %e, backup_id, "failed to record backup manifest in Raft");
-                            continue;
-                        }
-                        info!(backup_id, frequency = %freq_str, "scheduled backup complete");
-                        self.prune(&freq_str, entry.retain as usize).await;
-                    }
-                    Err(e) => {
-                        error!(frequency = %freq_str, err = %e, "scheduled backup failed");
-                    }
-                }
+            if !is_due(
+                self.config.interval_seconds,
+                last_backup_ts(&topology),
+                unix_now(),
+            ) {
+                continue;
             }
-        }
-    }
 
-    async fn prune(&self, frequency: &str, retain: usize) {
-        let topology = self.topology_rx.current();
-        let mut completed: Vec<BackupManifest> = topology
-            .backups
-            .iter()
-            .filter(|b| b.frequency == frequency && b.status == BackupStatus::Completed)
-            .cloned()
-            .collect();
-        // Topology keeps backups sorted most-recent-first; stable.
-        completed.sort_by_key(|m| std::cmp::Reverse(m.completed_at));
-
-        if completed.len() <= retain {
-            return;
-        }
-
-        for old in &completed[retain..] {
-            let bid = old.backup_id.clone();
-            delete_from_s3(&self.store, &self.config.s3.bucket, &old.s3_uri).await;
-            match self
-                .raft
-                .raft
-                .client_write(TopologyCommand::RemoveBackupManifest {
-                    backup_id: bid.clone(),
-                })
-                .await
+            let label = format!("scheduled-{}", chrono::Utc::now().format("%Y-%m-%d"));
+            match run_backup(
+                &self.raft,
+                &topology,
+                &self.pool,
+                &self.config,
+                "scheduled",
+                &label,
+            )
+            .await
             {
-                Ok(_) => info!(backup_id = bid, frequency, "pruned old backup"),
-                Err(e) => warn!(backup_id = bid, err = %e, "failed to remove backup manifest"),
+                Ok(manifest) => {
+                    last_failure = None;
+                    info!(
+                        backup_id = manifest.backup_id,
+                        source_node = manifest.source_node,
+                        "scheduled backup complete"
+                    );
+                }
+                Err(e) => {
+                    last_failure = Some(Instant::now());
+                    error!(err = %e, "scheduled backup failed");
+                }
             }
         }
     }
@@ -188,149 +116,93 @@ impl BackupScheduler {
 
 // ── Core execution ─────────────────────────────────────────────────────────────
 
-/// Run pg_basebackup against `source_addr`, upload each tar file to S3,
-/// and return a completed `BackupManifest`.
-///
-/// Requires `pg_basebackup` to be available on the pgcluster host PATH
-/// (installed via the `postgresql-client` OS package).
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_backup(
-    source_node: &str,
-    source_addr: &str,
-    repl_user: &str,
-    repl_password: &str,
+/// Take a backup on the best node, record it through Raft and apply retention.
+pub async fn run_backup(
+    raft: &Arc<RaftNode>,
+    topology: &ClusterTopology,
+    pool: &AgentClientPool,
+    config: &BackupConfig,
     frequency: &str,
     label: &str,
-    backup_cfg: &BackupConfig,
-    store: &Arc<dyn ObjectStore>,
 ) -> Result<BackupManifest> {
-    let backup_id = uuid::Uuid::new_v4().to_string();
+    let (mut source_node, agent_addr) = select_source(topology, config.prefer_replica)
+        .ok_or_else(|| anyhow!("no suitable backup source"))?;
+
     let started_at = unix_now();
+    info!(source_node, label, "starting backup");
+    let mut client = pool.get_or_connect(&source_node, &agent_addr).await?;
+    let mut response = client.backup_push().await?;
 
-    let (host, port) = parse_host_port(source_addr)?;
-
-    // pg_basebackup writes base.tar.gz + pg_wal.tar.gz into the temp dir.
-    let tmp = tempfile::tempdir()?;
-
-    let out = tokio::process::Command::new("pg_basebackup")
-        .args([
-            "-h",
-            &host,
-            "-p",
-            &port.to_string(),
-            "-U",
-            repl_user,
-            "-F",
-            "tar",
-            "-z",
-            "--wal-method=stream",
-            "-D",
-            tmp.path().to_str().unwrap_or("/tmp/pgcluster-backup"),
-            "--no-password",
-        ])
-        .env("PGPASSWORD", repl_password)
-        .output()
-        .await?;
-
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!(
-            "pg_basebackup exited {:?}: {}",
-            out.status.code(),
-            stderr.trim()
-        );
+    // A standby can refuse, for one when an idle cluster has written no new WAL
+    // since the last backup. The primary can always start a new segment.
+    if !response.success && source_node != topology.primary_node_id {
+        warn!(source_node, err = %response.error, "backup failed on a standby, using the primary");
+        let (primary, primary_addr) =
+            select_source(topology, false).ok_or_else(|| anyhow!("the cluster has no primary"))?;
+        client = pool.get_or_connect(&primary, &primary_addr).await?;
+        response = client.backup_push().await?;
+        source_node = primary;
+    }
+    if !response.success {
+        bail!("backup on {source_node} failed: {}", response.error);
     }
 
-    // Upload every file the backup wrote to S3.
-    let s3_key_base = format!(
-        "{}/{}/{}",
-        backup_cfg.s3.prefix.trim_end_matches('/'),
-        frequency,
-        backup_id,
-    );
-    let mut total_bytes: u64 = 0;
-
-    let mut dir = tokio::fs::read_dir(tmp.path()).await?;
-    while let Some(entry) = dir.next_entry().await? {
-        let path = entry.path();
-        let filename = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let data = tokio::fs::read(&path).await?;
-        total_bytes += data.len() as u64;
-        let key = format!("{}/{}", s3_key_base, filename);
-        let location = object_store::path::Path::from(key.as_str());
-        store
-            .put(&location, bytes::Bytes::from(data).into())
-            .await
-            .map_err(|e| anyhow::anyhow!("S3 put {} failed: {}", key, e))?;
-        info!(key, bytes = total_bytes, "uploaded backup file to S3");
-    }
-    // tmp dir cleaned up on drop here.
-
-    Ok(BackupManifest {
-        backup_id,
+    let manifest = BackupManifest {
+        backup_id: response.backup_name.clone(),
         label: label.to_string(),
         frequency: frequency.to_string(),
-        source_node: source_node.to_string(),
+        source_node,
         started_at,
         completed_at: unix_now(),
-        size_bytes: total_bytes,
-        s3_uri: format!("s3://{}/{}", backup_cfg.s3.bucket, s3_key_base),
+        size_bytes: response.size_bytes,
+        location: response.backup_name,
         status: BackupStatus::Completed,
-    })
+    };
+    raft.raft
+        .client_write(TopologyCommand::AddBackupManifest(manifest.clone()))
+        .await
+        .map_err(|e| anyhow!("record backup manifest: {e}"))?;
+
+    // Retention failing does not undo a good backup.
+    match client.backup_delete(config.retain_full, "").await {
+        Ok(response) if response.success => {
+            remove_manifests_except(raft, topology, &manifest, &response.remaining).await;
+        }
+        Ok(response) => warn!(err = %response.error, "backup retention failed"),
+        Err(e) => warn!(err = %e, "backup retention failed"),
+    }
+    Ok(manifest)
 }
 
-// ── S3 helpers ─────────────────────────────────────────────────────────────────
-
-/// Build an S3 object store from config.
-/// Credentials are sourced from the environment (AWS_ACCESS_KEY_ID /
-/// AWS_SECRET_ACCESS_KEY / IAM role) via `AmazonS3Builder::from_env()`.
-pub fn build_s3_store(cfg: &S3Config) -> Result<Arc<dyn ObjectStore>> {
-    let mut builder = AmazonS3Builder::from_env().with_bucket_name(&cfg.bucket);
-    if let Some(region) = &cfg.region {
-        builder = builder.with_region(region);
-    }
-    if let Some(endpoint) = &cfg.endpoint {
-        builder = builder.with_endpoint(endpoint);
-    }
-    if cfg.path_style {
-        // Path-style addressing: required for MinIO and Ceph.
-        builder = builder.with_virtual_hosted_style_request(false);
-    }
-    Ok(Arc::new(builder.build().map_err(|e| {
-        anyhow::anyhow!("S3 store init failed: {}", e)
-    })?))
-}
-
-/// Delete all objects under the backup's S3 prefix.
-/// Non-fatal: logs warnings on individual delete failures.
-pub async fn delete_from_s3(store: &Arc<dyn ObjectStore>, bucket: &str, s3_uri: &str) {
-    // s3_uri = "s3://bucket/prefix/frequency/backup_id"
-    let prefix_str = s3_uri
-        .strip_prefix(&format!("s3://{}/", bucket))
-        .unwrap_or(s3_uri);
-    let prefix = object_store::path::Path::from(prefix_str);
-
-    let mut stream = store.list(Some(&prefix));
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(meta) => {
-                if let Err(e) = store.delete(&meta.location).await {
-                    warn!(key = %meta.location, err = %e, "S3 delete failed during backup prune");
-                }
-            }
-            Err(e) => warn!(err = %e, "S3 list error during backup delete"),
+/// Drop manifests of backups retention removed from the repository.
+async fn remove_manifests_except(
+    raft: &Arc<RaftNode>,
+    topology: &ClusterTopology,
+    newest: &BackupManifest,
+    remaining: &[String],
+) {
+    for old in &topology.backups {
+        if old.backup_id == newest.backup_id || remaining.contains(&old.backup_id) {
+            continue;
+        }
+        let backup_id = old.backup_id.clone();
+        if let Err(e) = raft
+            .raft
+            .client_write(TopologyCommand::RemoveBackupManifest {
+                backup_id: backup_id.clone(),
+            })
+            .await
+        {
+            warn!(backup_id, err = %e, "failed to remove backup manifest");
         }
     }
 }
 
 // ── Scheduling helpers ─────────────────────────────────────────────────────────
 
-/// Pick the best Postgres node to back up from.
-/// Prefers the replica with the smallest replication lag (fewest bytes behind);
-/// falls back to the primary when `prefer_replica` is false or no replica is healthy.
+/// Pick the node to back up, as `(node_id, agent_addr)`.
+/// Prefers the replica with the smallest replication lag; falls back to the
+/// primary when `prefer_replica` is false or no replica is healthy.
 pub fn select_source(topology: &ClusterTopology, prefer_replica: bool) -> Option<(String, String)> {
     if prefer_replica {
         let best = topology
@@ -350,42 +222,27 @@ pub fn select_source(topology: &ClusterTopology, prefer_replica: bool) -> Option
 
         if let Some(node_id) = best {
             if let Some(cfg) = topology.node_configs.get(&node_id) {
-                return Some((node_id, cfg.postgres_addr.clone()));
+                return Some((node_id, cfg.agent_addr.clone()));
             }
         }
     }
 
-    if !topology.primary_node_id.is_empty() {
-        if let Some(cfg) = topology.node_configs.get(&topology.primary_node_id) {
-            return Some((topology.primary_node_id.clone(), cfg.postgres_addr.clone()));
-        }
-    }
-    None
+    let cfg = topology.node_configs.get(&topology.primary_node_id)?;
+    Some((topology.primary_node_id.clone(), cfg.agent_addr.clone()))
 }
 
-fn last_backup_ts(topology: &ClusterTopology, frequency: &str) -> Option<i64> {
+fn last_backup_ts(topology: &ClusterTopology) -> Option<i64> {
     topology
         .backups
         .iter()
-        .filter(|b| b.frequency == frequency && b.status == BackupStatus::Completed)
+        .filter(|b| b.status == BackupStatus::Completed)
         .map(|b| b.completed_at)
         .max()
 }
 
-fn is_due(frequency: &BackupFrequency, last: Option<i64>) -> bool {
-    let Some(last_ts) = last else {
-        return true; // never backed up
-    };
-    let elapsed = unix_now() - last_ts;
-    match frequency {
-        // 1-hour slack so backups don't drift across the day boundary.
-        BackupFrequency::Daily => elapsed >= 23 * 3600,
-        BackupFrequency::Weekly => elapsed >= (7 * 24 - 1) * 3600,
-        BackupFrequency::Monthly => elapsed >= 28 * 24 * 3600,
-    }
+fn is_due(interval_seconds: u64, last: Option<i64>, now: i64) -> bool {
+    last.is_none_or(|last| now - last >= interval_seconds as i64)
 }
-
-// ── Misc helpers ───────────────────────────────────────────────────────────────
 
 fn unix_now() -> i64 {
     SystemTime::now()
@@ -394,28 +251,24 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-fn parse_host_port(addr: &str) -> Result<(String, u16)> {
-    let colon = addr
-        .rfind(':')
-        .ok_or_else(|| anyhow::anyhow!("missing port in address {:?}", addr))?;
-    let host = addr[..colon].to_string();
-    let port = addr[colon + 1..]
-        .parse::<u16>()
-        .map_err(|_| anyhow::anyhow!("invalid port in address {:?}", addr))?;
-    Ok((host, port))
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::topology::{
-        BackupManifest, BackupStatus, ClusterTopology, NodeConfig, NodeRole,
-    };
-    use std::collections::HashMap;
+    use crate::raft::topology::NodeConfig;
 
-    fn make_topology_with_backups(backups: Vec<BackupManifest>) -> ClusterTopology {
+    fn node(id: &str) -> NodeConfig {
+        NodeConfig {
+            node_id: id.into(),
+            agent_addr: format!("{id}-agent:7001"),
+            postgres_addr: format!("{id}-db:5432"),
+            priority: 100,
+            tags: Default::default(),
+        }
+    }
+
+    fn topology() -> ClusterTopology {
         let mut t = ClusterTopology {
             primary_node_id: "pg1".into(),
             ..Default::default()
@@ -424,141 +277,73 @@ mod tests {
         t.node_roles.insert("pg2".into(), NodeRole::Replica);
         t.node_roles.insert("pg3".into(), NodeRole::Replica);
         t.replica_lag_bytes.insert("pg2".into(), 500);
-        t.replica_lag_bytes.insert("pg3".into(), 100); // pg3 is closer
+        t.replica_lag_bytes.insert("pg3".into(), 100);
         for id in ["pg1", "pg2", "pg3"] {
-            t.node_configs.insert(
-                id.into(),
-                NodeConfig {
-                    node_id: id.into(),
-                    agent_addr: format!("{}:7001", id),
-                    postgres_addr: format!("{}:5432", id),
-                    priority: 100,
-                    tags: HashMap::new(),
-                },
-            );
+            t.node_configs.insert(id.into(), node(id));
         }
-        t.backups = backups;
         t
     }
 
-    fn completed_manifest(frequency: &str, completed_at: i64) -> BackupManifest {
+    fn manifest(completed_at: i64, status: BackupStatus) -> BackupManifest {
         BackupManifest {
-            backup_id: uuid::Uuid::new_v4().to_string(),
-            label: format!("{}-test", frequency),
-            frequency: frequency.to_string(),
+            backup_id: format!("base_{completed_at}"),
+            label: String::new(),
+            frequency: "scheduled".into(),
             source_node: "pg2".into(),
-            started_at: completed_at - 60,
+            started_at: 0,
             completed_at,
-            size_bytes: 1024 * 1024,
-            s3_uri: format!("s3://test-bucket/backups/{}/backup-id/", frequency),
-            status: BackupStatus::Completed,
+            size_bytes: 0,
+            location: String::new(),
+            status,
         }
     }
 
     #[test]
-    fn select_source_prefers_lowest_lag_replica() {
-        let t = make_topology_with_backups(vec![]);
-        let (node_id, _) = select_source(&t, true).unwrap();
-        assert_eq!(node_id, "pg3", "pg3 has lower lag (100) than pg2 (500)");
-    }
-
-    #[test]
-    fn select_source_falls_back_to_primary_when_prefer_replica_false() {
-        let t = make_topology_with_backups(vec![]);
-        let (node_id, _) = select_source(&t, false).unwrap();
-        assert_eq!(node_id, "pg1");
-    }
-
-    #[test]
-    fn select_source_falls_back_to_primary_when_no_replicas() {
-        let mut t = ClusterTopology {
-            primary_node_id: "pg1".into(),
-            ..Default::default()
-        };
-        t.node_roles.insert("pg1".into(), NodeRole::Primary);
-        t.node_configs.insert(
-            "pg1".into(),
-            NodeConfig {
-                node_id: "pg1".into(),
-                agent_addr: "pg1:7001".into(),
-                postgres_addr: "pg1:5432".into(),
-                priority: 100,
-                tags: HashMap::new(),
-            },
+    fn source_is_the_least_lagged_standby_agent() {
+        assert_eq!(
+            select_source(&topology(), true),
+            Some(("pg3".into(), "pg3-agent:7001".into()))
         );
-        let (node_id, _) = select_source(&t, true).unwrap();
-        assert_eq!(node_id, "pg1");
     }
 
     #[test]
-    fn is_due_when_never_backed_up() {
-        assert!(is_due(&BackupFrequency::Daily, None));
-        assert!(is_due(&BackupFrequency::Weekly, None));
-        assert!(is_due(&BackupFrequency::Monthly, None));
+    fn source_can_be_forced_to_the_primary() {
+        let (node, _) = select_source(&topology(), false).unwrap();
+        assert_eq!(node, "pg1");
     }
 
     #[test]
-    fn is_due_daily_after_threshold() {
-        let now = unix_now();
-        let just_backed_up = now - 22 * 3600;
-        assert!(!is_due(&BackupFrequency::Daily, Some(just_backed_up)));
-
-        let old_backup = now - 24 * 3600;
-        assert!(is_due(&BackupFrequency::Daily, Some(old_backup)));
+    fn source_falls_back_to_the_primary_with_no_standby() {
+        let mut t = topology();
+        t.node_roles.insert("pg2".into(), NodeRole::Offline);
+        t.node_roles.insert("pg3".into(), NodeRole::Offline);
+        let (node, _) = select_source(&t, true).unwrap();
+        assert_eq!(node, "pg1");
     }
 
     #[test]
-    fn is_due_weekly_after_threshold() {
-        let now = unix_now();
-        let recent = now - 6 * 24 * 3600; // 6 days ago — not yet due
-        assert!(!is_due(&BackupFrequency::Weekly, Some(recent)));
-
-        let old = now - 7 * 24 * 3600; // 7 days ago — due
-        assert!(is_due(&BackupFrequency::Weekly, Some(old)));
+    fn no_primary_and_no_standby_means_no_source() {
+        assert_eq!(select_source(&ClusterTopology::default(), true), None);
     }
 
     #[test]
-    fn is_due_monthly_after_threshold() {
-        let now = unix_now();
-        let recent = now - 27 * 24 * 3600; // 27 days — not yet due
-        assert!(!is_due(&BackupFrequency::Monthly, Some(recent)));
-
-        let old = now - 29 * 24 * 3600; // 29 days — due
-        assert!(is_due(&BackupFrequency::Monthly, Some(old)));
+    fn a_first_backup_is_due_at_once() {
+        assert!(is_due(86400, None, 1000));
     }
 
     #[test]
-    fn last_backup_ts_returns_most_recent_completed() {
-        let now = unix_now();
-        let t = make_topology_with_backups(vec![
-            completed_manifest("daily", now - 100),
-            completed_manifest("daily", now - 50), // most recent
-            completed_manifest("weekly", now - 200),
-        ]);
-        assert_eq!(last_backup_ts(&t, "daily"), Some(now - 50));
-        assert_eq!(last_backup_ts(&t, "weekly"), Some(now - 200));
-        assert_eq!(last_backup_ts(&t, "monthly"), None);
+    fn backups_come_due_after_the_interval() {
+        assert!(!is_due(100, Some(1000), 1099));
+        assert!(is_due(100, Some(1000), 1100));
     }
 
     #[test]
-    fn last_backup_ts_ignores_failed_backups() {
-        let now = unix_now();
-        let mut failed = completed_manifest("daily", now - 30);
-        failed.status = BackupStatus::Failed;
-        let t = make_topology_with_backups(vec![failed, completed_manifest("daily", now - 100)]);
-        // The failed manifest (now - 30) must not count.
-        assert_eq!(last_backup_ts(&t, "daily"), Some(now - 100));
-    }
-
-    #[test]
-    fn parse_host_port_valid() {
-        let (h, p) = parse_host_port("pg-replica:5432").unwrap();
-        assert_eq!(h, "pg-replica");
-        assert_eq!(p, 5432);
-    }
-
-    #[test]
-    fn parse_host_port_missing_port() {
-        assert!(parse_host_port("pg-replica").is_err());
+    fn last_backup_ignores_failures() {
+        let mut t = topology();
+        t.backups = vec![
+            manifest(100, BackupStatus::Completed),
+            manifest(200, BackupStatus::Failed),
+        ];
+        assert_eq!(last_backup_ts(&t), Some(100));
     }
 }

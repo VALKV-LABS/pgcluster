@@ -320,7 +320,7 @@ Every database has point-in-time restore.
 | Encryption | libsodium on the node before upload, one key per database, encrypted at rest in `pgcluster-admin` |
 | Verification | Page checksums during backup, and `wal-g wal-verify` for WAL integrity |
 
-The coordinator talks to WAL-G through a small engine interface, and the API and topology carry nothing specific to it, so another engine can replace it.
+The coordinator talks to `vk-agent` through backup RPCs that name no tool, and the API and topology carry nothing specific to WAL-G, so another engine can replace it.
 
 Restore always creates a new database, so the source stays up and a failed restore harms nothing. `restore-window` returns the earliest and latest restorable times.
 

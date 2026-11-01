@@ -75,3 +75,12 @@ listen_addr = "0.0.0.0:9190"
 listen_addr = "0.0.0.0:8009"
 api_keys    = ["dev-api-key"]
 public_read_endpoints = true
+
+[backup]
+interval_seconds   = 20
+delta_steps        = 1
+retain_full        = 2
+encryption_key_env = "BACKUP_KEY"
+
+[backup.posix]
+path = "/backups"
