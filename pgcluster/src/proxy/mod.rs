@@ -21,7 +21,11 @@ use axum::{
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use crate::{config::ProxyConfig, metrics_registry::Metrics, tls::TlsManager};
+use crate::{
+    config::ProxyConfig,
+    metrics_registry::Metrics,
+    tls::{SharedAcceptor, TlsManager},
+};
 
 use allowlist::SharedAllowlist;
 use auth::AuthQuery;
@@ -35,7 +39,7 @@ pub struct ProxyServer {
     config: ProxyConfig,
     router: Arc<Router>,
     pool: Arc<ConnectionPool>,
-    tls: Option<Arc<TlsManager>>,
+    acceptor: Option<SharedAcceptor>,
     metrics: Arc<Metrics>,
     auth: Arc<AuthQuery>,
     allowlist: SharedAllowlist,
@@ -52,6 +56,7 @@ impl ProxyServer {
         config: ProxyConfig,
         router: Arc<Router>,
         tls: Option<Arc<TlsManager>>,
+        acceptor: Option<SharedAcceptor>,
         metrics: Arc<Metrics>,
         auth: Arc<AuthQuery>,
         allowlist: SharedAllowlist,
@@ -63,7 +68,7 @@ impl ProxyServer {
             config,
             router,
             pool,
-            tls,
+            acceptor,
             metrics,
             auth,
             allowlist,
@@ -79,12 +84,6 @@ impl ProxyServer {
             .with_context(|| format!("bind proxy listener on {}", self.config.listen_addr))?;
 
         info!(addr = %self.config.listen_addr, "proxy listening");
-
-        // Build TLS acceptor once, share via Arc.
-        let tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>> = self
-            .tls
-            .as_ref()
-            .map(|tm| Arc::new(tm.server_tls_acceptor()));
 
         // Idle connection reaper: evict stale pool connections every 30 s.
         let pool_reaper = Arc::clone(&self.pool);
@@ -112,7 +111,8 @@ impl ProxyServer {
 
             let router = Arc::clone(&self.router);
             let pool = Arc::clone(&self.pool);
-            let tls_clone = tls_acceptor.clone();
+            // Read for each client, so a renewed certificate applies at once.
+            let tls_clone = self.acceptor.as_ref().map(|a| a.load_full());
             let m = Arc::clone(&self.metrics);
             let auth = Arc::clone(&self.auth);
             let require_tls = self.config.require_tls;

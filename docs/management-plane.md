@@ -129,7 +129,7 @@ deploy/aws/        Terraform template for a test fleet
 
 Conventions:
 
-- Authentication is `Authorization: Bearer <key>`. `pgcluster-admin` refuses to start with no keys configured.
+- Authentication is `Authorization: Bearer <key>`. `pgcluster-admin` refuses to start with no keys configured, stores only their hashes, and accepts no key under 32 characters.
 - Errors are `{ "error": { "code": "...", "message": "..." } }`.
 - Lists are `{ "items": [...], "next_page_token": "..." }`, with `limit` and `page_token`.
 - Changes that take time return `202` and an operation.
@@ -229,7 +229,7 @@ POST /agent/v1/operations/{id}/log     step output
 
 - Enrolment tokens are single-use and expire after 15 minutes. A token ends in the hash of the CA certificate, so a new host can verify the server with nothing else copied to it.
 - Every later call uses mutual TLS, and a certificate can only read or report its own host's state.
-- `pgcluster-admin` is the certificate authority for host certificates, and rotates them.
+- `pgcluster-admin` is the certificate authority for host certificates, and rotates them. Each database has its own CA, and node certificates last 90 days and renew through desired state, with no restart.
 
 **Desired state** lists the instances a host should run:
 

@@ -6,8 +6,10 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, CertificateSigningRequestParams, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType, PKCS_ECDSA_P256_SHA256,
@@ -16,6 +18,12 @@ use sha2::{Digest, Sha256};
 
 /// How long a host certificate lasts. Hosts rotate well before this.
 pub const HOST_CERT_DAYS: i64 = 90;
+/// How long a node certificate lasts. The reconciler renews it well before this.
+pub const NODE_CERT_DAYS: i64 = 90;
+/// How long a CA and this service's own certificate last.
+const CA_DAYS: i64 = 3650;
+/// Tolerates clocks that are a little behind.
+const CLOCK_SKEW: Duration = Duration::from_secs(300);
 
 pub struct Ca {
     cert: Certificate,
@@ -27,6 +35,16 @@ pub struct Ca {
 pub struct Issued {
     pub cert_pem: String,
     pub key_pem: String,
+    pub not_after: DateTime<Utc>,
+}
+
+/// Make `params` valid from now for `days`, and return when it ends.
+fn set_validity(params: &mut CertificateParams, days: i64) -> DateTime<Utc> {
+    let life = Duration::from_secs(days as u64 * 86_400);
+    let now = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(Utc::now().timestamp() as u64);
+    params.not_before = now - CLOCK_SKEW;
+    params.not_after = now + life;
+    Utc::now() + chrono::Duration::days(days)
 }
 
 impl Ca {
@@ -39,6 +57,7 @@ impl Ca {
         params
             .distinguished_name
             .push(DnType::CommonName, common_name);
+        set_validity(&mut params, CA_DAYS);
         let cert = params.self_signed(&key).context("self-sign CA")?;
         let cert_pem = cert.pem();
         Ok(Self {
@@ -101,16 +120,17 @@ impl Ca {
     pub fn issue_server(&self, names: &[String]) -> Result<Issued> {
         let mut params = named_params(names)?;
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        self.issue(params)
+        self.issue(params, CA_DAYS)
     }
 
     /// A certificate for a Postgres node. Every peer there is client and server,
     /// so it carries no extended key usage, as `pgcluster certs` does.
     pub fn issue_node(&self, names: &[String]) -> Result<Issued> {
-        self.issue(named_params(names)?)
+        self.issue(named_params(names)?, NODE_CERT_DAYS)
     }
 
-    fn issue(&self, params: CertificateParams) -> Result<Issued> {
+    fn issue(&self, mut params: CertificateParams, days: i64) -> Result<Issued> {
+        let not_after = set_validity(&mut params, days);
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).context("generate key")?;
         let cert = params
             .signed_by(&key, &self.cert, &self.key)
@@ -118,6 +138,7 @@ impl Ca {
         Ok(Issued {
             cert_pem: cert.pem(),
             key_pem: key.serialize_pem(),
+            not_after,
         })
     }
 
@@ -129,10 +150,7 @@ impl Ca {
         let mut params = CertificateParams::new(Vec::<String>::new())?;
         params.distinguished_name.push(DnType::CommonName, host_id);
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-        let now = rcgen::date_time_ymd(1970, 1, 1)
-            + std::time::Duration::from_secs(chrono::Utc::now().timestamp() as u64);
-        params.not_before = now - std::time::Duration::from_secs(300);
-        params.not_after = now + std::time::Duration::from_secs(HOST_CERT_DAYS as u64 * 86_400);
+        set_validity(&mut params, HOST_CERT_DAYS);
         let signed = CertificateSigningRequestParams {
             params,
             public_key: csr.public_key,
@@ -221,6 +239,20 @@ mod tests {
     fn garbage_is_not_a_request() {
         let ca = Ca::generate("test").unwrap();
         assert!(ca.sign_host_csr("nonsense", "host-1").is_err());
+    }
+
+    #[test]
+    fn node_certificates_and_cas_expire() {
+        let ca = Ca::generate("db").unwrap();
+        let days_left = |pem: &str| {
+            with_parsed(pem, |cert| {
+                (cert.validity().not_after.timestamp() - chrono::Utc::now().timestamp()) / 86_400
+            })
+        };
+        let issued = ca.issue_node(&["127.0.0.1".into()]).unwrap();
+        assert!((NODE_CERT_DAYS - 1..=NODE_CERT_DAYS).contains(&days_left(&issued.cert_pem)));
+        assert!((issued.not_after - chrono::Utc::now()).num_days() <= NODE_CERT_DAYS);
+        assert!(days_left(ca.cert_pem()) <= CA_DAYS);
     }
 
     #[test]

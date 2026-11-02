@@ -88,20 +88,44 @@ impl AgentServiceImpl {
 
 /// Serve the agent gRPC service until the server fails. `tls` of `None` means
 /// plaintext, for development.
+/// A new value on `tls` starts a new generation of the server on the same
+/// listener. RPCs in flight finish on the old certificate, and the port never
+/// stops accepting, so heartbeats carry on through a renewal.
 pub async fn serve(
     svc: AgentServiceImpl,
     addr: std::net::SocketAddr,
-    tls: Option<ServerTlsConfig>,
+    tls: Option<tokio::sync::watch::Receiver<ServerTlsConfig>>,
 ) -> anyhow::Result<()> {
-    let mut builder = Server::builder();
-    if let Some(tls) = tls {
-        builder = builder.tls_config(tls)?;
+    use futures::StreamExt;
+
+    let service = AgentServiceServer::new(svc);
+    let listener = Arc::new(tokio::net::TcpListener::bind(addr).await?);
+    loop {
+        let mut builder = Server::builder();
+        let mut changes = tls.clone();
+        if let Some(rx) = &mut changes {
+            builder = builder.tls_config(rx.borrow_and_update().clone())?;
+        }
+        // Ends the stream, and so this generation, when a new config arrives.
+        let reload = async move {
+            let changed = match &mut changes {
+                Some(rx) => rx.changed().await.is_ok(),
+                None => false,
+            };
+            if !changed {
+                std::future::pending::<()>().await;
+            }
+        };
+        let incoming = futures::stream::unfold(listener.clone(), |listener| async move {
+            let accepted = listener.accept().await.map(|(stream, _)| stream);
+            Some((accepted, listener))
+        })
+        .take_until(reload);
+        builder
+            .add_service(service.clone())
+            .serve_with_incoming(incoming)
+            .await?;
     }
-    builder
-        .add_service(AgentServiceServer::new(svc))
-        .serve(addr)
-        .await?;
-    Ok(())
 }
 
 #[tonic::async_trait]

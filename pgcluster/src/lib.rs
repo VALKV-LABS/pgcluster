@@ -36,6 +36,36 @@ fn raft_bind_addr(peer_addr: &str) -> String {
     }
 }
 
+/// Read the certificate files again on SIGHUP, and apply them to everything that
+/// holds one. Connections stay up. Files that do not load leave the old ones in
+/// use, which still work: they are renewed well before they expire.
+fn spawn_certificate_reload(
+    cfg: Arc<config::PgClusterConfig>,
+    client_tls: tls::SharedClientTls,
+    acceptor: tls::SharedAcceptor,
+    server_tls: tokio::sync::watch::Sender<tonic::transport::ServerTlsConfig>,
+    pool: Arc<agent_clients::AgentClientPool>,
+) -> Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut hangup = signal(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        while hangup.recv().await.is_some() {
+            match tls::TlsManager::new(&cfg.tls) {
+                Ok(manager) => {
+                    client_tls.store(Arc::new(manager.tonic_client_tls_config()));
+                    acceptor.store(Arc::new(manager.server_tls_acceptor()));
+                    server_tls.send_replace(manager.tonic_server_tls_config());
+                    pool.clear();
+                    info!("reloaded certificates");
+                }
+                Err(e) => error!(err = format!("{e:#}"), "kept the old certificates"),
+            }
+        }
+    });
+    Ok(())
+}
+
 /// Start the full pgcluster server from the given config file path.
 pub async fn run_server(config_path: &str) -> Result<()> {
     // sqlx's runtime-tokio-rustls pulls in aws-lc-rs alongside our ring feature;
@@ -74,8 +104,18 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         ca_pem: tls_mgr.as_ref().map(|t| t.ca_cert_pem().to_vec()),
     };
 
-    let raft_tls = tls_mgr.as_ref().map(|t| t.tonic_client_tls_config());
-    let raft_node = Arc::new(raft::RaftNode::start(&cfg, raft_tls).await?);
+    // Each of these is swapped when certificates reload.
+    let client_tls = tls_mgr
+        .as_ref()
+        .map(|t| tls::shared_client_tls(t.tonic_client_tls_config()));
+    let acceptor: Option<tls::SharedAcceptor> = tls_mgr
+        .as_ref()
+        .map(|t| Arc::new(arc_swap::ArcSwap::from_pointee(t.server_tls_acceptor())));
+    let server_tls = tls_mgr
+        .as_ref()
+        .map(|t| tokio::sync::watch::channel(t.tonic_server_tls_config()));
+
+    let raft_node = Arc::new(raft::RaftNode::start(&cfg, client_tls.clone()).await?);
     let topology_rx = raft_node.topology_rx.clone();
 
     // On bootstrap, seed the Raft topology from the TOML [[nodes.node]] list.
@@ -134,8 +174,8 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     }
     let metrics = metrics_registry::Metrics::new()?;
 
-    let pool = Arc::new(match tls_mgr.as_ref() {
-        Some(t) => agent_clients::AgentClientPool::new_with_tls(t.tonic_client_tls_config()),
+    let pool = Arc::new(match client_tls.as_ref() {
+        Some(tls) => agent_clients::AgentClientPool::new_with_tls(tls.clone()),
         None => agent_clients::AgentClientPool::new(),
     });
 
@@ -144,11 +184,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     let quorum = Arc::new(raft::lease::QuorumLease::new(
         std::time::Duration::from_millis(cfg.proxy.quorum_lease_ms),
     ));
-    raft::lease::spawn_renewal(
-        quorum.clone(),
-        raft_node.raft.clone(),
-        tls_mgr.as_ref().map(|t| t.tonic_client_tls_config()),
-    );
+    raft::lease::spawn_renewal(quorum.clone(), raft_node.raft.clone(), client_tls.clone());
     let proxy_router = Arc::new(
         proxy::Router::new(topology_rx.clone(), cfg.proxy.read_routing.clone())
             .with_quorum(quorum.clone()),
@@ -182,7 +218,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     // Raft gRPC peer server
     {
         let addr_str = raft_grpc_addr.clone();
-        let raft_tls = tls_mgr.as_ref().map(|t| t.tonic_server_tls_config());
+        let raft_tls = server_tls.as_ref().map(|(_, rx)| rx.clone());
         let raft = raft_node.raft.clone();
         tasks.push(tokio::spawn(async move {
             let addr: std::net::SocketAddr = match addr_str.parse() {
@@ -257,6 +293,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
             proxy_cfg,
             proxy_router.clone(),
             proxy_tls,
+            acceptor.clone(),
             proxy_metrics,
             Arc::new(proxy::auth::AuthQuery::new(auth_role.clone())),
             allowlist,
@@ -319,6 +356,12 @@ pub async fn run_server(config_path: &str) -> Result<()> {
             pool.clone(),
         );
         tasks.push(tokio::spawn(async move { scheduler.run().await }));
+    }
+
+    if let (Some(client_tls), Some(acceptor), Some((server_tls, _))) =
+        (client_tls, acceptor, server_tls)
+    {
+        spawn_certificate_reload(cfg.clone(), client_tls, acceptor, server_tls, pool.clone())?;
     }
 
     info!(raft_grpc = %raft_grpc_addr, api = %cfg.api.listen_addr,

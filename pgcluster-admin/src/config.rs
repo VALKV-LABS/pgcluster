@@ -26,9 +26,11 @@ pub struct AdminConfig {
 pub struct ApiConfig {
     #[serde(default = "default_api_listen")]
     pub listen_addr: String,
-    /// Bearer tokens accepted by the admin API. There is no way to run without.
+    /// SHA-256 of each accepted API key, in hex, so a copy of this file cannot
+    /// call the API. `pgcluster-admin generate-key` makes a key and its hash.
+    /// There is no way to run without one.
     #[serde(default)]
-    pub api_keys: Vec<String>,
+    pub api_key_hashes: Vec<String>,
     /// Development only: serve the admin API in plaintext.
     #[serde(default)]
     pub insecure_plaintext: bool,
@@ -88,6 +90,10 @@ fn default_bootstrap_token_ttl() -> u32 {
     60
 }
 
+fn is_sha256(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 impl AdminConfig {
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -99,11 +105,14 @@ impl AdminConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.api.api_keys.is_empty() {
-            anyhow::bail!("[api] api_keys must contain at least one key");
+        if self.api.api_key_hashes.is_empty() {
+            anyhow::bail!(
+                "[api] api_key_hashes must contain at least one hash. \
+                 Run pgcluster-admin generate-key to make a key"
+            );
         }
-        if self.api.api_keys.iter().any(|k| k.trim().is_empty()) {
-            anyhow::bail!("[api] api_keys must not contain an empty key");
+        if !self.api.api_key_hashes.iter().all(|h| is_sha256(h)) {
+            anyhow::bail!("[api] api_key_hashes must each be 64 hex digits");
         }
         for (name, addr) in [
             ("api", &self.api.listen_addr),
@@ -119,8 +128,7 @@ impl AdminConfig {
             anyhow::bail!("[tls] server_names must contain at least one name");
         }
         for host in &self.bootstrap_hosts {
-            let hash = &host.token_sha256;
-            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if !is_sha256(&host.token_sha256) {
                 anyhow::bail!(
                     "[[bootstrap_hosts]] {} token_sha256 must be 64 hex digits",
                     host.name
@@ -137,7 +145,7 @@ mod tests {
 
     const VALID: &str = r#"
 [api]
-api_keys = ["key"]
+api_key_hashes = ["ab0d8f2c6a1e4b7790c3de15f24a6b8c1d3e5f7091a2b4c6d8e0f1a3b5c7d9e1"]
 
 [tls]
 ca_dir       = "/ca"
@@ -160,14 +168,24 @@ server_names = ["admin.internal"]
 
     #[test]
     fn api_keys_are_required() {
-        let text = VALID.replace(r#"api_keys = ["key"]"#, "");
-        let err = parse(&text).unwrap_err().to_string();
-        assert!(err.contains("api_keys"), "{err}");
+        let start = VALID.find("api_key_hashes").unwrap();
+        let end = VALID[start..].find('\n').unwrap() + start;
+        let err = parse(&VALID.replace(&VALID[start..end], ""))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("api_key_hashes"), "{err}");
     }
 
     #[test]
-    fn an_empty_key_is_refused() {
-        let text = VALID.replace(r#"["key"]"#, r#"["  "]"#);
+    fn a_plain_key_in_place_of_a_hash_is_refused() {
+        let start = VALID.find("ab0d").unwrap();
+        let text = VALID.replace(&VALID[start..start + 64], "a-plain-key");
+        assert!(parse(&text).is_err());
+    }
+
+    #[test]
+    fn the_old_setting_is_refused_rather_than_ignored() {
+        let text = VALID.replace("api_key_hashes", "api_keys");
         assert!(parse(&text).is_err());
     }
 

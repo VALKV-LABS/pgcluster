@@ -121,6 +121,9 @@ impl InstanceManager<'_> {
                 .log(instance.operation_id.as_deref(), "restarting the instance")
                 .await;
             self.runner.restart(&processes).await?;
+        } else if files.certificate {
+            // Reloads the allowlist too, so a change to both needs only this.
+            self.reload_certificates(instance, &processes).await?;
         } else if files.proxy_config {
             self.runner.reload_proxy(&processes).await?;
         }
@@ -173,14 +176,13 @@ impl InstanceManager<'_> {
     ) -> Result<FilesChanged> {
         let secrets = &instance.secrets;
         let tls = layout.tls();
-        let mut restart = false;
-        for (name, contents) in [
-            ("ca.crt", &secrets.ca_cert_pem),
-            ("node.crt", &secrets.cert_pem),
-            ("node.key", &secrets.key_pem),
-        ] {
-            restart |= write_private_if_changed(&tls.join(name), contents, self.run_as)?;
-        }
+        let mut restart =
+            write_private_if_changed(&tls.join("ca.crt"), &secrets.ca_cert_pem, self.run_as)?;
+        // Both are in place before anything is told to read them.
+        let mut certificate =
+            write_private_if_changed(&tls.join("node.key"), &secrets.key_pem, self.run_as)?;
+        certificate |=
+            write_private_if_changed(&tls.join("node.crt"), &secrets.cert_pem, self.run_as)?;
         restart |= write_private_if_changed(
             &layout.agent_config(),
             &render::agent_toml(instance, layout, pg_bin),
@@ -195,8 +197,35 @@ impl InstanceManager<'_> {
         )?;
         Ok(FilesChanged {
             restart,
+            certificate,
             proxy_config,
         })
+    }
+
+    /// Move every process to a renewed certificate. Nothing restarts, so clients
+    /// stay connected.
+    async fn reload_certificates(&self, instance: &Instance, processes: &Processes) -> Result<()> {
+        self.runner.reload_certificates(processes).await?;
+        let output = command_as(&processes.pg_ctl, self.run_as)
+            .arg("reload")
+            .arg("-D")
+            .arg(processes.layout.data())
+            .output()
+            .await
+            .context("run pg_ctl")?;
+        if !output.status.success() {
+            bail!(
+                "pg_ctl reload failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        self.client
+            .log(
+                instance.operation_id.as_deref(),
+                "loaded the new certificate",
+            )
+            .await;
+        Ok(())
     }
 
     /// Create the data directory once. Returns whether this call did.
@@ -460,6 +489,8 @@ impl InstanceManager<'_> {
 struct FilesChanged {
     /// Something a running process read at startup.
     restart: bool,
+    /// The node's own certificate, which running processes can reload.
+    certificate: bool,
     /// `pgcluster.toml`, which holds the allowlist.
     proxy_config: bool,
 }

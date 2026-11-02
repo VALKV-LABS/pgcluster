@@ -105,7 +105,7 @@ impl RaftNode {
     /// connections. `None` → plaintext, for development.
     pub async fn start(
         cfg: &PgClusterConfig,
-        raft_tls: Option<tonic::transport::ClientTlsConfig>,
+        raft_tls: Option<crate::tls::SharedClientTls>,
     ) -> Result<Self> {
         let raft_config = Arc::new(
             OpenRaftConfig {
@@ -225,22 +225,46 @@ impl RaftGrpcServer {
 ///
 /// `tls` must require client certificates in production; `None` → plaintext,
 /// for development.
+///
+/// A new value on `tls` starts a new generation of the server on the same
+/// listener. Connections already open finish on the old certificate, and the
+/// port never stops accepting, so a renewal interrupts nothing.
 pub async fn serve_grpc(
     raft: RaftClient,
     addr: std::net::SocketAddr,
-    tls: Option<tonic::transport::ServerTlsConfig>,
+    tls: Option<tokio::sync::watch::Receiver<tonic::transport::ServerTlsConfig>>,
 ) -> Result<()> {
+    use futures::StreamExt;
+
     let (raft_svc, topo_svc) = RaftGrpcServer::new(raft).into_services();
-    let mut builder = tonic::transport::Server::builder();
-    if let Some(tls) = tls {
-        builder = builder.tls_config(tls)?;
+    let listener = std::sync::Arc::new(tokio::net::TcpListener::bind(addr).await?);
+    loop {
+        let mut builder = tonic::transport::Server::builder();
+        let mut changes = tls.clone();
+        if let Some(rx) = &mut changes {
+            builder = builder.tls_config(rx.borrow_and_update().clone())?;
+        }
+        // Ends the stream, and so this generation, when a new config arrives.
+        let reload = async move {
+            let changed = match &mut changes {
+                Some(rx) => rx.changed().await.is_ok(),
+                None => false,
+            };
+            if !changed {
+                std::future::pending::<()>().await;
+            }
+        };
+        let incoming = futures::stream::unfold(listener.clone(), |listener| async move {
+            let accepted = listener.accept().await.map(|(stream, _)| stream);
+            Some((accepted, listener))
+        })
+        .take_until(reload);
+        builder
+            .add_service(raft_svc.clone())
+            .add_service(topo_svc.clone())
+            .serve_with_incoming(incoming)
+            .await?;
     }
-    builder
-        .add_service(raft_svc)
-        .add_service(topo_svc)
-        .serve(addr)
-        .await?;
-    Ok(())
 }
 
 #[async_trait::async_trait]

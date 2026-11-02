@@ -93,7 +93,7 @@ pub async fn run(config_path: &str) -> Result<()> {
     MIGRATOR.run(&pool).await.context("run migrations")?;
     load_bootstrap_hosts(&pool, &config).await?;
 
-    let state = AdminState::new(pool, ca.clone(), secrets, &config.api.api_keys);
+    let state = AdminState::new(pool, ca.clone(), secrets, &config.api.api_key_hashes)?;
     let server_cert = ca.issue_server(&config.tls.server_names)?;
 
     let agent_listener = TcpListener::bind(&config.agent_api.listen_addr)

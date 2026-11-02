@@ -22,7 +22,7 @@ ENV
 cat > /etc/pgcluster-admin/config.toml <<'TOML'
 [api]
 listen_addr = "0.0.0.0:8443"
-api_keys    = ["${api_key}"]
+api_key_hashes = ["${api_key_hash}"]
 
 [agent_api]
 listen_addr = "0.0.0.0:8444"

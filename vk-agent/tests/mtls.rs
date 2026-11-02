@@ -60,7 +60,8 @@ async fn start_agent() -> (SocketAddr, TempDir) {
         .local_addr()
         .unwrap();
     let server_tls = vk_agent::tls::server_tls_config(&tls).unwrap();
-    tokio::spawn(serve(svc, addr, Some(server_tls)));
+    let (_, rx) = tokio::sync::watch::channel(server_tls);
+    tokio::spawn(serve(svc, addr, Some(rx)));
     tokio::time::sleep(Duration::from_millis(200)).await;
     (addr, dir)
 }

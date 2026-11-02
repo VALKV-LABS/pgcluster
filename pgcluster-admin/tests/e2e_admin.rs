@@ -15,7 +15,7 @@ use sqlx::{ConnectOptions, Connection, PgConnection};
 
 const PROJECT: &str = "pgcluster-admin-e2e";
 const ADMIN_URL: &str = "https://localhost:18443";
-const API_KEY: &str = "dev-admin-key";
+const API_KEY: &str = "dev-admin-key-for-the-local-stack-only";
 const HOST: &str = "host-1";
 const CONSOLE_URL: &str = "http://localhost:18080";
 
@@ -220,7 +220,10 @@ impl Endpoint {
 }
 
 async fn scalar(connection: &mut PgConnection, sql: &str) -> String {
+    // Unnamed: the proxy pools by transaction, so a named statement can be gone
+    // from the backend a later query lands on.
     sqlx::query_scalar::<_, String>(sql)
+        .persistent(false)
         .fetch_one(connection)
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"))
@@ -430,6 +433,103 @@ fn cli_fails(service: &str, args: &str) -> String {
     );
     assert!(!output.status.success());
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// The certificate each TLS port presents, by fingerprint. Connections made here
+/// have no client certificate, which gets far enough to see the server's.
+fn served_fingerprint(port: u16, starttls: bool) -> String {
+    let starttls = if starttls { "-starttls postgres" } else { "" };
+    sh(
+        HOST,
+        &format!(
+            "openssl s_client -connect 127.0.0.1:{port} {starttls} </dev/null 2>/dev/null | \\
+             openssl x509 -noout -fingerprint -sha256"
+        ),
+    )
+}
+
+/// A renewed certificate reaches every process, and no client notices.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn e2e_admin_certificate_renewal_keeps_clients_connected() {
+    let _stack = Stack::up(&[HOST]);
+    let client = admin_client();
+    wait_online(&client, HOST).await;
+    let output = cli(HOST, "database create orders --allow 0.0.0.0/0 --wait");
+    let created = parse_created(&output);
+    let id = created.id.as_str();
+    let endpoint = endpoint(&client, id).await;
+    let mut owner = endpoint.wait_connectable(&created.password).await;
+
+    let file = format!("{}/tls/node.crt", instance_dir(id));
+    let on_disk = || {
+        sh(
+            HOST,
+            &format!("openssl x509 -in {file} -noout -fingerprint -sha256"),
+        )
+    };
+    let old = on_disk();
+    for (port, starttls) in [(20000, true), (20002, true), (20003, false), (20004, false)] {
+        assert_eq!(served_fingerprint(port, starttls), old, "port {port}");
+    }
+    let days = sh(
+        HOST,
+        &format!(
+            "openssl x509 -in {file} -noout -checkend {} >/dev/null && echo long || echo bounded",
+            91 * 86_400
+        ),
+    );
+    assert_eq!(days, "bounded", "certificates must not outlive 90 days");
+    let postmaster = postmaster_pid(HOST, id);
+    let pgcluster_pid = sh(HOST, &format!("cat {}/pgcluster.pid", instance_dir(id)));
+    let agent_pid = sh(HOST, &format!("cat {}/vk-agent.pid", instance_dir(id)));
+
+    // Bring the expiry close, and the reconciler renews it by itself.
+    sh(
+        "admin-db",
+        "psql -U postgres -d pgcluster_admin -c \
+         \"UPDATE nodes SET cert_not_after = now() + interval '1 day'\"",
+    );
+    wait_for("the new certificate", Duration::from_secs(60), async || {
+        let new = on_disk();
+        new != old
+            && [(20000, true), (20002, true), (20003, false), (20004, false)]
+                .iter()
+                .all(|(port, starttls)| served_fingerprint(*port, *starttls) == new)
+    })
+    .await;
+
+    // Nothing restarted, and the connection opened before it all still works.
+    assert_eq!(postmaster_pid(HOST, id), postmaster);
+    assert_eq!(
+        sh(HOST, &format!("cat {}/pgcluster.pid", instance_dir(id))),
+        pgcluster_pid
+    );
+    assert_eq!(
+        sh(HOST, &format!("cat {}/vk-agent.pid", instance_dir(id))),
+        agent_pid
+    );
+    assert_eq!(
+        scalar(&mut owner, "SELECT 'still here'").await,
+        "still here"
+    );
+    endpoint.connect(&created.password).await.unwrap();
+
+    // Past the renewal, heartbeats and failover checks carry on, so nothing
+    // fences. Self-fencing would have stopped Postgres by now.
+    tokio::time::sleep(Duration::from_secs(45)).await;
+    assert_eq!(postmaster_pid(HOST, id), postmaster);
+    assert_eq!(
+        scalar(&mut owner, "SELECT 'still here'").await,
+        "still here"
+    );
+    let database = api(&client, "GET", &format!("/v1/databases/{id}"), None).await;
+    assert_eq!(
+        database["status"], "active",
+        "{}",
+        database["status_reason"]
+    );
+    assert_eq!(database["generation"], 2);
 }
 
 /// Every supported major gets every extension.

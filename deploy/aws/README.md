@@ -29,4 +29,4 @@ Hosts enrol within a few minutes of `apply`. `terraform destroy` removes everyth
 - **Your credentials stay in Terraform.** They never reach `pgcluster-admin` or the hosts. Hosts use an instance role limited to the backup bucket.
 - **`allowed_cidr` has no default.** The admin API and databases accept only that range, and `0.0.0.0/0` is refused.
 - **Enrolment needs no admin key on the hosts.** Terraform generates one single-use token per host, and loads their hashes into `pgcluster-admin` at boot. Tokens last an hour from the admin VM's first start.
-- **Terraform state and each VM's user data hold secrets:** the API key, and on the admin VM the CA key. Treat the state file as a secret. VMs require IMDSv2.
+- **Terraform state holds the API key, and each VM's user data holds secrets**, such as the CA key on the admin VM. The admin VM keeps only a hash of the API key. Treat the state file as a secret. VMs require IMDSv2.

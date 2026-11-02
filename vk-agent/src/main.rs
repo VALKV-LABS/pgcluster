@@ -5,12 +5,35 @@ use std::time::Duration;
 use tracing::info;
 
 use vk_agent::{
-    config::AgentConfig,
+    config::{AgentConfig, AgentTlsConfig},
     heartbeat::HeartbeatTracker,
     postgres::LocalPostgres,
     process::PgCtl,
     server::{serve, AgentServiceImpl},
 };
+
+/// Read the certificate files again on SIGHUP. Files that do not load leave the
+/// old ones in use, which still work: they are renewed well before they expire.
+fn spawn_certificate_reload(
+    tls: AgentTlsConfig,
+    server_tls: tokio::sync::watch::Sender<tonic::transport::ServerTlsConfig>,
+) -> Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut hangup = signal(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        while hangup.recv().await.is_some() {
+            match vk_agent::tls::server_tls_config(&tls) {
+                Ok(config) => {
+                    server_tls.send_replace(config);
+                    info!("reloaded certificates");
+                }
+                Err(e) => tracing::error!(err = format!("{e:#}"), "kept the old certificates"),
+            }
+        }
+    });
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -115,7 +138,9 @@ async fn main() -> Result<()> {
         None
     } else {
         info!(%addr, "gRPC server listening (TLS, client certificates required)");
-        Some(vk_agent::tls::server_tls_config(&config.tls)?)
+        let (tx, rx) = tokio::sync::watch::channel(vk_agent::tls::server_tls_config(&config.tls)?);
+        spawn_certificate_reload(config.tls.clone(), tx)?;
+        Some(rx)
     };
 
     serve(svc, addr, tls).await?;

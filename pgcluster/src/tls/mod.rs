@@ -7,11 +7,24 @@ use std::io::BufReader;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use arc_swap::ArcSwap;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::RootCertStore;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::config::TlsConfig;
+
+/// The client identity for outbound gRPC. A reload swaps it, so it renews without
+/// a restart. Read it when opening a channel, not once.
+pub type SharedClientTls = Arc<ArcSwap<tonic::transport::ClientTlsConfig>>;
+
+/// The proxy's acceptor. A reload swaps it, and connected clients keep theirs.
+pub type SharedAcceptor = Arc<ArcSwap<TlsAcceptor>>;
+
+/// Wrap a config for sharing.
+pub fn shared_client_tls(config: tonic::transport::ClientTlsConfig) -> SharedClientTls {
+    Arc::new(ArcSwap::from_pointee(config))
+}
 
 // ── TlsManager ────────────────────────────────────────────────────────────────
 

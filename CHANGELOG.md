@@ -46,6 +46,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `pgcluster host` and `pgcluster database` commands. `pgcluster database create` generates the password locally and sends only its verifier.
 - `pgcluster console`: a local web page for trying every operation of both planes and checking the result. `make try` starts the full stack and points at it. `make start` now includes `pgcluster-admin`, a host and the console.
 - `[proxy] allowed_cidrs`, reloaded on SIGHUP, and `[proxy] require_tls`.
+- `pgcluster` and `vk-agent` reload their certificates on SIGHUP, with no restart. Node certificates from `pgcluster-admin` last 90 days and renew by themselves.
 - A node image recipe in `images/` and a Terraform template in `deploy/aws/`.
 - Docker image `valkvlabs/pgcluster-admin`.
 - External standbys: `"external": true` on `POST /api/nodes/add` adds a node that follows the primary but stays outside failover, synchronous commit, backups and rolling restarts. `POST /api/nodes/:id/detach` promotes it into an independent database.

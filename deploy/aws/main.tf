@@ -253,7 +253,7 @@ resource "aws_instance" "admin" {
 
   user_data_replace_on_change = true
   user_data = templatefile("${path.module}/templates/admin.sh.tftpl", {
-    api_key        = random_password.api_key.result
+    api_key_hash   = sha256(random_password.api_key.result)
     secret_key     = random_id.secret_key.b64_std
     metadata_db    = random_password.metadata_db.result
     ca_cert        = tls_self_signed_cert.ca.cert_pem

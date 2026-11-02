@@ -21,7 +21,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
 const VERIFIER: &str = "SCRAM-SHA-256$4096:c2FsdHNhbHRzYWx0$c3RvcmVkc3RvcmVk:c2VydmVyc2VydmVy";
-const API_KEY: &str = "test-key";
+const API_KEY: &str = "a-test-key-that-is-long-enough-to-pass";
 
 struct Fixture {
     pool: PgPool,
@@ -65,7 +65,8 @@ impl Fixture {
 
         let ca = Arc::new(Ca::generate("test-ca").unwrap());
         let secrets = SecretBox::from_base64(&BASE64.encode([9u8; 32])).unwrap();
-        let state = AdminState::new(pool.clone(), ca.clone(), secrets, &[API_KEY.to_string()]);
+        let hash = pgcluster_admin::state::hash_api_key(API_KEY).unwrap();
+        let state = AdminState::new(pool.clone(), ca.clone(), secrets, &[hash]).unwrap();
 
         let issued = ca.issue_server(&["127.0.0.1".to_string()]).unwrap();
         let agent_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -446,15 +447,15 @@ async fn bootstrap_hosts_load_once_and_cannot_revive_a_token() {
     let config: AdminConfig = toml::from_str(&format!(
         r#"
 [api]
-api_keys = ["k"]
+api_key_hashes = ["{hash}"]
 [tls]
 ca_dir = "/nonexistent"
 server_names = ["x"]
 [[bootstrap_hosts]]
 name = "boot-1"
-token_sha256 = "{}"
+token_sha256 = "{hash}"
 "#,
-        agent::token_hash(secret)
+        hash = agent::token_hash(secret),
     ))
     .unwrap();
     pgcluster_admin::load_bootstrap_hosts(&f.pool, &config)
@@ -1032,4 +1033,152 @@ async fn a_failed_or_lost_node_degrades_the_database_and_it_recovers() {
     assert_eq!(body["status"], "degraded");
     let (_, hosts) = f.api("GET", "/v1/hosts", None).await;
     assert_eq!(hosts["items"][0]["status"], "offline");
+}
+
+/// A flood of enrolment requests is turned away and leaves the pool usable.
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn an_enrolment_flood_cannot_exhaust_the_metadata_database() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (_, secret) = f.add_host("a").await;
+
+    // Hold the token's row, so each enrolment sits on a database connection.
+    let mut blocker = f.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM enrollment_tokens FOR UPDATE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let url = format!("{}/agent/v1/enroll", f.agent_url);
+    let body = json!({ "token": secret, "csr_pem": "not a request" });
+    let requests: Vec<_> = (0..30)
+        .map(|_| {
+            let (http, url, body) = (f.http.clone(), url.clone(), body.clone());
+            tokio::spawn(async move { http.post(url).json(&body).send().await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Everyone else still gets a connection.
+    let (status, _) = f.api("GET", "/v1/hosts", None).await;
+    assert_eq!(status, 200);
+    blocker.rollback().await.unwrap();
+
+    let mut refused = 0;
+    for request in requests {
+        if request.await.unwrap().unwrap().status() == 429 {
+            refused += 1;
+        }
+    }
+    assert!(refused >= 20, "only {refused} of 30 were refused");
+}
+
+async fn cert_of(f: &Fixture, host: &reqwest::Client) -> String {
+    let (_, state) = f.desired(host, 0).await;
+    state["instances"][0]["secrets"]["cert_pem"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn active_database(f: &Fixture) -> (String, String, reqwest::Client) {
+    let (host_id, secret) = f.add_host("a").await;
+    let host = f.enroll(&secret).await;
+    f.report(&host, 0, json!([])).await;
+    let (database_id, _) = f.create_database("orders").await;
+    f.drain().await;
+    f.report(
+        &host,
+        f.generation(&host_id).await,
+        running(&database_id, 1),
+    )
+    .await;
+    f.hurry().await;
+    f.drain().await;
+    (host_id, database_id, host)
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_new_certificate_is_not_renewed() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (host_id, _, _) = active_database(&f).await;
+    let generation = f.generation(&host_id).await;
+    f.reconciler().renew_certificates().await.unwrap();
+    assert_eq!(f.generation(&host_id).await, generation);
+}
+
+/// A certificate near its end is reissued as an ordinary tracked change.
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_certificate_near_its_end_is_renewed_through_desired_state() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (host_id, database_id, host) = active_database(&f).await;
+    let old_cert = cert_of(&f, &host).await;
+    let old_generation = f.generation(&host_id).await;
+    let (_, state) = f.desired(&host, 0).await;
+    let old_ca = state["instances"][0]["secrets"]["ca_cert_pem"].clone();
+    let old_key = state["instances"][0]["secrets"]["superuser_password"].clone();
+
+    sqlx::query("UPDATE nodes SET cert_not_after = now() + interval '1 day'")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    f.reconciler().renew_certificates().await.unwrap();
+
+    assert_eq!(f.generation(&host_id).await, old_generation + 1);
+    let (_, state) = f.desired(&host, 0).await;
+    let instance = &state["instances"][0];
+    assert_ne!(cert_of(&f, &host).await, old_cert);
+    assert_eq!(instance["generation"], 2);
+    assert_eq!(instance["secrets"]["ca_cert_pem"], old_ca, "same CA");
+    assert_eq!(instance["secrets"]["superuser_password"], old_key);
+
+    // Renewing again finds nothing to do, and the renewed cert is good for months.
+    f.reconciler().renew_certificates().await.unwrap();
+    assert_eq!(f.generation(&host_id).await, old_generation + 1);
+    let days: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM cert_not_after - now())::float8 / 86400 FROM nodes",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert!(days > 80.0, "{days}");
+
+    f.report(
+        &host,
+        f.generation(&host_id).await,
+        running(&database_id, 2),
+    )
+    .await;
+    f.hurry().await;
+    f.drain().await;
+    let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM operations ORDER BY seq")
+        .fetch_all(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(statuses, vec!["succeeded", "succeeded"]);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_host_that_is_away_keeps_its_certificate_until_it_returns() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (host_id, _, _) = active_database(&f).await;
+    for sql in [
+        "UPDATE nodes SET cert_not_after = NULL",
+        "UPDATE hosts SET last_seen_at = now() - interval '5 minutes'",
+    ] {
+        sqlx::query(sql).execute(&f.pool).await.unwrap();
+    }
+    let generation = f.generation(&host_id).await;
+    f.reconciler().renew_certificates().await.unwrap();
+    assert_eq!(f.generation(&host_id).await, generation);
 }

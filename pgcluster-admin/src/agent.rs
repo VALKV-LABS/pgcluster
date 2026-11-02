@@ -9,6 +9,7 @@ use axum::extract::rejection::QueryRejection;
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -32,7 +33,13 @@ const MAX_LOG_BYTES: usize = 8192;
 pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/agent/v1/ca", get(get_ca))
-        .route("/agent/v1/enroll", post(enroll))
+        .route(
+            "/agent/v1/enroll",
+            post(enroll).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                limit_open_route,
+            )),
+        )
         .route("/agent/v1/certificate", post(rotate_certificate))
         .route("/agent/v1/desired-state", get(desired_state))
         .route("/agent/v1/report", post(report))
@@ -43,6 +50,28 @@ pub fn router(state: AdminState) -> Router {
 #[derive(FromRequest)]
 #[from_request(via(axum::Json), rejection(ApiError))]
 struct Body<T>(T);
+
+/// Anyone can reach a route that takes no credentials, so these routes share a
+/// few slots. A flood fails fast here instead of queuing for the database, and
+/// enrolled hosts and operators keep their connections.
+pub async fn limit_open_route(
+    State(state): State<AdminState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    match state.open_routes.clone().try_acquire_owned() {
+        Ok(_permit) => next.run(request).await,
+        Err(_) => (
+            [(header::RETRY_AFTER, "1")],
+            ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_requests",
+                "too many requests, try again shortly",
+            ),
+        )
+            .into_response(),
+    }
+}
 
 /// The enrolled host making this call. A deleted host fails here, which is what
 /// revokes it, even though its certificate has not expired.

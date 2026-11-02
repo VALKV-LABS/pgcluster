@@ -60,7 +60,13 @@ pub fn router(state: AdminState) -> Router {
             require_api_key,
         ));
     Router::new()
-        .route("/health", get(health))
+        .route(
+            "/health",
+            get(health).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::agent::limit_open_route,
+            )),
+        )
         .merge(protected)
         .with_state(state)
 }
@@ -165,6 +171,8 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
+    const KEY: &str = "a-test-key-that-is-long-enough-to-pass";
+
     fn state() -> AdminState {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://nobody@127.0.0.1:1/none")
@@ -173,8 +181,44 @@ mod tests {
             pool,
             Arc::new(Ca::generate("test").unwrap()),
             SecretBox::from_base64(&BASE64.encode([1u8; 32])).unwrap(),
-            &["key".to_string()],
+            &[crate::state::hash_api_key(KEY).unwrap()],
         )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_open_requests_is_turned_away() {
+        let state = state();
+        let _held = state
+            .open_routes
+            .clone()
+            .acquire_many_owned(6)
+            .await
+            .unwrap();
+        let request = Request::get("/health").body(Body::empty()).unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "1");
+    }
+
+    #[tokio::test]
+    async fn a_short_key_never_authenticates_even_with_its_hash_configured() {
+        let short = "short";
+        let hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(short));
+        let state = AdminState::new(
+            state().pool,
+            Arc::new(Ca::generate("test").unwrap()),
+            SecretBox::from_base64(&BASE64.encode([1u8; 32])).unwrap(),
+            &[hash],
+        )
+        .unwrap();
+        assert!(!state.accepts_key(short));
+    }
+
+    #[tokio::test]
+    async fn only_the_right_key_is_accepted() {
+        assert!(state().accepts_key(KEY));
+        assert!(!state().accepts_key("another-key-that-is-long-enough-to-pass"));
     }
 
     /// Every operation of a delivered stage exists, and sits behind the key;
@@ -199,7 +243,7 @@ mod tests {
                         .method(method.to_uppercase().as_str())
                         .uri(&uri);
                     if authorized {
-                        request = request.header(header::AUTHORIZATION, "Bearer key");
+                        request = request.header(header::AUTHORIZATION, format!("Bearer {KEY}"));
                     }
                     request.body(Body::empty()).unwrap()
                 };

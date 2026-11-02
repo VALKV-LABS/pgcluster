@@ -1,6 +1,7 @@
 [api]
 listen_addr = "0.0.0.0:8443"
-api_keys    = ["dev-admin-key"]
+# SHA-256 of dev-admin-key-for-the-local-stack-only, the key in admin-compose.yml.
+api_key_hashes = ["a82de29c7a49e719b1ace45c970ad5b6b3ca5edd8b4656b79f4ea13c3d6d3063"]
 
 [agent_api]
 listen_addr = "0.0.0.0:8444"

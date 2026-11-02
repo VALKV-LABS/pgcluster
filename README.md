@@ -101,7 +101,7 @@ It is for one operator on their own machine, not a portal for users.
 ```bash
 docker compose -f docker/e2e-compose.yml -f docker/admin-compose.yml cp pgcluster-admin:/ca/ca.crt admin-ca.crt
 export PGCLUSTER_ADMIN_URL=https://localhost:18443
-export PGCLUSTER_ADMIN_KEY=dev-admin-key
+export PGCLUSTER_ADMIN_KEY=dev-admin-key-for-the-local-stack-only
 export PGCLUSTER_ADMIN_CA=admin-ca.crt
 
 pgcluster host list

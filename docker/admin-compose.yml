@@ -10,7 +10,7 @@
 # Quick start: run `make try`, and open the console. From a shell:
 #   docker compose -f docker/admin-compose.yml cp pgcluster-admin:/ca/ca.crt admin-ca.crt
 #   export PGCLUSTER_ADMIN_URL=https://localhost:18443
-#   export PGCLUSTER_ADMIN_KEY=dev-admin-key
+#   export PGCLUSTER_ADMIN_KEY=dev-admin-key-for-the-local-stack-only
 #   export PGCLUSTER_ADMIN_CA=admin-ca.crt
 #   pgcluster host list
 #   pgcluster database create orders --allow 0.0.0.0/0 --extension vector --wait
@@ -115,7 +115,7 @@ services:
       - --cluster-url=http://pgcluster-2:8009
       - --cluster-url=http://pgcluster-3:8009
     environment:
-      PGCLUSTER_ADMIN_KEY: dev-admin-key
+      PGCLUSTER_ADMIN_KEY: dev-admin-key-for-the-local-stack-only
       PGCLUSTER_API_KEY: dev-api-key
       PGCLUSTER_CONSOLE_SQL_URL: postgres://postgres:test@pgcluster-1:5432/postgres?sslmode=require
     depends_on:

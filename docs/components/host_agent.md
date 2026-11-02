@@ -49,6 +49,7 @@ Each instance is two processes: `vk-agent`, which owns Postgres, and `pgcluster`
 |---|---|
 | New instance | Writes its files, runs `initdb --data-checksums`, starts it, then creates the roles, the database and the extensions |
 | `allowed_cidrs` | Rewrites `pgcluster.toml` and sends SIGHUP. Connected clients stay connected |
+| Renewed certificate | Replaces the files, sends SIGHUP to `vk-agent` and `pgcluster`, and runs `pg_ctl reload`. Nothing restarts, and connected clients stay connected |
 | Extensions with no preload | `CREATE EXTENSION` or `DROP EXTENSION`, as the superuser, so the owner never needs to be one |
 | `pg_tle`, `pg_cron`, memory | Rewrites `pgcluster-managed.conf` and restarts the instance |
 | Owner verifier | `ALTER ROLE`, only when the verifier in desired state changed, so a later change cannot undo a password the owner set with SQL |

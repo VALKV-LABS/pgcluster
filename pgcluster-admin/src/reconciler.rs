@@ -24,6 +24,9 @@ const PORT_BASE_END: i32 = 32760;
 const PORT_BLOCK: i32 = 10;
 
 const WAIT_RETRY: Duration = Duration::from_secs(1);
+/// Renew a node certificate with this long left, which leaves room for a host
+/// to be away for weeks before anything expires.
+const CERT_RENEW_DAYS: i32 = 30;
 const SWEEP_EVERY_TICKS: u32 = 10;
 
 type Tx<'a> = Transaction<'a, Postgres>;
@@ -74,6 +77,9 @@ impl Reconciler {
             if ticks.is_multiple_of(SWEEP_EVERY_TICKS) {
                 if let Err(e) = self.sweep().await {
                     tracing::error!(err = %e, "health sweep failed");
+                }
+                if let Err(e) = self.renew_certificates().await {
+                    tracing::error!(err = format!("{e:#}"), "certificate renewal failed");
                 }
             }
             tokio::time::sleep(self.tick).await;
@@ -222,11 +228,7 @@ impl Reconciler {
         };
 
         let ca = crate::ca::Ca::generate(&format!("pgcluster-{name}"))?;
-        let mut names = vec!["127.0.0.1".to_string(), "localhost".to_string()];
-        if !names.contains(&address) {
-            names.insert(0, address.clone());
-        }
-        let issued = ca.issue_node(&names)?;
+        let issued = ca.issue_node(&node_names(&address))?;
         let database_secrets = DatabaseSecrets {
             ca_cert_pem: ca.cert_pem().to_string(),
             ca_key_pem: ca.key_pem(),
@@ -236,6 +238,7 @@ impl Reconciler {
             api_key: random_token(),
         };
         let node = "n1";
+        let cert_not_after = issued.not_after;
         let node_secrets = NodeSecrets {
             cert_pem: issued.cert_pem,
             key_pem: issued.key_pem,
@@ -252,8 +255,8 @@ impl Reconciler {
             .execute(&mut **tx)
             .await?;
         sqlx::query(
-            "INSERT INTO nodes (database_id, node, host_id, port_base, secrets) \
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO nodes (database_id, node, host_id, port_base, secrets, cert_not_after) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(&step.database_id)
         .bind(node)
@@ -264,6 +267,7 @@ impl Reconciler {
                 .secrets
                 .seal(&format!("{}/{node}", step.database_id), &node_secrets)?,
         )
+        .bind(cert_not_after)
         .execute(&mut **tx)
         .await?;
         bump_host(tx, &host_id).await?;
@@ -275,6 +279,110 @@ impl Reconciler {
         )
         .await?;
         Ok(Outcome::Done)
+    }
+
+    /// Reissue node certificates that are near their end, as a change like any
+    /// other: a new generation, published to the host, tracked by an operation.
+    /// Hosts that are away are skipped until they return, and a database that is
+    /// busy waits for its next turn.
+    pub async fn renew_certificates(&self) -> Result<()> {
+        let due: Vec<(String, String)> = sqlx::query_as(
+            "SELECT n.database_id, n.node FROM nodes n \
+             JOIN databases d ON d.id = n.database_id \
+             JOIN hosts h ON h.id = n.host_id \
+             WHERE NOT n.retracted \
+               AND d.status IN ('active', 'degraded') \
+               AND (n.cert_not_after IS NULL \
+                    OR n.cert_not_after < now() + make_interval(days => $1)) \
+               AND h.last_seen_at > now() - make_interval(secs => $2) \
+               AND NOT EXISTS (SELECT 1 FROM operations o \
+                               WHERE o.database_id = d.id \
+                                 AND o.status IN ('pending', 'running'))",
+        )
+        .bind(CERT_RENEW_DAYS)
+        .bind(ONLINE_WINDOW_SECONDS as f64)
+        .fetch_all(&self.state.pool)
+        .await
+        .context("find certificates to renew")?;
+        for (database_id, node) in due {
+            self.renew_certificate(&database_id, &node)
+                .await
+                .with_context(|| format!("renew {database_id}/{node}"))?;
+        }
+        Ok(())
+    }
+
+    async fn renew_certificate(&self, database_id: &str, node: &str) -> Result<()> {
+        let mut tx = self.state.pool.begin().await?;
+        let sealed: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT secrets FROM databases \
+             WHERE id = $1 AND status IN ('active', 'degraded') FOR UPDATE",
+        )
+        .bind(database_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        // The lock may have waited out a delete or another operation.
+        let busy: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM operations \
+                            WHERE database_id = $1 AND status IN ('pending', 'running'))",
+        )
+        .bind(database_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let Some(sealed) = sealed.filter(|_| !busy) else {
+            return Ok(());
+        };
+        let (host_id, address): (String, String) = sqlx::query_as(
+            "SELECT h.id, h.address FROM nodes n JOIN hosts h ON h.id = n.host_id \
+             WHERE n.database_id = $1 AND n.node = $2",
+        )
+        .bind(database_id)
+        .bind(node)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let secrets: DatabaseSecrets = self.state.secrets.open(database_id, &sealed)?;
+        let ca = crate::ca::Ca::from_pem(&secrets.ca_cert_pem, &secrets.ca_key_pem)?;
+        let issued = ca.issue_node(&node_names(&address))?;
+        let not_after = issued.not_after;
+        let node_secrets = NodeSecrets {
+            cert_pem: issued.cert_pem,
+            key_pem: issued.key_pem,
+        };
+        sqlx::query(
+            "UPDATE nodes SET secrets = $3, cert_not_after = $4 \
+             WHERE database_id = $1 AND node = $2",
+        )
+        .bind(database_id)
+        .bind(node)
+        .bind(
+            self.state
+                .secrets
+                .seal(&format!("{database_id}/{node}"), &node_secrets)?,
+        )
+        .bind(not_after)
+        .execute(&mut *tx)
+        .await?;
+        let generation: i64 = sqlx::query_scalar(
+            "UPDATE databases SET generation = generation + 1, updated_at = now() \
+             WHERE id = $1 RETURNING generation",
+        )
+        .bind(database_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        bump_host(&mut tx, &host_id).await?;
+        let operation = operations::create(&mut tx, database_id, Kind::Update, generation).await?;
+        operations::log(
+            &mut tx,
+            &operation.id,
+            "reconciler",
+            &format!("renewed the certificate of {node}"),
+        )
+        .await?;
+        tx.commit().await?;
+        tracing::info!(database_id, node, "renewed a node certificate");
+        Ok(())
     }
 
     /// Reflect node and host health in each database's status.
@@ -307,6 +415,15 @@ impl Reconciler {
         .context("mark recovered databases")?;
         Ok(())
     }
+}
+
+/// The names on a node's certificate. Local processes connect over loopback.
+fn node_names(address: &str) -> Vec<String> {
+    let mut names = vec!["127.0.0.1".to_string(), "localhost".to_string()];
+    if !names.iter().any(|name| name == address) {
+        names.insert(0, address.to_string());
+    }
+    names
 }
 
 pub async fn bump_host(tx: &mut Tx<'_>, host_id: &str) -> Result<(), sqlx::Error> {

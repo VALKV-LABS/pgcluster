@@ -51,6 +51,8 @@ paths:
                 properties:
                   status:
                     type: string
+        "429":
+          $ref: "#/components/responses/Error"
         "503":
           $ref: "#/components/responses/Error"
   /v1/hosts:

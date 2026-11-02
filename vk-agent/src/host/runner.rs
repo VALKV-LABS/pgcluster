@@ -65,6 +65,8 @@ pub trait Runner: Send + Sync {
     async fn restart(&self, processes: &Processes) -> Result<()>;
     /// Have `pgcluster` read its allowlist again, keeping connected clients.
     async fn reload_proxy(&self, processes: &Processes) -> Result<()>;
+    /// Have `vk-agent` and `pgcluster` read their certificates again.
+    async fn reload_certificates(&self, processes: &Processes) -> Result<()>;
     async fn is_running(&self, processes: &Processes) -> Result<bool>;
     /// Stop the instance and forget it. Its directory stays.
     async fn remove(&self, processes: &Processes) -> Result<()>;
@@ -106,6 +108,7 @@ pub fn agent_unit(processes: &Processes) -> String {
          Type=simple\n\
          {user}\
          ExecStart={program} {config}\n\
+         ExecReload=/bin/kill -HUP $MAINPID\n\
          Restart=always\n\
          RestartSec=2\n\
          KillMode=control-group\n\
@@ -219,6 +222,12 @@ impl Runner for Systemd {
 
     async fn reload_proxy(&self, processes: &Processes) -> Result<()> {
         systemctl(&["reload", &proxy_unit_name(&processes.id)]).await
+    }
+
+    async fn reload_certificates(&self, processes: &Processes) -> Result<()> {
+        let agent = agent_unit_name(&processes.id);
+        let proxy = proxy_unit_name(&processes.id);
+        systemctl(&["reload", &agent, &proxy]).await
     }
 
     async fn is_running(&self, processes: &Processes) -> Result<bool> {
@@ -424,6 +433,14 @@ impl Runner for Plain {
         let pid = live_pid(&pid_path(layout, "pgcluster"), &layout.pgcluster_config())
             .context("pgcluster is not running")?;
         kill(pid, Signal::SIGHUP).context("signal pgcluster")
+    }
+
+    async fn reload_certificates(&self, processes: &Processes) -> Result<()> {
+        let layout = &processes.layout;
+        let pid = live_pid(&pid_path(layout, "vk-agent"), &layout.agent_config())
+            .context("vk-agent is not running")?;
+        kill(pid, Signal::SIGHUP).context("signal vk-agent")?;
+        self.reload_proxy(processes).await
     }
 
     async fn is_running(&self, processes: &Processes) -> Result<bool> {

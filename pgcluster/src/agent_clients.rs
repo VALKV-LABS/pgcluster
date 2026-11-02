@@ -10,6 +10,8 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use tonic::transport::ClientTlsConfig;
 
+use crate::tls::SharedClientTls;
+
 // ── AgentClient ───────────────────────────────────────────────────────────────
 
 /// A gRPC client for a single vk-agent instance.
@@ -264,7 +266,7 @@ impl AgentClient {
 pub struct AgentClientPool {
     channels: DashMap<String, tonic::transport::Channel>,
     /// `None` → plaintext connections.
-    tls: Option<ClientTlsConfig>,
+    tls: Option<SharedClientTls>,
 }
 
 impl AgentClientPool {
@@ -277,7 +279,7 @@ impl AgentClientPool {
     }
 
     /// Create a pool that connects to agents with `tls`.
-    pub fn new_with_tls(tls: ClientTlsConfig) -> Self {
+    pub fn new_with_tls(tls: SharedClientTls) -> Self {
         Self {
             channels: DashMap::new(),
             tls: Some(tls),
@@ -293,7 +295,8 @@ impl AgentClientPool {
         if let Some(ch) = self.channels.get(node_id) {
             return Ok(AgentClient::from_channel(addr, ch.value().clone()));
         }
-        let channel = make_channel(addr, self.tls.clone()).await?;
+        let tls = self.tls.as_ref().map(|t| ClientTlsConfig::clone(&t.load()));
+        let channel = make_channel(addr, tls).await?;
         self.channels.insert(node_id.to_string(), channel.clone());
         Ok(AgentClient::from_channel(addr, channel))
     }
@@ -303,6 +306,11 @@ impl AgentClientPool {
     /// Call this after any RPC error to avoid reusing a broken channel.
     pub fn remove(&self, node_id: &str) {
         self.channels.remove(node_id);
+    }
+
+    /// Forget every channel, so new ones present a renewed certificate.
+    pub fn clear(&self) {
+        self.channels.clear();
     }
 }
 
