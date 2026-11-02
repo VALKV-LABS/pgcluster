@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pgcluster console</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --ink: #1c2330; --muted: #5f6b7c; --line: #dfe3e9;
+    --accent: #2457c5; --accent-ink: #fff; --good: #1a7f4b; --warn: #a86400; --bad: #b3261e;
+    --code: #f0f2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12161d; --panel: #1a2029; --ink: #e6e9ee; --muted: #9aa5b4; --line: #2c3440;
+      --accent: #7ba4f7; --accent-ink: #0d1420; --good: #5fce95; --warn: #e6b05c; --bad: #f28b82;
+      --code: #232a35;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+           background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; }
+  nav { display: flex; gap: 4px; }
+  nav button { background: none; color: var(--muted); border: 0; padding: 6px 12px; border-radius: 6px; }
+  nav button[aria-selected="true"] { background: var(--code); color: var(--ink); font-weight: 600; }
+  .health { margin-left: auto; display: flex; gap: 14px; color: var(--muted); font-size: 13px; }
+  main { max-width: 1120px; margin: 0 auto; padding: 20px; display: grid; gap: 16px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  section h2 { font-size: 15px; margin: 0 0 12px; }
+  section h3 { font-size: 13px; margin: 16px 0 8px; color: var(--muted); }
+  p.hint { color: var(--muted); margin: 0 0 12px; }
+  form, .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+  label { display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
+  input, select, textarea { font: inherit; color: var(--ink); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  textarea { width: 100%; font-family: ui-monospace, Menlo, monospace; min-height: 72px; }
+  button { font: inherit; cursor: pointer; }
+  button.primary, button.plain, button.danger { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line); }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button.plain { background: var(--panel); color: var(--ink); }
+  button.danger { background: var(--panel); color: var(--bad); border-color: var(--bad); }
+  button:disabled { opacity: .5; cursor: wait; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover, tr.selected { background: var(--code); }
+  code, pre { font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; }
+  pre { background: var(--code); padding: 10px; border-radius: 6px; overflow: auto; max-height: 280px; margin: 8px 0 0; white-space: pre-wrap; word-break: break-word; }
+  .status { font-weight: 600; }
+  .good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .once { border: 1px solid var(--warn); border-radius: 6px; padding: 10px; margin-top: 12px; word-break: break-all; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+  .card { border: 1px solid var(--line); border-radius: 6px; padding: 10px; }
+  .card span { display: block; font-size: 12px; color: var(--muted); }
+  .checks { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .checks label { display: flex; gap: 4px; align-items: center; color: var(--ink); font-size: 13px; }
+  #activity div { padding: 4px 0; border-bottom: 1px solid var(--line); }
+  #activity time { color: var(--muted); margin-right: 8px; }
+  .empty { color: var(--muted); padding: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>pgcluster console</h1>
+  <nav id="tabs" role="tablist"></nav>
+  <div class="health" id="health"></div>
+</header>
+<main id="main"></main>
+<main>
+  <section>
+    <h2>Activity</h2>
+    <div id="activity"><div class="empty">What you do here appears in this list, with the reply.</div></div>
+  </section>
+</main>
+<script>
+"use strict";
+
+// Builds elements from data. Everything shown comes from a server, so text only
+// ever goes in through text nodes.
+function el(tag, attrs, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else if (value === true) node.setAttribute(key, "");
+    else if (value !== false && value != null) node.setAttribute(key, value);
+  }
+  for (const child of children.flat()) {
+    if (child != null) node.append(child);
+  }
+  return node;
+}
+
+const EXTENSIONS = ["uuid-ossp", "pgcrypto", "pg_trgm", "unaccent", "vector",
+                    "pg_stat_statements", "pg_tle", "postgis", "pg_cron"];
+const PRELOAD = new Set(["pg_tle", "pg_cron"]);
+const WAIT_MS = 1500;
+const WAIT_TIMEOUT_MS = 660000;
+
+const state = {
+  tab: "databases",
+  selected: null,
+  passwords: {},   // Held in this page only, and gone on reload.
+  once: null,
+};
+
+async function call(method, path, body) {
+  const response = await fetch(path, {
+    method,
+    headers: { "content-type": "application/json", "x-pgcluster-console": "1" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!response.ok) {
+    const message = data && data.error ? data.error.message
+      : data && data.message ? data.message : text || response.statusText;
+    throw new Error(message);
+  }
+  return data;
+}
+
+function log(message, detail, kind) {
+  const box = document.getElementById("activity");
+  box.querySelector(".empty")?.remove();
+  const line = el("div", {},
+    el("time", {}, new Date().toLocaleTimeString()),
+    el("span", { class: kind || "" }, message),
+    detail === undefined ? null : el("pre", {}, typeof detail === "string" ? detail : JSON.stringify(detail, null, 2)));
+  box.prepend(line);
+  while (box.children.length > 30) box.lastChild.remove();
+}
+
+// Runs an action from a button, reports it, then redraws.
+async function act(label, action) {
+  try {
+    const result = await action();
+    log(label, result === undefined ? undefined : result, "good");
+    return result;
+  } catch (error) {
+    log(`${label} failed: ${error.message}`, undefined, "bad");
+    return undefined;
+  } finally {
+    await draw();
+  }
+}
+
+async function waitFor(operation) {
+  const path = `/admin/v1/databases/${operation.database_id}/operations/${operation.id}`;
+  const deadline = Date.now() + WAIT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const current = await call("GET", path);
+    if (current.status === "succeeded") return current;
+    if (current.status === "failed") throw new Error(current.error || "the operation failed");
+    await new Promise(done => setTimeout(done, WAIT_MS));
+    await draw();
+  }
+  throw new Error("timed out waiting for the operation");
+}
+
+function statusClass(status) {
+  const word = String(status).toLowerCase();
+  if (["active", "online", "running", "succeeded", "done", "primary", "replica"].includes(word)) return "good";
+  if (["error", "failed", "offline"].includes(word)) return "bad";
+  return "warn";
+}
+
+function statusCell(status) {
+  return el("span", { class: `status ${statusClass(status)}` }, status ?? "unknown");
+}
+
+function table(columns, rows, options = {}) {
+  if (!rows.length) return el("div", { class: "empty" }, options.empty || "Nothing yet.");
+  return el("table", {},
+    el("thead", {}, el("tr", {}, columns.map(c => el("th", {}, c.label)))),
+    el("tbody", {}, rows.map(row => el("tr", {
+      class: [options.onrow ? "clickable" : "", options.selected?.(row) ? "selected" : ""].join(" ").trim() || null,
+      onclick: options.onrow ? () => options.onrow(row) : null,
+    }, columns.map(c => el("td", {}, c.cell(row)))))));
+}
+
+function field(label, input) { return el("label", {}, label, input); }
+
+function formValues(form) { return Object.fromEntries(new FormData(form).entries()); }
+
+function checks(name, selected) {
+  return el("div", { class: "checks" }, EXTENSIONS.map(extension => el("label", {},
+    el("input", { type: "checkbox", name, value: extension, checked: selected.includes(extension) }),
+    extension, PRELOAD.has(extension) ? " (restarts)" : "")));
+}
+
+function checked(form, name) {
+  return [...form.querySelectorAll(`input[name="${name}"]:checked`)].map(input => input.value);
+}
+
+function words(text) { return text.split(/[\s,]+/).filter(Boolean); }
+
+function sqlBox(target, examples) {
+  const output = el("div", {});
+  const area = el("textarea", { "aria-label": "SQL", spellcheck: "false" }, examples[0]);
+  const run = async () => {
+    output.replaceChildren(el("div", { class: "empty" }, "Running…"));
+    try {
+      const result = await call("POST", "/console/sql", { ...target(), sql: area.value });
+      output.replaceChildren(result.columns.length
+        ? el("div", {},
+            table(result.columns.map((label, i) => ({ label, cell: row => row[i] ?? "NULL" })), result.rows),
+            result.truncated ? el("div", { class: "empty" }, "Showing the first rows.") : null)
+        : el("div", { class: "empty" }, "Done, with no rows."));
+    } catch (error) {
+      output.replaceChildren(el("pre", { class: "bad" }, error.message));
+    }
+  };
+  return el("div", {}, area,
+    el("div", { class: "row" },
+      el("button", { class: "primary", onclick: run }, "Run"),
+      examples.slice(1).map(sql => el("button", { class: "plain", onclick: () => { area.value = sql; run(); } }, sql.slice(0, 44)))),
+    output);
+}
+
+// ── Databases ─────────────────────────────────────────────────────────────────
+
+function createDatabaseForm(hosts) {
+  const form = el("form", { onsubmit: async event => {
+    event.preventDefault();
+    const values = formValues(form);
+    const button = form.querySelector("button");
+    button.disabled = true;
+    await act(`Create ${values.name}`, async () => {
+      const secret = await call("POST", "/console/password");
+      const body = {
+        name: values.name,
+        version: values.version,
+        resources: { vcpu: Number(values.vcpu), memory_gb: Number(values.memory_gb), storage_gb: Number(values.storage_gb) },
+        owner: { username: values.owner, scram_verifier: secret.scram_verifier },
+        allowed_cidrs: words(values.cidrs),
+        extensions: checked(form, "extension"),
+      };
+      if (values.host) body.hosts = [values.host];
+      const operation = await call("POST", "/admin/v1/databases", body);
+      state.passwords[operation.database_id] = { username: values.owner, password: secret.password };
+      state.once = { label: `Password for ${values.owner} on ${values.name}. It is not stored, and this page forgets it on reload.`, value: secret.password };
+      state.selected = operation.database_id;
+      await draw();
+      await waitFor(operation);
+      return { database: operation.database_id, status: "active" };
+    });
+    button.disabled = false;
+  } },
+    field("Name", el("input", { name: "name", required: true, pattern: "[a-z_][a-z0-9_]*", value: "orders" })),
+    field("Postgres", el("select", { name: "version" }, ["18", "17", "16"].map(v => el("option", {}, v)))),
+    field("Owner role", el("input", { name: "owner", required: true, value: "app_owner" })),
+    field("vCPU", el("input", { name: "vcpu", type: "number", step: "0.5", min: "0.5", value: "1", style: "width:70px" })),
+    field("Memory GB", el("input", { name: "memory_gb", type: "number", step: "0.5", min: "0.5", value: "1", style: "width:80px" })),
+    field("Storage GB", el("input", { name: "storage_gb", type: "number", min: "1", value: "10", style: "width:80px" })),
+    field("Host", el("select", { name: "host" }, el("option", { value: "" }, "Most free"),
+      hosts.filter(h => h.status === "online").map(h => el("option", { value: h.id }, h.name)))),
+    field("Allowed CIDRs", el("input", { name: "cidrs", value: "0.0.0.0/0", size: 20 })),
+    checks("extension", ["vector"]),
+    el("button", { class: "primary" }, "Create database"));
+  return form;
+}
+
+async function databaseDetail(id) {
+  const [database, nodes, operations] = await Promise.all([
+    call("GET", `/admin/v1/databases/${id}`),
+    call("GET", `/admin/v1/databases/${id}/nodes`),
+    call("GET", `/admin/v1/databases/${id}/operations?limit=50`),
+  ]);
+  const latest = [...operations.items].sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+  const detail = latest ? await call("GET", `/admin/v1/databases/${id}/operations/${latest.id}`) : null;
+  const endpoint = database.endpoint;
+  const secret = state.passwords[id];
+  const change = (label, path, method, body) => act(label, async () => {
+    const operation = await call(method, `/admin/v1/databases/${id}/${path}`, body);
+    await waitFor(operation);
+    return "applied";
+  });
+
+  const allow = el("input", { value: database.allowed_cidrs.join(" "), size: 30, "aria-label": "Allowed CIDRs" });
+  const extensionForm = el("form", { onsubmit: event => {
+    event.preventDefault();
+    change("Change extensions", "extensions", "PUT", { extensions: checked(extensionForm, "installed") });
+  } }, checks("installed", database.extensions), el("button", { class: "plain" }, "Apply extensions"));
+
+  const password = el("input", { type: "password", value: secret?.password || "", "aria-label": "Owner password", size: 30 });
+  const sqlTarget = () => ({
+    target: "database", host: endpoint.host, port: endpoint.port, database: endpoint.database,
+    username: database.owner_username, password: password.value, ca_cert_pem: endpoint.ca_cert_pem,
+  });
+
+  return el("section", {},
+    el("h2", {}, database.name, " ", statusCell(database.status)),
+    database.status_reason ? el("p", { class: "bad" }, database.status_reason) : null,
+    endpoint ? el("code", {}, `postgres://${database.owner_username}@${endpoint.host}:${endpoint.port}/${endpoint.database}?sslmode=verify-full`) : null,
+    el("h3", {}, "Nodes"),
+    table([
+      { label: "Node", cell: n => n.node },
+      { label: "Host", cell: n => n.host_name },
+      { label: "Port", cell: n => String(n.port_base) },
+      { label: "Generation", cell: n => `${n.observed_generation} of ${database.generation}` },
+      { label: "State", cell: n => statusCell(n.state) },
+      { label: "Error", cell: n => n.error || "" },
+    ], nodes.items, { empty: "Not placed yet." }),
+    el("h3", {}, "Allowlist. Empty means no access"),
+    el("div", { class: "row" }, allow,
+      el("button", { class: "plain", onclick: () =>
+        change("Change allowlist", "allowlist", "PUT", { allowed_cidrs: words(allow.value) }) }, "Apply allowlist")),
+    el("h3", {}, "Extensions"),
+    extensionForm,
+    el("h3", {}, "Owner password"),
+    el("div", { class: "row" },
+      el("button", { class: "plain", onclick: () => act("Rotate password", async () => {
+        const generated = await call("POST", "/console/password");
+        const operation = await call("POST", `/admin/v1/databases/${id}/owner-password`, { scram_verifier: generated.scram_verifier });
+        state.passwords[id] = { username: database.owner_username, password: generated.password };
+        state.once = { label: `New password for ${database.owner_username}. It is not stored, and this page forgets it on reload.`, value: generated.password };
+        await waitFor(operation);
+        return "applied";
+      }) }, "Generate a new password")),
+    endpoint ? [
+      el("h3", {}, "Verify with SQL, as the owner, over verified TLS"),
+      el("div", { class: "row" }, field("Owner password", password)),
+      sqlBox(sqlTarget, [
+        "SELECT current_user, current_database(), version();",
+        "SELECT extname, extversion FROM pg_extension ORDER BY 1;",
+        "SELECT rolname, rolsuper, rolcreatedb FROM pg_roles WHERE rolname = current_user;",
+      ]),
+    ] : null,
+    latest ? [
+      el("h3", {}, `Latest operation: ${latest.kind}`),
+      table([
+        { label: "Step", cell: s => s.name },
+        { label: "Status", cell: s => statusCell(s.status) },
+        { label: "Attempts", cell: s => String(s.attempts) },
+      ], detail.steps),
+      el("pre", {}, detail.logs.map(l => `${l.source}: ${l.message}`).join("\n") || "No log lines yet."),
+    ] : null,
+    el("h3", {}, "Delete"),
+    el("button", { class: "danger", onclick: () => {
+      if (!confirm(`Delete ${database.name} and all its data?`)) return;
+      act(`Delete ${database.name}`, async () => {
+        const operation = await call("DELETE", `/admin/v1/databases/${id}`);
+        state.selected = null;
+        await waitFor(operation);
+        return "deleted";
+      });
+    } }, "Delete this database"));
+}
+
+async function drawDatabases() {
+  const [databases, hosts] = await Promise.all([call("GET", "/admin/v1/databases"), call("GET", "/admin/v1/hosts")]);
+  const parts = [
+    el("section", {}, el("h2", {}, "Create a database"),
+      el("p", { class: "hint" }, "The password is generated by this console, and only its verifier goes to pgcluster-admin."),
+      createDatabaseForm(hosts.items),
+      state.once ? el("div", { class: "once" }, el("div", {}, state.once.label), el("code", {}, state.once.value)) : null),
+    el("section", {}, el("h2", {}, "Databases"),
+      table([
+        { label: "Name", cell: d => d.name },
+        { label: "Status", cell: d => statusCell(d.status) },
+        { label: "Postgres", cell: d => d.version },
+        { label: "Endpoint", cell: d => d.endpoint ? `${d.endpoint.host}:${d.endpoint.port}` : "" },
+        { label: "Generation", cell: d => String(d.generation) },
+      ], databases.items, {
+        empty: "No databases yet.",
+        selected: d => d.id === state.selected,
+        onrow: d => { state.selected = d.id; draw(); },
+      })),
+  ];
+  if (state.selected && databases.items.some(d => d.id === state.selected)) {
+    parts.push(await databaseDetail(state.selected));
+  }
+  return parts;
+}
+
+// ── Hosts ─────────────────────────────────────────────────────────────────────
+
+async function drawHosts() {
+  const hosts = await call("GET", "/admin/v1/hosts");
+  const capacity = c => c ? `${c.vcpu.toFixed(1)} vCPU, ${c.memory_gb.toFixed(1)} GB, ${c.storage_gb.toFixed(0)} GB disk` : "";
+  const form = el("form", { onsubmit: event => {
+    event.preventDefault();
+    const values = formValues(form);
+    act(`Add host ${values.name}`, async () => {
+      const created = await call("POST", "/admin/v1/hosts", { name: values.name, failure_domain: values.domain || undefined });
+      state.once = { label: `Enrolment token for ${values.name}. It works once, within 15 minutes, and is not shown again.`, value: created.enrollment_token };
+      return { host: created.host.id, expires_at: created.expires_at };
+    });
+  } },
+    field("Name", el("input", { name: "name", required: true })),
+    field("Failure domain", el("input", { name: "domain" })),
+    el("button", { class: "primary" }, "Add host"));
+  return [
+    el("section", {}, el("h2", {}, "Add a host"),
+      el("p", { class: "hint" }, "Gives a single-use token. Save it on the machine, and vk-agent host enrols with it."),
+      form,
+      state.once ? el("div", { class: "once" }, el("div", {}, state.once.label), el("code", {}, state.once.value)) : null),
+    el("section", {}, el("h2", {}, "Hosts"),
+      table([
+        { label: "Name", cell: h => h.name },
+        { label: "Status", cell: h => statusCell(h.status) },
+        { label: "Address", cell: h => h.address || "" },
+        { label: "Capacity", cell: h => capacity(h.capacity) },
+        { label: "Free", cell: h => capacity(h.free_capacity) },
+        { label: "", cell: h => el("button", { class: "danger", onclick: () => {
+            if (confirm(`Remove host ${h.name}?`)) act(`Remove host ${h.name}`, () => call("DELETE", `/admin/v1/hosts/${h.id}`));
+          } }, "Remove") },
+      ], hosts.items)),
+  ];
+}
+
+// ── Cluster ───────────────────────────────────────────────────────────────────
+
+async function drawCluster() {
+  const [status, nodes, replication, history, restart, overview] = await Promise.all([
+    call("GET", "/cluster/api/status"),
+    call("GET", "/cluster/api/nodes"),
+    call("GET", "/cluster/api/replication"),
+    call("GET", "/cluster/api/failover/history"),
+    call("GET", "/cluster/api/restart"),
+    call("GET", "/console/overview"),
+  ]);
+  const list = nodes.nodes;
+  const standbys = list.filter(n => n.node_id !== status.primary_node_id);
+  const target = el("select", { "aria-label": "Switchover target" }, standbys.map(n => el("option", {}, n.node_id)));
+  const mode = el("select", { "aria-label": "Replication mode" }, ["async", "sync", "sync_strict"].map(m =>
+    el("option", { selected: m === replication.mode }, m)));
+  const events = Array.isArray(history) ? history : history.history;
+  return [
+    el("section", {}, el("h2", {}, "Three-node cluster"),
+      el("div", { class: "cards" },
+        el("div", { class: "card" }, el("span", {}, "Primary"), status.primary_node_id || "none"),
+        el("div", { class: "card" }, el("span", {}, "Raft leader"), String(status.raft_leader_id ?? "none")),
+        el("div", { class: "card" }, el("span", {}, "Topology version"), String(status.topology_version)),
+        el("div", { class: "card" }, el("span", {}, "Replication"), `${replication.mode}${replication.degraded ? " (degraded)" : ""}`)),
+      el("h3", {}, "Nodes"),
+      table([
+        { label: "Node", cell: n => n.node_id },
+        { label: "Role", cell: n => statusCell(n.role) },
+        { label: "Lag bytes", cell: n => String(n.lag_bytes) },
+        { label: "Maintenance", cell: n => {
+            const on = String(n.role).toLowerCase() === "maintenance";
+            return el("button", { class: "plain", onclick: () => act(`${on ? "End" : "Start"} maintenance on ${n.node_id}`,
+              () => call(on ? "DELETE" : "POST", `/cluster/api/maintenance/${n.node_id}`)) }, on ? "End" : "Start");
+          } },
+      ], list)),
+    el("section", {}, el("h2", {}, "Operations"),
+      el("h3", {}, "Planned switchover"),
+      el("div", { class: "row" }, target, el("button", { class: "primary", onclick: () =>
+        act(`Switch over to ${target.value}`, () => call("POST", "/cluster/api/switchover", { target_node_id: target.value })) }, "Switch over")),
+      el("h3", {}, "Replication mode"),
+      el("div", { class: "row" }, mode, el("button", { class: "plain", onclick: () =>
+        act(`Set mode ${mode.value}`, () => call("POST", "/cluster/api/replication/mode", { mode: mode.value })) }, "Apply")),
+      el("h3", {}, "Rolling restart"),
+      el("div", { class: "row" },
+        el("button", { class: "plain", disabled: restart.running, onclick: () => act("Rolling restart", () => call("POST", "/cluster/api/restart")) },
+          restart.running ? "Restart running" : "Start rolling restart"),
+        restart.error ? el("span", { class: "bad" }, restart.error) : null),
+      el("h3", {}, "Manual failover. This abandons the primary"),
+      el("button", { class: "danger", onclick: () => {
+        if (confirm(`Fail over away from ${status.primary_node_id}?`)) {
+          act("Failover", () => call("POST", "/cluster/api/failover", { failed_node_id: status.primary_node_id }));
+        }
+      } }, `Fail over from ${status.primary_node_id || "the primary"}`),
+      el("h3", {}, "Failover history"),
+      table([
+        { label: "When", cell: e => e.triggered_at },
+        { label: "From", cell: e => e.old_primary },
+        { label: "To", cell: e => e.new_primary },
+        { label: "Took", cell: e => `${e.duration_ms} ms` },
+        { label: "Reason", cell: e => e.reason },
+      ], events.slice(-5).reverse(), { empty: "No failovers yet." })),
+    overview.cluster_sql ? el("section", {}, el("h2", {}, "Verify with SQL, through the proxy"),
+      el("p", { class: "hint" }, "Writes reach whichever node is primary, so these show a switchover take effect."),
+      sqlBox(() => ({ target: "cluster" }), [
+        "SELECT inet_server_addr() AS node, pg_is_in_recovery() AS standby, now();",
+        "CREATE TABLE IF NOT EXISTS probe (at timestamptz DEFAULT now(), node inet DEFAULT inet_server_addr());",
+        "INSERT INTO probe DEFAULT VALUES RETURNING *;",
+        "SELECT * FROM probe ORDER BY at DESC LIMIT 10;",
+      ])) : null,
+  ];
+}
+
+// ── Backups ───────────────────────────────────────────────────────────────────
+
+async function drawBackups() {
+  const [backups, restore] = await Promise.all([call("GET", "/cluster/api/backups"), call("GET", "/cluster/api/backups/restore")]);
+  const list = backups.backups;
+  const restoreForm = el("form", { onsubmit: event => {
+    event.preventDefault();
+    const values = formValues(restoreForm);
+    act("Restore", () => call("POST", "/cluster/api/backups/restore", {
+      agent_addr: values.agent_addr, backup_name: values.backup_name, target_time: values.target_time, force: values.force === "on",
+    }));
+  } },
+    field("Agent to restore onto", el("input", { name: "agent_addr", value: "vk-agent-4:7001", required: true })),
+    field("Backup, or empty for the latest", el("input", { name: "backup_name" })),
+    field("Recover to, or empty for the end of the WAL", el("input", { name: "target_time", placeholder: "2026-11-01 12:00:00+00", size: 26 })),
+    el("label", { style: "display:flex;gap:4px;align-items:center" }, el("input", { type: "checkbox", name: "force" }), "Discard data on the target"),
+    el("button", { class: "primary" }, "Start restore"));
+  return [
+    el("section", {}, el("h2", {}, "Backups"),
+      el("div", { class: "row" },
+        el("button", { class: "primary", onclick: () => act("Take a backup", () => call("POST", "/cluster/api/backups", { label: "console" })) }, "Take a backup now"),
+        el("button", { class: "plain", onclick: () => act("Check the WAL archive", () => call("GET", "/cluster/api/backups/verify")) }, "Check the WAL archive")),
+      el("h3", {}, "Stored backups"),
+      table([
+        { label: "Label", cell: b => b.label },
+        { label: "Kind", cell: b => b.frequency },
+        { label: "Source", cell: b => b.source_node },
+        { label: "Finished", cell: b => new Date(b.completed_at * 1000).toLocaleString() },
+        { label: "Size", cell: b => `${(b.size_bytes / 1048576).toFixed(1)} MB` },
+        { label: "Status", cell: b => statusCell(typeof b.status === "string" ? b.status : JSON.stringify(b.status)) },
+        { label: "", cell: b => el("button", { class: "danger", onclick: () => {
+            if (confirm(`Delete backup ${b.label}?`)) act(`Delete backup ${b.label}`, () => call("DELETE", `/cluster/api/backups/${encodeURIComponent(b.backup_id)}`));
+          } }, "Delete") },
+      ], list, { empty: "No backups yet." })),
+    el("section", {}, el("h2", {}, "Restore to a point in time"),
+      el("p", { class: "hint" }, "Restores onto a separate agent, as an independent database. The cluster stays up."),
+      restoreForm,
+      el("pre", {}, JSON.stringify(restore, null, 2))),
+  ];
+}
+
+// ── Page ──────────────────────────────────────────────────────────────────────
+
+const TABS = {
+  databases: ["Databases", drawDatabases],
+  hosts: ["Hosts", drawHosts],
+  cluster: ["Cluster", drawCluster],
+  backups: ["Backups", drawBackups],
+};
+
+function drawTabs() {
+  document.getElementById("tabs").replaceChildren(...Object.entries(TABS).map(([key, [label]]) =>
+    el("button", { role: "tab", "aria-selected": String(key === state.tab), onclick: () => {
+      state.tab = key;
+      state.once = null;
+      draw();
+    } }, label)));
+}
+
+async function drawHealth() {
+  const overview = await call("GET", "/console/overview").catch(() => null);
+  const item = (label, ok, text) => el("span", {}, `${label}: `, el("span", { class: ok ? "good" : "bad" }, text));
+  document.getElementById("health").replaceChildren(
+    item("pgcluster-admin", overview?.admin, overview?.admin ? "up" : "down"),
+    item("cluster", overview?.cluster, overview?.cluster ? `primary ${overview.cluster_primary ?? "none"}` : "down"));
+}
+
+// Keeps what someone is typing: a refresh must not wipe a form.
+function busy() {
+  const active = document.activeElement;
+  return active && document.getElementById("main").contains(active) && /INPUT|TEXTAREA|SELECT/.test(active.tagName);
+}
+
+let drawing = false;
+async function draw() {
+  if (drawing) return;
+  drawing = true;
+  drawTabs();
+  try {
+    const parts = await TABS[state.tab][1]();
+    document.getElementById("main").replaceChildren(...parts.flat().filter(Boolean));
+  } catch (error) {
+    document.getElementById("main").replaceChildren(el("section", {},
+      el("h2", {}, "This part of the stack is not answering"),
+      el("pre", { class: "bad" }, error.message),
+      el("p", { class: "hint" }, "Start everything with make try.")));
+  } finally {
+    drawing = false;
+  }
+}
+
+draw();
+drawHealth();
+setInterval(() => { drawHealth(); if (!busy()) draw(); }, 5000);
+</script>
+</body>
+</html>

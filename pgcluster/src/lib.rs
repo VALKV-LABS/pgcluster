@@ -7,6 +7,7 @@ pub mod api;
 pub mod backup;
 pub mod cli;
 pub mod config;
+pub mod console;
 pub mod failover;
 pub mod logging;
 pub mod metrics_registry;

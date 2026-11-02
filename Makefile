@@ -78,10 +78,22 @@ test-integ:  ## Build, run all tests inside Docker, then tear down
 
 ##@ E2E Stack — full 3-node pgcluster cluster
 
-.PHONY: start stop logs status restart
+.PHONY: start try stop logs status restart
 
 start:  ## Start the 3-node cluster, pgcluster-admin and a host
 	docker compose -f $(COMPOSE_E2E) -f $(COMPOSE_ADMIN) up -d --build --wait
+
+try: start  ## Start the full stack, then try it in the console at localhost:18080
+	@echo
+	@echo "  Console:  http://localhost:18080"
+	@echo
+	@echo "  Databases  create one, change its allowlist and extensions, and check it with SQL"
+	@echo "  Cluster    switch over, change replication mode, restart, and watch writes follow"
+	@echo "  Backups    take a backup, check the WAL archive, and restore to a point in time"
+	@echo
+	@echo "  make logs   follow the logs"
+	@echo "  make stop   remove the stack and its data"
+	@echo
 
 stop:  ## Stop and remove the full stack (deletes volumes)
 	docker compose -f $(COMPOSE_E2E) -f $(COMPOSE_ADMIN) down -v --remove-orphans

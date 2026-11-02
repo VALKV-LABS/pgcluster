@@ -228,7 +228,7 @@ fn pretty(value: &Value) -> Result<()> {
 }
 
 /// A password and its verifier. The password stays on this machine.
-fn generate_password() -> (String, String) {
+pub fn generate_password() -> (String, String) {
     let mut rng = rand::thread_rng();
     let mut secret = [0u8; 24];
     let mut salt = [0u8; 16];

@@ -5,8 +5,9 @@
 #   admin API           → https://localhost:18443
 #   agent API           → https://localhost:18444
 #   instance port blocks → localhost:20000-20039
+#   console             → http://localhost:18080
 #
-# Quick start:
+# Quick start: run `make try`, and open the console. From a shell:
 #   docker compose -f docker/admin-compose.yml cp pgcluster-admin:/ca/ca.crt admin-ca.crt
 #   export PGCLUSTER_ADMIN_URL=https://localhost:18443
 #   export PGCLUSTER_ADMIN_KEY=dev-admin-key
@@ -90,8 +91,40 @@ services:
       - host-instances:/var/lib/pgcluster
     ports:
       - "20000-20039:20000-20039"
+      - "127.0.0.1:18080:8080"
     healthcheck:
       test: ["CMD-SHELL", "test -f /var/lib/vk-agent-host/host_id"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # A local page for trying every operation. It shares host-1's network, because
+  # databases there advertise localhost, and a client must connect by that name
+  # for TLS to verify. Only loopback reaches it, and it holds the stack's keys.
+  console:
+    build:
+      context: ..
+      dockerfile: docker/pgcluster.Dockerfile
+    network_mode: service:host-1
+    command:
+      - console
+      - --listen=0.0.0.0:8080
+      - --admin-url=https://pgcluster-admin:8443
+      - --admin-ca=/ca/ca.crt
+      - --cluster-url=http://pgcluster-1:8009
+      - --cluster-url=http://pgcluster-2:8009
+      - --cluster-url=http://pgcluster-3:8009
+    environment:
+      PGCLUSTER_ADMIN_KEY: dev-admin-key
+      PGCLUSTER_API_KEY: dev-api-key
+      PGCLUSTER_CONSOLE_SQL_URL: postgres://postgres:test@pgcluster-1:5432/postgres?sslmode=require
+    depends_on:
+      host-1:
+        condition: service_healthy
+    volumes:
+      - admin-ca:/ca:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/ -o /dev/null || exit 1"]
       interval: 2s
       timeout: 5s
       retries: 30

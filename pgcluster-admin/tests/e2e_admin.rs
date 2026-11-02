@@ -17,6 +17,7 @@ const PROJECT: &str = "pgcluster-admin-e2e";
 const ADMIN_URL: &str = "https://localhost:18443";
 const API_KEY: &str = "dev-admin-key";
 const HOST: &str = "host-1";
+const CONSOLE_URL: &str = "http://localhost:18080";
 
 fn root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -29,6 +30,7 @@ fn compose_command(args: &[&str]) -> Command {
     let mut command = Command::new("docker");
     command
         .args(["compose", "-p", PROJECT, "--profile", "systemd"])
+        .args(["-f", "docker/e2e-compose.yml"])
         .args(["-f", "docker/admin-compose.yml"]);
     if let Ok(path) = std::env::var("E2E_COMPOSE_OVERRIDE") {
         command.args(["-f", &path]);
@@ -133,14 +135,18 @@ async fn wait_for(what: &str, timeout: Duration, mut check: impl AsyncFnMut() ->
 }
 
 async fn wait_online(client: &reqwest::Client, name: &str) {
-    wait_for(&format!("{name} to report"), Duration::from_secs(90), async || {
-        let hosts = api(client, "GET", "/v1/hosts", None).await;
-        hosts["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|h| h["name"] == name && h["status"] == "online")
-    })
+    wait_for(
+        &format!("{name} to report"),
+        Duration::from_secs(90),
+        async || {
+            let hosts = api(client, "GET", "/v1/hosts", None).await;
+            hosts["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["name"] == name && h["status"] == "online")
+        },
+    )
     .await;
 }
 
@@ -321,9 +327,11 @@ async fn e2e_admin_one_node_database() {
     // An empty allowlist refuses everyone, with no restart.
     let postmaster = postmaster_pid(HOST, id);
     cli(HOST, &format!("database allow {id} --wait"));
-    wait_for("the allowlist to close", Duration::from_secs(20), async || {
-        endpoint.connect(&created.password).await.is_err()
-    })
+    wait_for(
+        "the allowlist to close",
+        Duration::from_secs(20),
+        async || endpoint.connect(&created.password).await.is_err(),
+    )
     .await;
     let connected: String = sqlx::query_scalar("SELECT 'still here'")
         .fetch_one(&mut owner)
@@ -432,7 +440,8 @@ async fn e2e_admin_each_postgres_version() {
     let client = admin_client();
     wait_online(&client, HOST).await;
     for version in ["16", "17", "18"] {
-        let mut args = format!("database create pg{version} --version {version} --allow 0.0.0.0/0 --wait");
+        let mut args =
+            format!("database create pg{version} --version {version} --allow 0.0.0.0/0 --wait");
         for extension in ALL_EXTENSIONS.split(' ') {
             args.push_str(&format!(" --extension {extension}"));
         }
@@ -464,7 +473,10 @@ async fn e2e_admin_systemd_runner() {
         .code()
         != Some(0)
     {
-        assert!(booted.elapsed() < Duration::from_secs(60), "systemd did not boot");
+        assert!(
+            booted.elapsed() < Duration::from_secs(60),
+            "systemd did not boot"
+        );
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     wait_online(&client, SYSTEMD_HOST).await;
@@ -486,10 +498,7 @@ async fn e2e_admin_systemd_runner() {
     // Postgres runs inside the agent's unit, as the postgres user.
     let cgroup = sh(
         SYSTEMD_HOST,
-        &format!(
-            "cat /proc/{}/cgroup",
-            postmaster_pid(SYSTEMD_HOST, id)
-        ),
+        &format!("cat /proc/{}/cgroup", postmaster_pid(SYSTEMD_HOST, id)),
     );
     assert!(cgroup.contains(&agent_unit), "{cgroup}");
     let psql = format!(
@@ -512,7 +521,10 @@ async fn e2e_admin_systemd_runner() {
     assert_eq!(sh(SYSTEMD_HOST, &format!("{psql} 'SELECT 2'")), "2");
 
     // Restart, for a preload extension.
-    cli(SYSTEMD_HOST, &format!("database extensions {id} pg_cron --wait"));
+    cli(
+        SYSTEMD_HOST,
+        &format!("database extensions {id} pg_cron --wait"),
+    );
     assert_ne!(postmaster_pid(SYSTEMD_HOST, id), postmaster);
     assert_eq!(
         sh(
@@ -530,4 +542,252 @@ async fn e2e_admin_systemd_runner() {
         &format!("test -e /etc/systemd/system/{agent_unit}"),
     );
     assert!(!unit_file.status.success(), "the unit file should go");
+}
+
+// ── Console ───────────────────────────────────────────────────────────────────
+
+async fn console_call(
+    client: &reqwest::Client,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let mut request = client
+        .request(method.parse().unwrap(), format!("{CONSOLE_URL}{path}"))
+        .header("x-pgcluster-console", "1");
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
+async fn console(client: &reqwest::Client, method: &str, path: &str, body: Option<Value>) -> Value {
+    let (status, reply) = console_call(client, method, path, body).await;
+    assert!(
+        (200..300).contains(&status),
+        "{method} {path}: {status} {reply}"
+    );
+    reply
+}
+
+async fn console_operation(client: &reqwest::Client, operation: &Value) {
+    let path = format!(
+        "/admin/v1/databases/{}/operations/{}",
+        operation["database_id"].as_str().unwrap(),
+        operation["id"].as_str().unwrap()
+    );
+    wait_for("the operation", Duration::from_secs(120), async || {
+        let current = console(client, "GET", &path, None).await;
+        assert_ne!(current["status"], "failed", "{current}");
+        current["status"] == "succeeded"
+    })
+    .await;
+}
+
+async fn cluster_sql(client: &reqwest::Client, sql: &str) -> Value {
+    let body = serde_json::json!({ "target": "cluster", "sql": sql });
+    console(client, "POST", "/console/sql", Some(body)).await
+}
+
+/// `make try` as its user sees it: everything below goes through the console.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn e2e_admin_console_full_stack() {
+    let _stack = Stack::up(&["console", "pgcluster-1", "pgcluster-2", "pgcluster-3"]);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+        .unwrap();
+
+    let page = client.get(CONSOLE_URL).send().await.unwrap();
+    assert!(page.text().await.unwrap().contains("pgcluster console"));
+
+    wait_for("the stack", Duration::from_secs(120), async || {
+        let overview = console(&client, "GET", "/console/overview", None).await;
+        let hosts = console(&client, "GET", "/admin/v1/hosts", None).await;
+        let online = hosts["items"]
+            .as_array()
+            .is_some_and(|h| h.iter().any(|h| h["status"] == "online"));
+        overview["admin"] == true && overview["cluster_primary"].is_string() && online
+    })
+    .await;
+
+    // A page on another site cannot drive it.
+    let refused = client
+        .post(format!("{CONSOLE_URL}/admin/v1/hosts"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+    let rebound = client
+        .get(CONSOLE_URL)
+        .header("host", "evil.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rebound.status(), 403);
+
+    // Create a database, and check it as its owner over verified TLS.
+    let secret = console(&client, "POST", "/console/password", None).await;
+    let operation = console(
+        &client,
+        "POST",
+        "/admin/v1/databases",
+        Some(serde_json::json!({
+            "name": "from_console",
+            "version": "18",
+            "resources": { "vcpu": 1, "memory_gb": 1, "storage_gb": 10 },
+            "owner": { "username": "app_owner", "scram_verifier": secret["scram_verifier"] },
+            "allowed_cidrs": ["0.0.0.0/0"],
+            "extensions": ["vector"],
+        })),
+    )
+    .await;
+    console_operation(&client, &operation).await;
+    let id = operation["database_id"].as_str().unwrap();
+    let database = console(&client, "GET", &format!("/admin/v1/databases/{id}"), None).await;
+    let endpoint = &database["endpoint"];
+    let result = console(
+        &client,
+        "POST",
+        "/console/sql",
+        Some(serde_json::json!({
+            "target": "database",
+            "host": endpoint["host"],
+            "port": endpoint["port"],
+            "database": endpoint["database"],
+            "username": "app_owner",
+            "password": secret["password"],
+            "ca_cert_pem": endpoint["ca_cert_pem"],
+            "sql": "SELECT current_user, extname FROM pg_extension WHERE extname = 'vector'",
+        })),
+    )
+    .await;
+    assert_eq!(
+        result["columns"],
+        serde_json::json!(["current_user", "extname"])
+    );
+    assert_eq!(
+        result["rows"][0],
+        serde_json::json!(["app_owner", "vector"])
+    );
+
+    // A statement that fails reports why.
+    let (status, reply) = console_call(
+        &client,
+        "POST",
+        "/console/sql",
+        Some(serde_json::json!({ "target": "cluster", "sql": "SELECT nonsense" })),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(reply["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("nonsense"));
+
+    // Switch over, and see writes follow the new primary.
+    wait_for(
+        "standbys to be seeded",
+        Duration::from_secs(120),
+        async || {
+            let nodes = console(&client, "GET", "/cluster/api/nodes", None).await;
+            let nodes = nodes["nodes"].as_array().unwrap();
+            let replicas = nodes
+                .iter()
+                .filter(|n| n["role"].as_str().unwrap().eq_ignore_ascii_case("replica"))
+                .count();
+            replicas >= 2
+        },
+    )
+    .await;
+    cluster_sql(&client, "CREATE TABLE probe (v text)").await;
+    cluster_sql(&client, "INSERT INTO probe VALUES ('before')").await;
+    let before = console(&client, "GET", "/cluster/api/status", None).await;
+    let old_primary = before["primary_node_id"].as_str().unwrap().to_string();
+    let nodes = console(&client, "GET", "/cluster/api/nodes", None).await;
+    let target = nodes["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["node_id"].as_str().unwrap().to_string())
+        .find(|n| *n != old_primary)
+        .unwrap();
+    console(
+        &client,
+        "POST",
+        "/cluster/api/switchover",
+        Some(serde_json::json!({ "target_node_id": target })),
+    )
+    .await;
+    wait_for("the new primary", Duration::from_secs(60), async || {
+        let status = console(&client, "GET", "/cluster/api/status", None).await;
+        status["primary_node_id"] == target.as_str()
+    })
+    .await;
+    let mut written = false;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !written && Instant::now() < deadline {
+        let (status, _) = console_call(
+            &client,
+            "POST",
+            "/console/sql",
+            Some(serde_json::json!({
+                "target": "cluster",
+                "sql": "INSERT INTO probe VALUES ('after')",
+            })),
+        )
+        .await;
+        written = status == 200;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(written, "writes should reach the new primary");
+    let rows = cluster_sql(&client, "SELECT v FROM probe ORDER BY v DESC").await;
+    assert_eq!(rows["rows"], serde_json::json!([["before"], ["after"]]));
+
+    // Replication mode changes online.
+    console(
+        &client,
+        "POST",
+        "/cluster/api/replication/mode",
+        Some(serde_json::json!({ "mode": "sync" })),
+    )
+    .await;
+    let replication = console(&client, "GET", "/cluster/api/replication", None).await;
+    assert_eq!(replication["mode"], "sync");
+
+    // A backup appears, and the WAL archive has no gaps.
+    let label = "from-console";
+    console(
+        &client,
+        "POST",
+        "/cluster/api/backups",
+        Some(serde_json::json!({ "label": label })),
+    )
+    .await;
+    wait_for("the backup", Duration::from_secs(120), async || {
+        let backups = console(&client, "GET", "/cluster/api/backups", None).await;
+        backups["backups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["label"] == label)
+    })
+    .await;
+    console(&client, "GET", "/cluster/api/backups/verify", None).await;
+
+    // Delete the database again.
+    let operation = console(
+        &client,
+        "DELETE",
+        &format!("/admin/v1/databases/{id}"),
+        None,
+    )
+    .await;
+    console_operation(&client, &operation).await;
+    let (status, _) =
+        console_call(&client, "GET", &format!("/admin/v1/databases/{id}"), None).await;
+    assert_eq!(status, 404);
 }
