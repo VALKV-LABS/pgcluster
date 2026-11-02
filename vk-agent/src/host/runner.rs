@@ -56,6 +56,8 @@ pub struct Processes {
     pub user: Option<String>,
 }
 
+// async_trait generates the attribute, so this lint cannot be fixed at the source.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Runner: Send + Sync {
     /// Record how to run the instance. Doing this again changes nothing.
