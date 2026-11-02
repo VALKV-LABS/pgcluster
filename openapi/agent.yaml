@@ -1,0 +1,390 @@
+openapi: 3.1.0
+info:
+  title: pgcluster agent API
+  version: 1.0.0
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+  description: |
+    `vk-agent host` calls these endpoints, and `pgcluster-admin` never calls a
+    host. This is a public contract: anything that serves it can drive
+    `vk-agent host`.
+
+    Connections use TLS with a certificate from the management plane CA. An
+    enrolment token ends in the SHA-256 of that CA's PEM file, so a new host
+    fetches `/agent/v1/ca`, compares the hash and only then trusts the server.
+
+    After enrolment every call uses mutual TLS. The host is identified by its
+    certificate, so it can only read or report its own state.
+servers:
+  - url: https://pgcluster-admin.example.com:8444
+tags:
+  - name: enrolment
+    description: Calls a host makes before it has a client certificate.
+  - name: state
+    description: Calls that need the host's client certificate.
+paths:
+  /agent/v1/ca:
+    get:
+      operationId: getCa
+      summary: Fetch the CA certificate, to compare with the hash in the token
+      tags: [enrolment]
+      security: []
+      responses:
+        "200":
+          description: The CA certificate.
+          content:
+            application/x-pem-file:
+              schema:
+                type: string
+  /agent/v1/enroll:
+    post:
+      operationId: enroll
+      summary: Exchange a single-use token and a key pair for a client certificate
+      description: Tokens are single-use and expire after 15 minutes.
+      tags: [enrolment]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnrollRequest"
+      responses:
+        "200":
+          description: The host's identity and certificate.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnrollResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+  /agent/v1/certificate:
+    post:
+      operationId: rotateCertificate
+      summary: Replace the client certificate before it expires
+      tags: [state]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RotateRequest"
+      responses:
+        "200":
+          description: The new certificate.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RotateResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+  /agent/v1/desired-state:
+    get:
+      operationId: getDesiredState
+      summary: Read the instances this host should run, long-polled
+      tags: [state]
+      parameters:
+        - name: generation
+          in: query
+          description: The generation the host already has. Answers at once if it differs.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+        - name: wait_seconds
+          in: query
+          description: How long to hold the request open.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 60
+            default: 25
+      responses:
+        "200":
+          description: The desired state. Holds secrets, so keep it private.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DesiredState"
+        "304":
+          description: Nothing changed before `wait_seconds` ran out.
+        "401":
+          $ref: "#/components/responses/Error"
+  /agent/v1/report:
+    post:
+      operationId: report
+      summary: Report what is running, the host's address and its capacity
+      tags: [state]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Report"
+      responses:
+        "204":
+          description: Recorded.
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+  /agent/v1/operations/{id}/log:
+    post:
+      operationId: appendOperationLog
+      summary: Append step output to an operation
+      tags: [state]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LogEntry"
+      responses:
+        "204":
+          description: Recorded.
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+security:
+  - mutualTLS: []
+components:
+  securitySchemes:
+    mutualTLS:
+      type: mutualTLS
+  responses:
+    Error:
+      description: The request failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+    EnrollRequest:
+      type: object
+      required: [token, csr_pem]
+      properties:
+        token:
+          type: string
+          description: The part of the enrolment token before the dot.
+        csr_pem:
+          type: string
+          description: A PEM certificate request for a key the host generated.
+    EnrollResponse:
+      type: object
+      required: [host_id, certificate_pem]
+      properties:
+        host_id:
+          type: string
+        certificate_pem:
+          type: string
+    RotateRequest:
+      type: object
+      required: [csr_pem]
+      properties:
+        csr_pem:
+          type: string
+    RotateResponse:
+      type: object
+      required: [certificate_pem]
+      properties:
+        certificate_pem:
+          type: string
+    Resources:
+      type: object
+      required: [vcpu, memory_gb, storage_gb]
+      properties:
+        vcpu:
+          type: number
+          minimum: 0
+        memory_gb:
+          type: number
+          minimum: 0
+        storage_gb:
+          type: number
+          minimum: 0
+    ReplicationMode:
+      type: string
+      enum: [async, sync, sync_strict]
+    Peer:
+      type: object
+      required: [node, address, port_base]
+      properties:
+        node:
+          type: string
+        address:
+          type: string
+        port_base:
+          type: integer
+    Owner:
+      type: object
+      required: [username, scram_verifier]
+      properties:
+        username:
+          type: string
+        scram_verifier:
+          type: string
+    InstanceSecrets:
+      type: object
+      description: Material the instance needs, sent only to the host that runs it.
+      required:
+        - ca_cert_pem
+        - cert_pem
+        - key_pem
+        - superuser_password
+        - replication_password
+        - auth_password
+        - api_key
+      properties:
+        ca_cert_pem:
+          type: string
+        cert_pem:
+          type: string
+        key_pem:
+          type: string
+        superuser_password:
+          type: string
+        replication_password:
+          type: string
+        auth_password:
+          type: string
+        api_key:
+          type: string
+    Instance:
+      type: object
+      required:
+        - database_id
+        - database_name
+        - node
+        - generation
+        - postgres_version
+        - resources
+        - port_base
+        - peers
+        - bootstrap
+        - replication_mode
+        - allowed_cidrs
+        - extensions
+        - owner
+        - secrets
+      properties:
+        database_id:
+          type: string
+        database_name:
+          type: string
+          description: The name of the database created for the owner.
+        node:
+          type: string
+        generation:
+          type: integer
+          format: int64
+          description: The database's generation.
+        operation_id:
+          type: [string, "null"]
+          description: The operation applying this generation, for log lines.
+        postgres_version:
+          type: string
+        resources:
+          $ref: "#/components/schemas/Resources"
+        port_base:
+          type: integer
+          description: First of ten consecutive ports.
+        peers:
+          type: array
+          items:
+            $ref: "#/components/schemas/Peer"
+        bootstrap:
+          type: string
+          enum: [initdb]
+        replication_mode:
+          $ref: "#/components/schemas/ReplicationMode"
+        allowed_cidrs:
+          type: array
+          items:
+            type: string
+          description: Empty means no access.
+        extensions:
+          type: array
+          items:
+            type: string
+        owner:
+          $ref: "#/components/schemas/Owner"
+        secrets:
+          $ref: "#/components/schemas/InstanceSecrets"
+    DesiredState:
+      type: object
+      required: [generation, instances]
+      properties:
+        generation:
+          type: integer
+          format: int64
+          description: The host's generation, which increases with any change to its instances.
+        instances:
+          type: array
+          items:
+            $ref: "#/components/schemas/Instance"
+    InstanceReport:
+      type: object
+      required: [database_id, node, observed_generation, state]
+      properties:
+        database_id:
+          type: string
+        node:
+          type: string
+        observed_generation:
+          type: integer
+          format: int64
+        state:
+          type: string
+          enum: [starting, running, failed]
+        error:
+          type: [string, "null"]
+    Report:
+      type: object
+      required: [observed_generation, version, address, capacity, instances]
+      properties:
+        observed_generation:
+          type: integer
+          format: int64
+        version:
+          type: string
+          description: The `vk-agent` version.
+        address:
+          type: string
+          description: The address clients and peers use to reach this host.
+        capacity:
+          $ref: "#/components/schemas/Resources"
+        instances:
+          type: array
+          items:
+            $ref: "#/components/schemas/InstanceReport"
+    LogEntry:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string

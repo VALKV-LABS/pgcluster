@@ -237,6 +237,8 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
     // Proxy server + health endpoint
     {
+        let allowlist = proxy::allowlist::shared(cfg.proxy.allowed_cidrs.as_deref())?;
+        proxy::allowlist::spawn_reload(config_path.to_string(), allowlist.clone())?;
         let proxy_cfg = cfg.proxy.clone();
         let proxy_tls = tls_mgr.clone();
         let proxy_metrics = metrics.clone();
@@ -246,6 +248,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
             proxy_tls,
             proxy_metrics,
             Arc::new(proxy::auth::AuthQuery::new(auth_role.clone())),
+            allowlist,
         ));
 
         let srv2 = Arc::clone(&srv);

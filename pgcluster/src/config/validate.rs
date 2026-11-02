@@ -141,6 +141,11 @@ fn validate_timing(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     if cfg.proxy.auth_user.is_empty() {
         anyhow::bail!("[proxy] auth_user must not be empty");
     }
+    crate::proxy::allowlist::Allowlist::parse(cfg.proxy.allowed_cidrs.as_deref())
+        .map_err(|e| anyhow::anyhow!("[proxy] allowed_cidrs: {e}"))?;
+    if cfg.proxy.require_tls && cfg.tls.insecure_plaintext {
+        anyhow::bail!("[proxy] require_tls needs certificates, not insecure_plaintext");
+    }
     if lease < MIN_QUORUM_LEASE_MS {
         anyhow::bail!("[proxy] quorum_lease_ms ({lease}) must be >= {MIN_QUORUM_LEASE_MS}");
     }
@@ -301,6 +306,8 @@ mod tests {
                 auth_user: "pgcluster_auth".into(),
                 auth_password_env: "PGCLUSTER_AUTH_PASSWORD".into(),
                 quorum_lease_ms: 1000,
+                allowed_cidrs: None,
+                require_tls: false,
             },
             failover: FailoverConfig::default(),
             tls: TlsConfig {

@@ -69,6 +69,32 @@ fn nonce() -> String {
 
 // ── Verifier ──────────────────────────────────────────────────────────────────
 
+/// Postgres's Hi() from RFC 5802, which only a client with the password needs.
+fn salted_password(password: &str, salt: &[u8], iterations: u32) -> Key {
+    let mut salted = salt.to_vec();
+    salted.extend_from_slice(&1u32.to_be_bytes());
+    let mut u = hmac(password.as_bytes(), &salted);
+    let mut out = u;
+    for _ in 1..iterations {
+        u = hmac(password.as_bytes(), &u);
+        out = xor(&out, &u);
+    }
+    out
+}
+
+/// The text Postgres stores for `password`, which `CREATE ROLE` accepts as is.
+pub fn make_verifier(password: &str, salt: &[u8], iterations: u32) -> String {
+    let salted = salted_password(password, salt, iterations);
+    let stored_key = sha256(&hmac(&salted, b"Client Key"));
+    let server_key = hmac(&salted, b"Server Key");
+    format!(
+        "SCRAM-SHA-256${iterations}:{}${}:{}",
+        BASE64.encode(salt),
+        BASE64.encode(stored_key),
+        BASE64.encode(server_key)
+    )
+}
+
 /// A role's stored `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`.
 #[derive(Clone)]
 pub struct Verifier {
@@ -433,29 +459,8 @@ mod tests {
     const SALT: &[u8] = b"0123456789abcdef";
     const ITERATIONS: u32 = 16;
 
-    /// Postgres's Hi() from RFC 5802, which only a client with the password needs.
-    fn salted_password(password: &str) -> Key {
-        let mut salted = SALT.to_vec();
-        salted.extend_from_slice(&1u32.to_be_bytes());
-        let mut u = hmac(password.as_bytes(), &salted);
-        let mut out = u;
-        for _ in 1..ITERATIONS {
-            u = hmac(password.as_bytes(), &u);
-            out = xor(&out, &u);
-        }
-        out
-    }
-
     fn stored(password: &str) -> String {
-        let salted = salted_password(password);
-        let stored_key = sha256(&hmac(&salted, b"Client Key"));
-        let server_key = hmac(&salted, b"Server Key");
-        format!(
-            "SCRAM-SHA-256${ITERATIONS}:{}${}:{}",
-            BASE64.encode(SALT),
-            BASE64.encode(stored_key),
-            BASE64.encode(server_key)
-        )
+        make_verifier(password, SALT, ITERATIONS)
     }
 
     /// A client that knows the password, as libpq does. Returns the server's
@@ -484,7 +489,7 @@ mod tests {
             attribute(&server_first, 'r').unwrap()
         );
         let auth = format!("{bare},{server_first},{without_proof}");
-        let salted = salted_password(password);
+        let salted = salted_password(password, SALT, ITERATIONS);
         let client_key = hmac(&salted, b"Client Key");
         let signature = hmac(&sha256(&client_key), auth.as_bytes());
         let proof = BASE64.encode(xor(&client_key, &signature));

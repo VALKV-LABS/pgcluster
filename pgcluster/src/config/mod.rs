@@ -161,6 +161,13 @@ pub struct ProxyConfig {
     /// before a new primary can be promoted.
     #[serde(default = "default_quorum_lease")]
     pub quorum_lease_ms: u64,
+    /// Client addresses the proxy accepts, as CIDR blocks. An empty list refuses
+    /// everyone, and leaving it out accepts everyone. SIGHUP reloads it.
+    #[serde(default)]
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// Refuse clients that do not negotiate TLS.
+    #[serde(default)]
+    pub require_tls: bool,
 }
 
 fn default_auth_user() -> String {

@@ -1,6 +1,7 @@
 //! Proxy layer: PostgreSQL wire protocol proxy with connection pooling
 //! and read/write routing.
 
+pub mod allowlist;
 pub mod auth;
 pub mod backend;
 pub mod connection;
@@ -22,6 +23,7 @@ use tracing::{error, info};
 
 use crate::{config::ProxyConfig, metrics_registry::Metrics, tls::TlsManager};
 
+use allowlist::SharedAllowlist;
 use auth::AuthQuery;
 use pool::ConnectionPool;
 pub use router::Router;
@@ -36,6 +38,7 @@ pub struct ProxyServer {
     tls: Option<Arc<TlsManager>>,
     metrics: Arc<Metrics>,
     auth: Arc<AuthQuery>,
+    allowlist: SharedAllowlist,
 }
 
 impl ProxyServer {
@@ -51,6 +54,7 @@ impl ProxyServer {
         tls: Option<Arc<TlsManager>>,
         metrics: Arc<Metrics>,
         auth: Arc<AuthQuery>,
+        allowlist: SharedAllowlist,
     ) -> Self {
         let backend_tls = tls.as_ref().map(|t| t.client_tls_connector());
         let pool = Arc::new(ConnectionPool::new(config.pool.clone(), backend_tls));
@@ -62,6 +66,7 @@ impl ProxyServer {
             tls,
             metrics,
             auth,
+            allowlist,
         }
     }
 
@@ -100,18 +105,31 @@ impl ProxyServer {
                 }
             };
 
+            if !self.allowlist.load().allows(peer_addr.ip()) {
+                tracing::debug!(%peer_addr, "client refused by allowed_cidrs");
+                continue;
+            }
+
             let router = Arc::clone(&self.router);
             let pool = Arc::clone(&self.pool);
             let tls_clone = tls_acceptor.clone();
             let m = Arc::clone(&self.metrics);
             let auth = Arc::clone(&self.auth);
+            let require_tls = self.config.require_tls;
 
             tokio::spawn(async move {
                 m.proxy_connections_total.inc();
                 m.connected_clients.inc();
                 tracing::debug!(%peer_addr, "client connected");
-                if let Err(e) =
-                    connection::ProxyConnection::run(stream, router, pool, tls_clone, auth).await
+                if let Err(e) = connection::ProxyConnection::run(
+                    stream,
+                    router,
+                    pool,
+                    tls_clone,
+                    auth,
+                    require_tls,
+                )
+                .await
                 {
                     tracing::debug!(%peer_addr, "connection ended: {e}");
                 }

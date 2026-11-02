@@ -1,0 +1,1471 @@
+openapi: 3.0.3
+info:
+  title: pgcluster admin API
+  version: 1.0.0
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+  description: |
+    One API for every cluster in a fleet.
+
+    - Authentication is `Authorization: Bearer <key>`.
+    - Errors are `{ "error": { "code": "...", "message": "..." } }`.
+    - Lists are `{ "items": [...], "next_page_token": "..." }`, with `limit` and `page_token`.
+    - Changes that take time return `202` and an operation.
+
+    `x-stage` on an operation names the stage of the management plane spec that
+    delivers it. Operations of later stages answer `404` until then.
+servers:
+  - url: https://pgcluster-admin.example.com:8443
+tags:
+  - name: hosts
+    description: Machines running `vk-agent host`.
+  - name: databases
+    description: Postgres clusters of one or three nodes.
+  - name: backups
+    description: Repositories, backups and restore.
+  - name: replicas
+    description: External standbys in another region.
+  - name: operations
+    description: Long-running changes and the event feed.
+  - name: health
+    description: Liveness.
+security:
+  - bearerKey: []
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Check that the service can reach its database
+      tags: [health]
+      security: []
+      x-stage: 1
+      responses:
+        "200":
+          description: Healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+        "503":
+          $ref: "#/components/responses/Error"
+  /v1/hosts:
+    post:
+      operationId: createHost
+      summary: "Add a host and get its enrolment token, shown once"
+      tags: [hosts]
+      x-stage: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateHost"
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HostEnrollment"
+        "401":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+    get:
+      operationId: listHosts
+      summary: "List hosts with status, reported capacity and free capacity"
+      tags: [hosts]
+      x-stage: 1
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HostList"
+        "401":
+          $ref: "#/components/responses/Error"
+  /v1/hosts/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getHost
+      summary: "Read a host"
+      tags: [hosts]
+      x-stage: 1
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Host"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+    delete:
+      operationId: deleteHost
+      summary: "Remove a host that runs no instances"
+      tags: [hosts]
+      x-stage: 1
+      responses:
+        "204":
+          description: Done.
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/hosts/{id}/drain:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: drainHost
+      summary: "Move every instance off a host"
+      tags: [hosts]
+      x-stage: 4
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/backup-repositories:
+    post:
+      operationId: createBackupRepository
+      summary: "Register a backup repository"
+      tags: [backups]
+      x-stage: 3
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBackupRepository"
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupRepository"
+        "401":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+    get:
+      operationId: listBackupRepositories
+      summary: "List backup repositories"
+      tags: [backups]
+      x-stage: 3
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupRepositoryList"
+        "401":
+          $ref: "#/components/responses/Error"
+  /v1/backup-repositories/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      operationId: deleteBackupRepository
+      summary: "Remove a backup repository"
+      tags: [backups]
+      x-stage: 3
+      responses:
+        "204":
+          description: Done.
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/databases:
+    post:
+      operationId: createDatabase
+      summary: "Create a database"
+      tags: [databases]
+      x-stage: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDatabase"
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+    get:
+      operationId: listDatabases
+      summary: "List databases"
+      tags: [databases]
+      x-stage: 1
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseList"
+        "401":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getDatabase
+      summary: "Read a database"
+      tags: [databases]
+      x-stage: 1
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Database"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+    patch:
+      operationId: updateDatabase
+      summary: "Change resources, replication mode or retention"
+      tags: [databases]
+      x-stage: 2
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateDatabase"
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+    delete:
+      operationId: deleteDatabase
+      summary: "Delete a database and its data"
+      tags: [databases]
+      x-stage: 1
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/restart:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: restartDatabase
+      summary: "Restart with a rolling restart"
+      tags: [databases]
+      x-stage: 2
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/switchover:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: switchoverDatabase
+      summary: "Hand the primary role to a standby"
+      tags: [databases]
+      x-stage: 2
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/backup:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: backupDatabase
+      summary: "Take a backup now"
+      tags: [backups]
+      x-stage: 3
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/restore:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: restoreDatabase
+      summary: "Restore into a new database"
+      tags: [backups]
+      x-stage: 3
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RestoreDatabase"
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/owner-password:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: setOwnerPassword
+      summary: "Replace the owner role's verifier"
+      tags: [databases]
+      x-stage: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OwnerPassword"
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/allowlist:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getAllowlist
+      summary: "Read the allowlist"
+      tags: [databases]
+      x-stage: 1
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Allowlist"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+    put:
+      operationId: putAllowlist
+      summary: "Replace the whole allowlist. Empty means no access"
+      tags: [databases]
+      x-stage: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Allowlist"
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/extensions:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getExtensions
+      summary: "Read the installed extensions"
+      tags: [databases]
+      x-stage: 1
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Extensions"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+    put:
+      operationId: putExtensions
+      summary: "Replace the whole list of extensions"
+      tags: [databases]
+      x-stage: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Extensions"
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/certificate:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      operationId: putCertificate
+      summary: "Replace the proxy certificate"
+      tags: [databases]
+      x-stage: 5
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Certificate"
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/nodes:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: listNodes
+      summary: "List a database's nodes"
+      tags: [databases]
+      x-stage: 1
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeList"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/nodes/{node}/replace:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: node
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: replaceNode
+      summary: "Replace a node"
+      tags: [databases]
+      x-stage: 2
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReplaceNode"
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/backups:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: listBackups
+      summary: "List backups"
+      tags: [backups]
+      x-stage: 3
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupList"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/restore-window:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getRestoreWindow
+      summary: "Read the earliest and latest restorable times"
+      tags: [backups]
+      x-stage: 3
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RestoreWindow"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/replicas:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: createReplica
+      summary: "Add a cross-region replica"
+      tags: [replicas]
+      x-stage: 5
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateReplica"
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+    get:
+      operationId: listReplicas
+      summary: "List cross-region replicas"
+      tags: [replicas]
+      x-stage: 5
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReplicaList"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/replicas/{replica_id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: replica_id
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      operationId: deleteReplica
+      summary: "Remove a cross-region replica"
+      tags: [replicas]
+      x-stage: 5
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/replicas/{replica_id}/promote:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: replica_id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: promoteReplica
+      summary: "Detach a replica into an independent database"
+      tags: [replicas]
+      x-stage: 5
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/operations:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: listOperations
+      summary: "List a database's operations"
+      tags: [operations]
+      x-stage: 1
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationList"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/operations/{op_id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: op_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getOperation
+      summary: "Read an operation with its steps and logs"
+      tags: [operations]
+      x-stage: 1
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationDetail"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/events:
+    get:
+      operationId: listEvents
+      summary: "Read state changes after a cursor"
+      tags: [operations]
+      x-stage: 2
+      parameters:
+        - name: after
+          in: query
+          schema:
+            type: string
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventList"
+        "401":
+          $ref: "#/components/responses/Error"
+components:
+  securitySchemes:
+    bearerKey:
+      type: http
+      scheme: bearer
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 100
+    PageToken:
+      name: page_token
+      in: query
+      schema:
+        type: string
+  responses:
+    Error:
+      description: The request failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+    Resources:
+      type: object
+      required: [vcpu, memory_gb, storage_gb]
+      properties:
+        vcpu:
+          type: number
+          exclusiveMinimum: true
+          minimum: 0
+        memory_gb:
+          type: number
+          exclusiveMinimum: true
+          minimum: 0
+        storage_gb:
+          type: number
+          exclusiveMinimum: true
+          minimum: 0
+    ReplicationMode:
+      type: string
+      enum: [async, sync, sync_strict]
+    CreateHost:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        failure_domain:
+          type: string
+    HostEnrollment:
+      type: object
+      required: [host, enrollment_token, expires_at]
+      properties:
+        host:
+          $ref: "#/components/schemas/Host"
+        enrollment_token:
+          type: string
+          description: Shown once. Single-use, and ends in the hash of the CA certificate.
+        expires_at:
+          type: string
+          format: date-time
+    Host:
+      type: object
+      required: [id, name, status, created_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        failure_domain:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [pending, online, offline]
+        address:
+          type: string
+          nullable: true
+        version:
+          type: string
+          nullable: true
+        capacity:
+          type: object
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/Resources"
+        free_capacity:
+          type: object
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/Resources"
+        last_seen_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    Owner:
+      type: object
+      required: [username, scram_verifier]
+      properties:
+        username:
+          type: string
+        scram_verifier:
+          type: string
+          description: Generate this locally. The password never reaches the API.
+    BackupPolicy:
+      type: object
+      required: [repository_id, retention_days]
+      properties:
+        repository_id:
+          type: string
+        retention_days:
+          type: integer
+          minimum: 1
+    CreateDatabase:
+      type: object
+      required: [name, version, resources, owner]
+      properties:
+        name:
+          type: string
+          description: Lowercase letters, digits and underscores, starting with a letter.
+        workspace:
+          type: string
+          description: An opaque label for a layer above to group databases.
+        version:
+          type: string
+          enum: ["16", "17", "18"]
+        ha:
+          type: boolean
+          default: false
+          description: Three nodes with automatic failover. Stage 2.
+        hosts:
+          type: array
+          items:
+            type: string
+          description: Host IDs or names. When left out, the most free host is chosen.
+        resources:
+          $ref: "#/components/schemas/Resources"
+        replication_mode:
+          allOf:
+            - $ref: "#/components/schemas/ReplicationMode"
+          description: Needs `ha`.
+        owner:
+          $ref: "#/components/schemas/Owner"
+        allowed_cidrs:
+          type: array
+          items:
+            type: string
+          description: Empty means no access. Public access is the explicit entry `0.0.0.0/0`.
+        extensions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtensionName"
+        backup:
+          allOf:
+            - $ref: "#/components/schemas/BackupPolicy"
+          description: Stage 3.
+    UpdateDatabase:
+      type: object
+      properties:
+        resources:
+          $ref: "#/components/schemas/Resources"
+        replication_mode:
+          $ref: "#/components/schemas/ReplicationMode"
+        retention_days:
+          type: integer
+          minimum: 1
+    Endpoint:
+      type: object
+      required: [host, port, database, ca_cert_pem]
+      properties:
+        host:
+          type: string
+        port:
+          type: integer
+        database:
+          type: string
+        ca_cert_pem:
+          type: string
+          description: Verifies the proxy, with `sslmode=verify-full`.
+    Database:
+      type: object
+      required:
+        - id
+        - name
+        - version
+        - ha
+        - status
+        - generation
+        - resources
+        - replication_mode
+        - allowed_cidrs
+        - extensions
+        - owner_username
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        workspace:
+          type: string
+          nullable: true
+        version:
+          type: string
+        ha:
+          type: boolean
+        status:
+          type: string
+          enum: [provisioning, active, degraded, deleting, deleted, error]
+        status_reason:
+          type: string
+          nullable: true
+        generation:
+          type: integer
+          format: int64
+        resources:
+          $ref: "#/components/schemas/Resources"
+        replication_mode:
+          $ref: "#/components/schemas/ReplicationMode"
+        allowed_cidrs:
+          type: array
+          items:
+            type: string
+        extensions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtensionName"
+        owner_username:
+          type: string
+        endpoint:
+          type: object
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/Endpoint"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    OwnerPassword:
+      type: object
+      required: [scram_verifier]
+      properties:
+        scram_verifier:
+          type: string
+    Allowlist:
+      type: object
+      required: [allowed_cidrs]
+      properties:
+        allowed_cidrs:
+          type: array
+          items:
+            type: string
+    ExtensionName:
+      type: string
+      enum:
+        - uuid-ossp
+        - pgcrypto
+        - pg_trgm
+        - unaccent
+        - vector
+        - pg_stat_statements
+        - pg_tle
+        - postgis
+        - pg_cron
+    Extensions:
+      type: object
+      required: [extensions]
+      properties:
+        extensions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExtensionName"
+    Certificate:
+      type: object
+      required: [certificate_pem, private_key_pem]
+      properties:
+        certificate_pem:
+          type: string
+        private_key_pem:
+          type: string
+    Node:
+      type: object
+      required: [node, host_id, port_base, observed_generation, state]
+      properties:
+        node:
+          type: string
+        host_id:
+          type: string
+        host_name:
+          type: string
+        port_base:
+          type: integer
+        observed_generation:
+          type: integer
+          format: int64
+        state:
+          type: string
+          enum: [pending, starting, running, failed]
+        error:
+          type: string
+          nullable: true
+    ReplaceNode:
+      type: object
+      required: [host_id]
+      properties:
+        host_id:
+          type: string
+    Operation:
+      type: object
+      required: [id, database_id, kind, status, target_generation, created_at]
+      properties:
+        id:
+          type: string
+        database_id:
+          type: string
+        kind:
+          type: string
+          enum: [create, delete, update]
+        status:
+          type: string
+          enum: [pending, running, succeeded, failed]
+        target_generation:
+          type: integer
+          format: int64
+        error:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+    OperationStep:
+      type: object
+      required: [seq, name, status, attempts]
+      properties:
+        seq:
+          type: integer
+        name:
+          type: string
+        status:
+          type: string
+          enum: [pending, done, failed]
+        attempts:
+          type: integer
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+    OperationLog:
+      type: object
+      required: [at, message]
+      properties:
+        at:
+          type: string
+          format: date-time
+        source:
+          type: string
+        message:
+          type: string
+    OperationDetail:
+      allOf:
+        - $ref: "#/components/schemas/Operation"
+        - type: object
+          required: [steps, logs]
+          properties:
+            steps:
+              type: array
+              items:
+                $ref: "#/components/schemas/OperationStep"
+            logs:
+              type: array
+              items:
+                $ref: "#/components/schemas/OperationLog"
+    CreateBackupRepository:
+      type: object
+      required: [name, type]
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          enum: [s3, posix]
+      additionalProperties: true
+    BackupRepository:
+      type: object
+      required: [id, name, type]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+          enum: [s3, posix]
+    Backup:
+      type: object
+      required: [id, finished_at]
+      properties:
+        id:
+          type: string
+        finished_at:
+          type: string
+          format: date-time
+    RestoreDatabase:
+      type: object
+      required: [name, target_time]
+      properties:
+        name:
+          type: string
+        target_time:
+          type: string
+          format: date-time
+    RestoreWindow:
+      type: object
+      required: [earliest, latest]
+      properties:
+        earliest:
+          type: string
+          format: date-time
+        latest:
+          type: string
+          format: date-time
+    CreateReplica:
+      type: object
+      required: [host_id]
+      properties:
+        host_id:
+          type: string
+    Replica:
+      type: object
+      required: [id, host_id, status]
+      properties:
+        id:
+          type: string
+        host_id:
+          type: string
+        status:
+          type: string
+    Event:
+      type: object
+      required: [cursor, type, at]
+      properties:
+        cursor:
+          type: string
+        type:
+          type: string
+          description: For example `node_offline`, `failover_completed`, `backup_failed` or `replacement_needed`.
+        database_id:
+          type: string
+          nullable: true
+        at:
+          type: string
+          format: date-time
+    HostList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Host"
+        next_page_token:
+          type: string
+          nullable: true
+    DatabaseList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Database"
+        next_page_token:
+          type: string
+          nullable: true
+    NodeList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Node"
+        next_page_token:
+          type: string
+          nullable: true
+    OperationList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Operation"
+        next_page_token:
+          type: string
+          nullable: true
+    BackupRepositoryList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/BackupRepository"
+        next_page_token:
+          type: string
+          nullable: true
+    BackupList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Backup"
+        next_page_token:
+          type: string
+          nullable: true
+    ReplicaList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Replica"
+        next_page_token:
+          type: string
+          nullable: true
+    EventList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Event"
+        next_page_token:
+          type: string
+          nullable: true

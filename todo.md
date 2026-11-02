@@ -50,7 +50,7 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 
 ## Part 6: Management plane, one node (Stage 1)
 
-- [ ] **6.1 Define the contracts.** Write the admin and agent APIs in `openapi/`. *Done when:* both validate in CI.
+- [x] **6.1 Define the contracts.** Write the admin and agent APIs in `openapi/`. *Done when:* both validate in CI.
 - [ ] **6.2 Scaffold `pgcluster-admin`.** Service, Postgres schema and migrations, and required API keys. *Done when:* it starts, migrates and serves health.
 - [ ] **6.3 Add hosts and enrolment.** Single-use tokens, the internal CA and client certificates. *Done when:* a host enrols, and a reused or expired token is rejected.
 - [ ] **6.4 Add `vk-agent host`.** New mode in the existing binary, with `vk-agent <config>` unchanged. It enrols, reports capacity and long-polls desired state. *Done when:* it runs as its own process, opens no port, and keeps its last state on disk.

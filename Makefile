@@ -5,6 +5,7 @@ COMPOSE_E2E    = docker/e2e-compose.yml
 COMPOSE_SHARD  = docker/shard-e2e-compose.yml
 CARGO          = cargo
 CARGO_FLAGS    =
+REDOCLY_IMAGE  = redocly/cli:1.34.5
 
 ##@ Help
 
@@ -32,6 +33,11 @@ fmt:  ## Format all code with cargo fmt
 
 check:  ## Run clippy lints (warnings as errors)
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
+
+.PHONY: lint-openapi
+
+lint-openapi:  ## Validate the admin and agent API contracts (needs Docker)
+	docker run --rm -v "$(CURDIR)/openapi:/spec" -w /spec $(REDOCLY_IMAGE) lint admin.yaml agent.yaml --config redocly.yaml
 
 ##@ Unit Tests (no Docker required)
 

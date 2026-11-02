@@ -74,6 +74,8 @@ tokio-stream = { version = "0.1", features = ["net"] }
 
 # Utils
 parking_lot = "0.12"
+arc-swap    = "1"
+ipnet       = "2"
 dashmap     = "5"
 murmur3     = "0.5"
 
