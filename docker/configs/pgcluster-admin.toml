@@ -1,0 +1,19 @@
+[api]
+listen_addr = "0.0.0.0:8443"
+api_keys    = ["dev-admin-key"]
+
+[agent_api]
+listen_addr = "0.0.0.0:8444"
+
+[tls]
+ca_dir       = "/ca"
+server_names = ["pgcluster-admin", "localhost", "127.0.0.1"]
+
+# The stack's hosts enrol with tokens loaded here, as the AWS template's do.
+[[bootstrap_hosts]]
+name         = "host-1"
+token_sha256 = "229cb9714a25ca6c8752e65f54037c3d9b9d29142f96b2029eca0f9f47ff453c"
+
+[[bootstrap_hosts]]
+name         = "host-systemd"
+token_sha256 = "dd29b6f9de5cc35bb9a50699b94d73d4a6c0b9ba01ef66dc82683fe6f3c7061b"

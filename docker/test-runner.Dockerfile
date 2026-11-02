@@ -8,10 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Cache dependency fetch separately from source compilation.
 COPY Cargo.toml Cargo.lock ./
 COPY pgcluster/Cargo.toml pgcluster/Cargo.toml
+COPY pgcluster-admin/Cargo.toml pgcluster-admin/Cargo.toml
 COPY vk-agent/Cargo.toml   vk-agent/Cargo.toml
-RUN mkdir -p pgcluster/src vk-agent/src && \
+RUN mkdir -p pgcluster/src pgcluster-admin/src vk-agent/src && \
     echo 'fn main() {}' > pgcluster/src/main.rs && \
     echo ''              > pgcluster/src/lib.rs  && \
+    echo 'fn main() {}' > pgcluster-admin/src/main.rs && \
+    echo ''              > pgcluster-admin/src/lib.rs && \
     echo 'fn main() {}' > vk-agent/src/main.rs  && \
     echo ''              > vk-agent/src/lib.rs
 RUN cargo fetch
@@ -20,6 +23,8 @@ RUN cargo fetch
 # This layer is rebuilt only when source changes.
 COPY proto      ./proto
 COPY pgcluster  ./pgcluster
+COPY pgcluster-admin ./pgcluster-admin
+COPY openapi    ./openapi
 COPY vk-agent   ./vk-agent
 RUN cargo test --workspace --no-run
 

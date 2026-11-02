@@ -29,6 +29,15 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `vk-agent host [config]` runs the host agent. It shares this binary but
+    // nothing below: it opens no port and answers to pgcluster-admin.
+    if first_arg == "host" {
+        let path = std::env::args()
+            .nth(2)
+            .unwrap_or_else(|| "/etc/vk-agent/host.toml".into());
+        return vk_agent::host::run(&path).await;
+    }
+
     // Load config from first CLI arg, or default path
     let config_path = if first_arg.is_empty() {
         "/etc/vk-agent/config.toml".into()

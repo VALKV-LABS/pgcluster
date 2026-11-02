@@ -63,6 +63,7 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 - [ ] **6.11 Build the node image.** Packer recipe in `images/`, published as a public AMI with each release. *Done when:* a host from the AMI enrols.
 - [ ] **6.12 Add local quick start.** *Done when:* `make start` runs the full stack, including `pgcluster-admin` and the host agent.
 - [ ] **6.13 Add the AWS template.** Terraform in `deploy/aws/`, with a required `allowed_cidr` and per-host single-use tokens. *Done when:* one `terraform apply` produces a working database, and `terraform destroy` removes everything.
+- [ ] **6.14 add web app** for locally launching and trying out all operations for pgcluster and verify results (sort of management portal for pgcluster)
 
 ## Part 7: Management plane, high availability (Stage 2)
 

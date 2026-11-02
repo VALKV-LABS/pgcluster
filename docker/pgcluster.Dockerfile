@@ -5,10 +5,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     protobuf-compiler pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY pgcluster/Cargo.toml pgcluster/Cargo.toml
+COPY pgcluster-admin/Cargo.toml pgcluster-admin/Cargo.toml
 COPY vk-agent/Cargo.toml vk-agent/Cargo.toml
-RUN mkdir -p pgcluster/src vk-agent/src && \
+RUN mkdir -p pgcluster/src pgcluster-admin/src vk-agent/src && \
     echo 'fn main() {}' > pgcluster/src/main.rs && \
     echo '' > pgcluster/src/lib.rs && \
+    echo 'fn main() {}' > pgcluster-admin/src/main.rs && \
+    echo '' > pgcluster-admin/src/lib.rs && \
     echo 'fn main() {}' > vk-agent/src/main.rs && \
     echo '' > vk-agent/src/lib.rs
 # Compile dependencies against the stubs, as their own cached layer.

@@ -2,10 +2,13 @@
 
 COMPOSE_INTEG  = docker/integ-compose.yml
 COMPOSE_E2E    = docker/e2e-compose.yml
+COMPOSE_ADMIN  = docker/admin-compose.yml
 COMPOSE_SHARD  = docker/shard-e2e-compose.yml
 CARGO          = cargo
 CARGO_FLAGS    =
 REDOCLY_IMAGE  = redocly/cli:1.34.5
+PACKER_IMAGE   = hashicorp/packer:1.11.2
+TERRAFORM_IMAGE = hashicorp/terraform:1.9.8
 
 ##@ Help
 
@@ -34,10 +37,17 @@ fmt:  ## Format all code with cargo fmt
 check:  ## Run clippy lints (warnings as errors)
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
-.PHONY: lint-openapi
+.PHONY: lint-openapi lint-deploy
 
 lint-openapi:  ## Validate the admin and agent API contracts (needs Docker)
 	docker run --rm -v "$(CURDIR)/openapi:/spec" -w /spec $(REDOCLY_IMAGE) lint admin.yaml agent.yaml --config redocly.yaml
+
+lint-deploy:  ## Validate the Packer recipe and the Terraform template (needs Docker)
+	docker run --rm -v "$(CURDIR)/images:/w" -w /w $(PACKER_IMAGE) init node.pkr.hcl
+	docker run --rm -v "$(CURDIR)/images:/w" -w /w -e PACKER_PLUGIN_PATH=/w/.packer.d/plugins $(PACKER_IMAGE) validate -syntax-only node.pkr.hcl
+	docker run --rm -v "$(CURDIR)/deploy/aws:/w" -w /w $(TERRAFORM_IMAGE) fmt -check -diff
+	docker run --rm -v "$(CURDIR)/deploy/aws:/w" -w /w $(TERRAFORM_IMAGE) init -backend=false -input=false
+	docker run --rm -v "$(CURDIR)/deploy/aws:/w" -w /w $(TERRAFORM_IMAGE) validate
 
 ##@ Unit Tests (no Docker required)
 
@@ -70,24 +80,25 @@ test-integ:  ## Build, run all tests inside Docker, then tear down
 
 .PHONY: start stop logs status restart
 
-start:  ## Start the full pgcluster + vk-agent + Postgres 3-node stack
-	docker compose -f $(COMPOSE_E2E) up -d --build --wait
+start:  ## Start the 3-node cluster, pgcluster-admin and a host
+	docker compose -f $(COMPOSE_E2E) -f $(COMPOSE_ADMIN) up -d --build --wait
 
 stop:  ## Stop and remove the full stack (deletes volumes)
-	docker compose -f $(COMPOSE_E2E) down -v --remove-orphans
+	docker compose -f $(COMPOSE_E2E) -f $(COMPOSE_ADMIN) down -v --remove-orphans
 
 restart: stop start  ## Rebuild and restart the full stack
 
 logs:  ## Tail logs from all containers in the full stack
-	docker compose -f $(COMPOSE_E2E) logs -f
+	docker compose -f $(COMPOSE_E2E) -f $(COMPOSE_ADMIN) logs -f
 
 status:  ## Show container health and ports for the full stack
-	docker compose -f $(COMPOSE_E2E) ps
+	docker compose -f $(COMPOSE_E2E) -f $(COMPOSE_ADMIN) ps
 
 .PHONY: test-e2e
 
-test-e2e:  ## Run the 3-node end-to-end tests on the host (they start and stop the stack)
+test-e2e:  ## Run the end-to-end tests on the host (they start and stop their stacks)
 	$(CARGO) test -p pgcluster --test e2e_stack -- --ignored --test-threads=1 --skip e2e_switchover_against_running_stack --nocapture
+	$(CARGO) test -p pgcluster-admin --test e2e_admin -- --ignored --test-threads=1 --nocapture
 
 ##@ Multi-Shard E2E Stack (M5-A — coordinator + 2 shards)
 

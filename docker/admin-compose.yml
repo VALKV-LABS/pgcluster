@@ -1,0 +1,123 @@
+# Management plane stack: pgcluster-admin, its metadata database and one host.
+# `make start` runs it alongside the three-node cluster in e2e-compose.yml.
+#
+# Port map:
+#   admin API           → https://localhost:18443
+#   agent API           → https://localhost:18444
+#   instance port blocks → localhost:20000-20039
+#
+# Quick start:
+#   docker compose -f docker/admin-compose.yml cp pgcluster-admin:/ca/ca.crt admin-ca.crt
+#   export PGCLUSTER_ADMIN_URL=https://localhost:18443
+#   export PGCLUSTER_ADMIN_KEY=dev-admin-key
+#   export PGCLUSTER_ADMIN_CA=admin-ca.crt
+#   pgcluster host list
+#   pgcluster database create orders --allow 0.0.0.0/0 --extension vector --wait
+#
+# The keys here are throwaway values for this stack.
+
+x-admin-secret-key: &admin-secret-key "nvQ1nHZ3hYkq0m4oGQ3p3k5u2u8Zt7y6vX1cR0eJm9U="
+
+x-host: &host
+  build:
+    context: ..
+    dockerfile: docker/host.Dockerfile
+  depends_on:
+    pgcluster-admin:
+      condition: service_healthy
+
+services:
+  # Creates the CA first, because enrolment tokens carry its hash.
+  admin-ca:
+    build:
+      context: ..
+      dockerfile: docker/pgcluster.Dockerfile
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - pgcluster certs --out /ca pgcluster-admin
+    volumes:
+      - admin-ca:/ca
+
+  admin-db:
+    image: postgres:18-bookworm
+    environment:
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: pgcluster_admin
+    volumes:
+      - admin-db:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pgcluster_admin"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  pgcluster-admin:
+    build:
+      context: ..
+      dockerfile: docker/admin.Dockerfile
+    depends_on:
+      admin-ca:
+        condition: service_completed_successfully
+      admin-db:
+        condition: service_healthy
+    environment:
+      PGCLUSTER_ADMIN_DATABASE_URL: postgres://postgres:test@admin-db:5432/pgcluster_admin
+      PGCLUSTER_ADMIN_SECRET_KEY: *admin-secret-key
+    volumes:
+      - ./configs/pgcluster-admin.toml:/etc/pgcluster-admin/config.toml:ro
+      - admin-ca:/ca
+    ports:
+      - "18443:8443"
+      - "18444:8444"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -skf https://localhost:8443/health || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  host-1:
+    <<: *host
+    init: true
+    entrypoint: ["/bin/sh", "/usr/local/bin/host-entry.sh"]
+    command: ["vk-agent", "host", "/etc/vk-agent/host.toml"]
+    environment:
+      HOST_TOKEN_SECRET: dev-host-token
+    volumes:
+      - ./host-entry.sh:/usr/local/bin/host-entry.sh:ro
+      - ./configs/vk-agent-host.toml:/etc/vk-agent/host.toml:ro
+      - admin-ca:/ca:ro
+      - host-state:/var/lib/vk-agent-host
+      - host-instances:/var/lib/pgcluster
+    ports:
+      - "20000-20039:20000-20039"
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/lib/vk-agent-host/host_id"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # A host under real systemd, for the runner test. It needs a privileged
+  # container, so only that test starts it.
+  host-systemd:
+    <<: *host
+    profiles: [systemd]
+    entrypoint: ["/lib/systemd/systemd"]
+    command: []
+    privileged: true
+    cgroup: private
+    tmpfs:
+      - /run
+      - /run/lock
+    stop_signal: SIGRTMIN+3
+    volumes:
+      - ./host-entry.sh:/usr/local/bin/host-entry.sh:ro
+      - ./configs/vk-agent-host-systemd.toml:/etc/vk-agent/host.toml:ro
+      - ./vk-agent-host.env:/etc/vk-agent/host.env:ro
+      - ./vk-agent-host.service:/etc/systemd/system/vk-agent-host.service:ro
+      - admin-ca:/ca:ro
+
+volumes:
+  admin-ca:
+  admin-db:
+  host-state:
+  host-instances:

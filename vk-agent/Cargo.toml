@@ -30,12 +30,19 @@ chrono.workspace     = true
 # Postgres
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls"] }
 
+# Host mode
+async-trait = "0.1"
+hex         = { workspace = true }
+rcgen       = { version = "0.13", features = ["pem"] }
+reqwest     = { workspace = true }
+sha2        = "0.10"
+
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
 # Signal handling (Unix only)
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.27", features = ["signal", "process"] }
+nix = { version = "0.27", features = ["signal", "process", "user", "fs"] }
 
 [build-dependencies]
 tonic-build = "0.11"

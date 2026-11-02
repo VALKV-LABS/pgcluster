@@ -1,6 +1,7 @@
 pub mod config;
 pub mod files;
 pub mod heartbeat;
+pub mod host;
 pub mod postgres;
 pub mod process;
 pub mod seed;
