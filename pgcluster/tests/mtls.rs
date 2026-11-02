@@ -152,13 +152,17 @@ async fn a_reload_changes_the_certificate_without_closing_the_port() {
         .await
         .unwrap();
 
-    // A connection that is open across the reload.
+    // A connection in use across the reload. The call matters: with TLS 1.3 the
+    // client finishes first, so until a call returns the server may still be
+    // handshaking, and a new generation drops handshakes in flight. Clients
+    // reconnect from that on their own, so it costs a retry, not a client.
     let port = server.addr.port();
     let endpoint = Channel::from_shared(format!("https://localhost:{port}"))
         .unwrap()
         .tls_config(old.tonic_client_tls_config())
         .unwrap();
     let mut open = TopologyServiceClient::new(endpoint.connect().await.unwrap());
+    open.get_leader(GetLeaderRequest {}).await.unwrap();
 
     let renewed = tempfile::tempdir().unwrap();
     certs::generate(renewed.path(), &["localhost".into(), "client".into()]).unwrap();
