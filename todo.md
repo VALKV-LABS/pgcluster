@@ -62,7 +62,7 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 - [x] **6.10 Add CLI commands.** *Done when:* the CLI covers enrolment and creating a database, and generates the password locally.
 - [ ] **6.11 Build the node image.** Packer recipe in `images/`, published as a public AMI with each release. *Done when:* a host from the AMI enrols. **Pending verification:** the recipe validates in CI and installs the versions the tested Docker host uses, but no AMI has been built. This needs an AWS account for releases, with `AWS_AMI_ROLE_ARN` set and public AMIs allowed.
 - [x] **6.12 Add local quick start.** *Done when:* `make start` runs the full stack, including `pgcluster-admin` and the host agent.
-- [ ] **6.13 Add the AWS template.** Terraform in `deploy/aws/`, with a required `allowed_cidr` and per-host single-use tokens. The CA key is never passed in user data. *Done when:* one `terraform apply` produces a working database, `terraform destroy` removes everything, and no VM's user data holds the CA key. **Pending verification:** the template validates in CI, and its boot scripts and CA were tested without AWS, but it has never been applied. This needs 6.11, an AWS account, and the published AMI's owner as the default for `ami_owner`.
+- [ ] **6.13 Add the AWS template.** Terraform in `deploy/aws/`, with a required `allowed_cidr` and per-host single-use tokens. User data holds no long-lived secrets: not the CA key, the key that encrypts instance secrets, or the metadata database password. *Done when:* one `terraform apply` produces a working database, `terraform destroy` removes everything, and no VM's user data holds those secrets. **Pending verification:** the template validates in CI, and its boot scripts and CA were tested without AWS, but it has never been applied. This needs 6.11, an AWS account, and the published AMI's owner as the default for `ami_owner`.
 - [x] **6.14 add web app** for locally launching and trying out all operations for pgcluster and verify results (sort of management portal for pgcluster)
 - [x] **6.15 makefilE** add to make file running fullstack and trying out web app to verify how system works (creating/database/backups/switch over etc)
 - [x] **6.16 Harden the admin and agent APIs.** `pgcluster-admin` config holds hashes of API keys, not the keys, with a minimum key length. Enrolment and other routes open before authentication have a concurrency limit. *Done when:* a short key can be neither hashed nor used, a copy of the config cannot be used to call the API, and a flood of enrolment requests cannot exhaust the metadata database's connections, by test.
@@ -78,6 +78,7 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 - [ ] **7.4 Add the event feed.** `GET /v1/events`, including `replacement_needed`. *Done when:* tooling can react without polling every database.
 - [ ] **7.5 Add switchover and restart.** *Done when:* both run as operations with logs.
 - [ ] **7.6 Add the HA test suite.** *Done when:* primary loss, a network partition and node replacement pass in all three modes.
+- [ ] **7.7 Add secret rotation.** Covers the key that encrypts instance secrets, the admin CA, each database's CA, and instance internal passwords. *Done when:* each rotates under client load with no failed commits, and an old value stops working afterwards, by test.
 
 ## Part 8: Management plane, backups (Stage 3)
 
@@ -98,7 +99,9 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 - [ ] **10.1 Add resizing.** Resources and storage. *Done when:* each passes under client load.
 - [ ] **10.2 Add minor upgrades.** *Done when:* a rolling upgrade passes under client load.
 - [ ] **10.3 Add cross-region replicas.** Uses 5.9. *Done when:* a replica promotes into an independent database through the API.
-- [ ] **10.4 Release `v1.0.0`.** *Done when:* every stage in the spec meets its completion check, and the upgrade path from `v0.2.0` is documented.
+- [ ] **10.4 Limit connections.** Cap TLS handshakes and open connections on the admin API, the agent API and the proxy. *Done when:* a connection flood cannot stop enrolled hosts or existing clients from working, by test.
+- [ ] **10.5 Add API key identities and an audit log.** Each key has a name, and every change records which key made it. *Done when:* each change through the admin API can be traced to one key, and a key can be revoked alone.
+- [ ] **10.6 Release `v1.0.0`.** *Done when:* every stage in the spec meets its completion check, and the upgrade path from `v0.2.0` is documented.
 
 ## Done
 
