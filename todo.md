@@ -68,6 +68,7 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 - [x] **6.16 Harden the admin and agent APIs.** `pgcluster-admin` config holds hashes of API keys, not the keys, with a minimum key length. Enrolment and other routes open before authentication have a concurrency limit. *Done when:* a short key can be neither hashed nor used, a copy of the config cannot be used to call the API, and a flood of enrolment requests cannot exhaust the metadata database's connections, by test.
 - [x] **6.17 Rotate instance certificates.** Instance certificates have a bounded lifetime, and are reissued through desired state before they expire. *Done when:* an instance moves to a new certificate with no client downtime, by test.
 - [ ] **6.18 Document the deployment security model.** `SECURITY.md` covers where keys and passwords live on disk, who can read them, and how to protect them. *Done when:* an operator can see from it what each file holds and what to back up.
+- [ ] **6.19 Keep named prepared statements working through the proxy.** Today a statement prepared on one client connection can fail with `prepared statement does not exist` once another client has connected and gone, because the proxy pools backends by transaction. *Done when:* a client that repeats a named prepared statement keeps working while other clients connect and disconnect, by test, or the limit and the driver settings that avoid it are documented.
 
 ## Part 7: Management plane, high availability (Stage 2)
 
