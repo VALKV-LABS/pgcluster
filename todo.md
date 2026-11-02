@@ -62,13 +62,16 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 - [x] **6.10 Add CLI commands.** *Done when:* the CLI covers enrolment and creating a database, and generates the password locally.
 - [ ] **6.11 Build the node image.** Packer recipe in `images/`, published as a public AMI with each release. *Done when:* a host from the AMI enrols. **Pending verification:** the recipe validates in CI and installs the versions the tested Docker host uses, but no AMI has been built. This needs an AWS account for releases, with `AWS_AMI_ROLE_ARN` set and public AMIs allowed.
 - [x] **6.12 Add local quick start.** *Done when:* `make start` runs the full stack, including `pgcluster-admin` and the host agent.
-- [ ] **6.13 Add the AWS template.** Terraform in `deploy/aws/`, with a required `allowed_cidr` and per-host single-use tokens. *Done when:* one `terraform apply` produces a working database, and `terraform destroy` removes everything. **Pending verification:** the template validates in CI, and its boot scripts and CA were tested without AWS, but it has never been applied. This needs 6.11, an AWS account, and the published AMI's owner as the default for `ami_owner`.
+- [ ] **6.13 Add the AWS template.** Terraform in `deploy/aws/`, with a required `allowed_cidr` and per-host single-use tokens. The CA key is never passed in user data. *Done when:* one `terraform apply` produces a working database, `terraform destroy` removes everything, and no VM's user data holds the CA key. **Pending verification:** the template validates in CI, and its boot scripts and CA were tested without AWS, but it has never been applied. This needs 6.11, an AWS account, and the published AMI's owner as the default for `ami_owner`.
 - [x] **6.14 add web app** for locally launching and trying out all operations for pgcluster and verify results (sort of management portal for pgcluster)
 - [x] **6.15 makefilE** add to make file running fullstack and trying out web app to verify how system works (creating/database/backups/switch over etc)
+- [ ] **6.16 Harden the admin and agent APIs.** `pgcluster-admin` config holds hashes of API keys, not the keys, with a minimum key length. Enrolment and other routes open before authentication have a concurrency limit. *Done when:* startup refuses a short key, a copy of the config cannot be used to call the API, and a flood of enrolment requests cannot exhaust the metadata database's connections, by test.
+- [ ] **6.17 Rotate instance certificates.** Instance certificates have a bounded lifetime, and are reissued through desired state before they expire. *Done when:* an instance moves to a new certificate with no client downtime, by test.
+- [ ] **6.18 Document the deployment security model.** `SECURITY.md` covers where keys and passwords live on disk, who can read them, and how to protect them. *Done when:* an operator can see from it what each file holds and what to back up.
 
 ## Part 7: Management plane, high availability (Stage 2)
 
-- [ ] **7.1 Create three-node databases.** *Done when:* nodes land on separate hosts and failure domains.
+- [ ] **7.1 Create three-node databases.** The host firewall applies the allowlist, and peer ports accept only the database's own nodes. *Done when:* nodes land on separate hosts and failure domains, and a machine outside the database cannot reach its peer ports, by test.
 - [ ] **7.2 Expose replication modes through the API.** *Done when:* `PATCH` changes the mode online.
 - [ ] **7.3 Add node replacement.** Replace a node through the API, using 5.1 and 5.2. *Done when:* replacement completes under client load.
 - [ ] **7.4 Add the event feed.** `GET /v1/events`, including `replacement_needed`. *Done when:* tooling can react without polling every database.
@@ -86,7 +89,7 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 
 - [ ] **9.1 Add the scheduler.** Capacity tracking, no overcommit, memory reserved for page cache, and placement across failure domains. *Done when:* an impossible request fails with a clear error.
 - [ ] **9.2 Add port blocks.** *Done when:* several instances run on one host with no collisions.
-- [ ] **9.3 Add isolation.** cgroup v2 limits, per-instance disk quotas, and the allowlist in the host firewall. *Done when:* one busy database cannot starve another, by load test.
+- [ ] **9.3 Add isolation.** cgroup v2 limits and per-instance disk quotas. *Done when:* one busy database cannot starve another, by load test.
 - [ ] **9.4 Add host drain.** *Done when:* draining moves every instance off a host with no downtime.
 
 ## Part 10: Management plane, day two (Stage 5)

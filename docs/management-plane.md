@@ -335,7 +335,7 @@ Scheduling stays on each cluster's Raft leader, so backups continue during a man
 ### Network
 
 - Clients reach the proxy only. Postgres, Raft and agent ports accept the database's own nodes.
-- The allowlist is a whole-list `PUT`, applied at the proxy and reloaded without dropping connected clients. The proxy is the only process that sees a client's address: Postgres sees the proxy, so `pg_hba.conf` cannot filter clients. Stage 4 also applies it to the host firewall. Empty means no access. Public access is the explicit entry `0.0.0.0/0`.
+- The allowlist is a whole-list `PUT`, applied at the proxy and reloaded without dropping connected clients. The proxy is the only process that sees a client's address: Postgres sees the proxy, so `pg_hba.conf` cannot filter clients. Stage 2 also applies it to the host firewall. Empty means no access. Public access is the explicit entry `0.0.0.0/0`.
 - TLS is required at the proxy. `pgcluster-admin` issues a certificate by default, and `PUT .../certificate` replaces it.
 - The owner role gets `CREATEDB` and `CREATEROLE`, not superuser.
 
