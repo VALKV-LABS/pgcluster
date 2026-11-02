@@ -21,6 +21,21 @@ use anyhow::Result;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+/// Where to bind Raft, given this node's address in `peers`. A hostname such as
+/// "pgcluster-1:7000" binds every interface, because it may not resolve to one
+/// this process can bind. A loopback address stays on loopback, so a one-node
+/// cluster has no Raft port reachable from outside.
+fn raft_bind_addr(peer_addr: &str) -> String {
+    match peer_addr.parse::<std::net::SocketAddr>() {
+        Ok(addr) if addr.ip().is_loopback() => peer_addr.to_string(),
+        _ => peer_addr
+            .rsplit(':')
+            .next()
+            .map(|port| format!("0.0.0.0:{port}"))
+            .unwrap_or_else(|| peer_addr.to_string()),
+    }
+}
+
 /// Start the full pgcluster server from the given config file path.
 pub async fn run_server(config_path: &str) -> Result<()> {
     // sqlx's runtime-tokio-rustls pulls in aws-lc-rs alongside our ring feature;
@@ -160,12 +175,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         .find(|p| p.id == cfg.raft.node_id)
         .map(|p| p.addr.clone())
         .unwrap_or_else(|| "0.0.0.0:7000".into());
-    // Peer addrs use hostnames (e.g. "pgcluster-1:7000"); extract port to bind on all interfaces.
-    let raft_grpc_addr = raft_peer_addr
-        .rsplit(':')
-        .next()
-        .map(|port| format!("0.0.0.0:{port}"))
-        .unwrap_or_else(|| raft_peer_addr.clone());
+    let raft_grpc_addr = raft_bind_addr(&raft_peer_addr);
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
@@ -316,4 +326,20 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
     let _ = futures::future::select_all(tasks).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::raft_bind_addr;
+
+    #[test]
+    fn loopback_stays_on_loopback() {
+        assert_eq!(raft_bind_addr("127.0.0.1:20003"), "127.0.0.1:20003");
+    }
+
+    #[test]
+    fn other_addresses_bind_every_interface() {
+        assert_eq!(raft_bind_addr("pgcluster-1:7000"), "0.0.0.0:7000");
+        assert_eq!(raft_bind_addr("10.0.0.1:7000"), "0.0.0.0:7000");
+    }
 }

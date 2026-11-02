@@ -51,20 +51,20 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 ## Part 6: Management plane, one node (Stage 1)
 
 - [x] **6.1 Define the contracts.** Write the admin and agent APIs in `openapi/`. *Done when:* both validate in CI.
-- [ ] **6.2 Scaffold `pgcluster-admin`.** Service, Postgres schema and migrations, and required API keys. *Done when:* it starts, migrates and serves health.
-- [ ] **6.3 Add hosts and enrolment.** Single-use tokens, the internal CA and client certificates. *Done when:* a host enrols, and a reused or expired token is rejected.
-- [ ] **6.4 Add `vk-agent host`.** New mode in the existing binary, with `vk-agent <config>` unchanged. It enrols, reports capacity and long-polls desired state. *Done when:* it runs as its own process, opens no port, and keeps its last state on disk.
-- [ ] **6.5 Add config rendering.** Generate each instance's `pgcluster` and `vk-agent` config from desired state. *Done when:* output passes `pgcluster` validation.
-- [ ] **6.6 Add process runners.** systemd for production, plain processes for development and tests. *Done when:* the host agent starts, stops and restarts an instance with both.
-- [ ] **6.7 Add the reconciler and operations.** Stored steps with `FOR UPDATE SKIP LOCKED`, `generation` and `observed_generation`. *Done when:* a restarted `pgcluster-admin` resumes an operation with no duplicate work.
-- [ ] **6.8 Add the database API for one node.** Create, read, delete, the owner role with a SCRAM verifier, and the allowlist. *Done when:* a database is created through the API and reachable over TLS.
-- [ ] **6.9 Add extensions.** *Done when:* each listed extension installs through the API without superuser.
-- [ ] **6.10 Add CLI commands.** *Done when:* the CLI covers enrolment and creating a database, and generates the password locally.
-- [ ] **6.11 Build the node image.** Packer recipe in `images/`, published as a public AMI with each release. *Done when:* a host from the AMI enrols.
-- [ ] **6.12 Add local quick start.** *Done when:* `make start` runs the full stack, including `pgcluster-admin` and the host agent.
-- [ ] **6.13 Add the AWS template.** Terraform in `deploy/aws/`, with a required `allowed_cidr` and per-host single-use tokens. *Done when:* one `terraform apply` produces a working database, and `terraform destroy` removes everything.
-- [ ] **6.14 add web app** for locally launching and trying out all operations for pgcluster and verify results (sort of management portal for pgcluster)
-- [ ] **6.15 makefilE** add to make file running fullstack and trying out web app to verify how system works (creating/database/backups/switch over etc)
+- [x] **6.2 Scaffold `pgcluster-admin`.** Service, Postgres schema and migrations, and required API keys. *Done when:* it starts, migrates and serves health.
+- [x] **6.3 Add hosts and enrolment.** Single-use tokens, the internal CA and client certificates. *Done when:* a host enrols, and a reused or expired token is rejected.
+- [x] **6.4 Add `vk-agent host`.** New mode in the existing binary, with `vk-agent <config>` unchanged. It enrols, reports capacity and long-polls desired state. *Done when:* it runs as its own process, opens no port, and keeps its last state on disk.
+- [x] **6.5 Add config rendering.** Generate each instance's `pgcluster` and `vk-agent` config from desired state. *Done when:* output passes `pgcluster` validation.
+- [x] **6.6 Add process runners.** systemd for production, plain processes for development and tests. *Done when:* the host agent starts, stops and restarts an instance with both.
+- [x] **6.7 Add the reconciler and operations.** Stored steps with `FOR UPDATE SKIP LOCKED`, `generation` and `observed_generation`. *Done when:* a restarted `pgcluster-admin` resumes an operation with no duplicate work.
+- [x] **6.8 Add the database API for one node.** Create, read, delete, the owner role with a SCRAM verifier, and the allowlist. *Done when:* a database is created through the API and reachable over TLS.
+- [x] **6.9 Add extensions.** *Done when:* each listed extension installs through the API without superuser.
+- [x] **6.10 Add CLI commands.** *Done when:* the CLI covers enrolment and creating a database, and generates the password locally.
+- [ ] **6.11 Build the node image.** Packer recipe in `images/`, published as a public AMI with each release. *Done when:* a host from the AMI enrols. **Pending verification:** the recipe validates in CI and installs the versions the tested Docker host uses, but no AMI has been built. This needs an AWS account for releases, with `AWS_AMI_ROLE_ARN` set and public AMIs allowed.
+- [x] **6.12 Add local quick start.** *Done when:* `make start` runs the full stack, including `pgcluster-admin` and the host agent.
+- [ ] **6.13 Add the AWS template.** Terraform in `deploy/aws/`, with a required `allowed_cidr` and per-host single-use tokens. *Done when:* one `terraform apply` produces a working database, and `terraform destroy` removes everything. **Pending verification:** the template validates in CI, and its boot scripts and CA were tested without AWS, but it has never been applied. This needs 6.11, an AWS account, and the published AMI's owner as the default for `ami_owner`.
+- [x] **6.14 add web app** for locally launching and trying out all operations for pgcluster and verify results (sort of management portal for pgcluster)
+- [x] **6.15 makefilE** add to make file running fullstack and trying out web app to verify how system works (creating/database/backups/switch over etc)
 
 ## Part 7: Management plane, high availability (Stage 2)
 
@@ -86,7 +86,7 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 
 - [ ] **9.1 Add the scheduler.** Capacity tracking, no overcommit, memory reserved for page cache, and placement across failure domains. *Done when:* an impossible request fails with a clear error.
 - [ ] **9.2 Add port blocks.** *Done when:* several instances run on one host with no collisions.
-- [ ] **9.3 Add isolation.** cgroup v2 limits and per-instance disk quotas. *Done when:* one busy database cannot starve another, by load test.
+- [ ] **9.3 Add isolation.** cgroup v2 limits, per-instance disk quotas, and the allowlist in the host firewall. *Done when:* one busy database cannot starve another, by load test.
 - [ ] **9.4 Add host drain.** *Done when:* draining moves every instance off a host with no downtime.
 
 ## Part 10: Management plane, day two (Stage 5)

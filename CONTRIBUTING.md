@@ -10,7 +10,8 @@ You need Rust 1.85+, `protoc`, Docker with Compose, and `make`.
 make setup-hooks   # once per clone: runs fmt and clippy before every push
 make all           # format, lint, unit tests
 make test-integ    # Docker integration tests
-make test-e2e      # 3-node switchover and failover tests on Docker
+make test-e2e      # switchover, failover and management plane tests on Docker
+make try           # run everything, and try it in the console
 ```
 
 ## Pull requests
@@ -39,4 +40,4 @@ Please report vulnerabilities privately, as described in [`SECURITY.md`](SECURIT
 
 ## Releasing
 
-A release is made by pushing a tag `vX.Y.Z` that matches the workspace version in `Cargo.toml`. The tag runs CI, publishes `valkvlabs/pgcluster` and `valkvlabs/vk-agent` to Docker Hub for amd64 and arm64, and creates the GitHub release from the matching `CHANGELOG.md` section. Every push to `main` publishes the `edge` tag.
+A release is made by pushing a tag `vX.Y.Z` that matches the workspace version in `Cargo.toml`. The tag runs CI, publishes `valkvlabs/pgcluster`, `valkvlabs/vk-agent` and `valkvlabs/pgcluster-admin` to Docker Hub for amd64 and arm64, publishes the node image as a public AMI once `AWS_AMI_ROLE_ARN` is set, and creates the GitHub release from the matching `CHANGELOG.md` section. Every push to `main` publishes the `edge` tag.

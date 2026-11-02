@@ -63,6 +63,11 @@ listen_addr        = "0.0.0.0:5432"
 admin_listen_addr  = "0.0.0.0:5433"
 # Simple HTTP /health endpoint for load-balancer health checks.
 health_listen_addr = "0.0.0.0:8008"
+# Client addresses to accept. An empty list refuses everyone, and leaving it out
+# accepts everyone. SIGHUP reloads it.
+# allowed_cidrs = ["198.51.100.0/24"]
+# Refuse clients that do not negotiate TLS.
+# require_tls = true
 
 [proxy.pool]
 max_connections_per_db_user = 25

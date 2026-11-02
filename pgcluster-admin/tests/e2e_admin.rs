@@ -595,7 +595,14 @@ async fn cluster_sql(client: &reqwest::Client, sql: &str) -> Value {
 #[tokio::test]
 #[ignore = "requires Docker"]
 async fn e2e_admin_console_full_stack() {
-    let _stack = Stack::up(&["console", "pgcluster-1", "pgcluster-2", "pgcluster-3"]);
+    let _stack = Stack::up(&[
+        "console",
+        "pg-replica-1",
+        "pg-replica-2",
+        "pgcluster-1",
+        "pgcluster-2",
+        "pgcluster-3",
+    ]);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(180))
         .build()

@@ -254,3 +254,9 @@ This is a custom virtual schema served entirely by pgcluster — the queries nev
 - On topology change (Raft state machine update), in-flight connections to old primary are gracefully drained; new connections route to new primary immediately.
 - `tls_manager` provides the TLS acceptor for client connections.
 - `ha_status` HTTP server shares the same port binding infrastructure but runs on a different port (:8008).
+
+## Client Access
+
+`[proxy] allowed_cidrs` lists the client addresses the proxy accepts. An empty list refuses everyone, and leaving it out accepts everyone. SIGHUP reloads it from the config file, and clients already connected stay connected. The proxy is the only place this can work: Postgres sees the proxy's address, so `pg_hba.conf` cannot filter clients.
+
+`[proxy] require_tls = true` refuses clients that do not negotiate TLS.
