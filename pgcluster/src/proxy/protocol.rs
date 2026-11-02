@@ -211,6 +211,14 @@ fn parse_startup_params(buf: &[u8]) -> Result<HashMap<String, String>> {
 pub async fn read_frontend_message(
     stream: &mut (impl AsyncRead + Unpin),
 ) -> Result<FrontendMessage> {
+    Ok(read_frontend_frame(stream).await?.0)
+}
+
+/// Read a message, along with its original bytes. Forward those, because the
+/// parsed form keeps only what routing needs, not format codes or NULLs.
+pub async fn read_frontend_frame(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> Result<(FrontendMessage, Vec<u8>)> {
     let msg_type = stream.read_u8().await.context("read message type")?;
     let length = stream.read_u32().await.context("read message length")?;
 
@@ -220,15 +228,19 @@ pub async fn read_frontend_message(
     }
     let payload_len = (length - 4) as usize;
 
-    let mut payload = vec![0u8; payload_len];
+    let mut raw = Vec::with_capacity(payload_len + 5);
+    raw.push(msg_type);
+    raw.extend_from_slice(&length.to_be_bytes());
+    raw.resize(payload_len + 5, 0);
     if payload_len > 0 {
         stream
-            .read_exact(&mut payload)
+            .read_exact(&mut raw[5..])
             .await
             .context("read message payload")?;
     }
 
-    parse_frontend_message(msg_type, &payload)
+    let msg = parse_frontend_message(msg_type, &raw[5..])?;
+    Ok((msg, raw))
 }
 
 fn parse_frontend_message(msg_type: u8, payload: &[u8]) -> Result<FrontendMessage> {
@@ -450,6 +462,27 @@ fn read_i32_be(buf: &[u8], offset: usize) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Bind with a binary format code and a NULL parameter, neither of which
+    /// the parsed form keeps.
+    #[tokio::test]
+    async fn a_frame_keeps_its_original_bytes() {
+        let mut body = vec![0u8, 0u8]; // unnamed portal and statement
+        body.extend_from_slice(&1u16.to_be_bytes()); // one format code
+        body.extend_from_slice(&1u16.to_be_bytes()); // binary
+        body.extend_from_slice(&1u16.to_be_bytes()); // one parameter
+        body.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
+        body.extend_from_slice(&0u16.to_be_bytes()); // no result formats
+
+        let mut frame = vec![b'B'];
+        frame.extend_from_slice(&(body.len() as u32 + 4).to_be_bytes());
+        frame.extend_from_slice(&body);
+
+        let mut stream = frame.as_slice();
+        let (msg, raw) = read_frontend_frame(&mut stream).await.unwrap();
+        assert!(matches!(msg, FrontendMessage::Bind { .. }));
+        assert_eq!(raw, frame);
+    }
 
     #[test]
     fn classify_select_is_read() {

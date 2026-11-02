@@ -1,3 +1,4 @@
+use crate::raft::topology::ReplicationMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -107,8 +108,23 @@ pub struct ReplicationConfig {
     pub replication_password_env: String,
     #[serde(default = "default_slot_prefix")]
     pub slot_prefix: String,
+    /// The mode a new cluster starts in. After that the mode lives in Raft, and
+    /// `POST /api/replication/mode` changes it without a restart.
     #[serde(default)]
-    pub synchronous_standby_names: String,
+    pub replication_mode: ReplicationMode,
+    /// How long `sync` stalls commits with no standby before it falls back.
+    #[serde(default = "default_sync_degrade_timeout")]
+    pub sync_degrade_timeout_seconds: u64,
+    /// WAL a slot may hold back, so a dead standby cannot fill the disk.
+    #[serde(default = "default_max_slot_wal_keep_size")]
+    pub max_slot_wal_keep_size_mb: u64,
+}
+
+fn default_sync_degrade_timeout() -> u64 {
+    30
+}
+fn default_max_slot_wal_keep_size() -> u64 {
+    10 * 1024
 }
 
 fn default_replication_password_env() -> String {
@@ -132,8 +148,30 @@ pub struct ProxyConfig {
     pub pool: PoolConfig,
     #[serde(default)]
     pub read_routing: ReadRoutingConfig,
+    /// The role the proxy uses to read password verifiers. pgcluster creates it,
+    /// with access to one function and nothing else.
+    #[serde(default = "default_auth_user")]
+    pub auth_user: String,
+    /// Environment variable holding that role's password. Required, and it must
+    /// match on every instance.
+    #[serde(default = "default_auth_password_env")]
+    pub auth_password_env: String,
+    /// The proxy stops routing this long after it last reached a majority of
+    /// Raft voters. Must be shorter than failover detection, so that it stops
+    /// before a new primary can be promoted.
+    #[serde(default = "default_quorum_lease")]
+    pub quorum_lease_ms: u64,
 }
 
+fn default_auth_user() -> String {
+    "pgcluster_auth".into()
+}
+fn default_auth_password_env() -> String {
+    "PGCLUSTER_AUTH_PASSWORD".into()
+}
+fn default_quorum_lease() -> u64 {
+    1000
+}
 fn default_proxy_listen() -> String {
     "0.0.0.0:5432".into()
 }
@@ -192,7 +230,8 @@ impl Default for ReadRoutingConfig {
 }
 
 fn default_read_routing_enabled() -> bool {
-    true
+    // Off, because a read that follows a write may then miss it.
+    false
 }
 fn default_max_lag_bytes() -> u64 {
     10 * 1024 * 1024
@@ -244,29 +283,16 @@ fn default_repoint_timeout() -> u64 {
 
 // ── [tls] ─────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Certificates for gRPC, the proxy and Postgres, all from one cluster CA.
+/// `pgcluster certs` generates a set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
     pub ca_cert: Option<String>,
     pub cert: Option<String>,
     pub key: Option<String>,
-    /// If true and cert/key are None, generate self-signed dev certs at startup.
-    #[serde(default = "default_auto_cert")]
-    pub auto_generate: bool,
-}
-
-fn default_auto_cert() -> bool {
-    true
-}
-
-impl Default for TlsConfig {
-    fn default() -> Self {
-        Self {
-            ca_cert: None,
-            cert: None,
-            key: None,
-            auto_generate: default_auto_cert(),
-        }
-    }
+    /// Development only: run gRPC and Postgres connections in plaintext.
+    #[serde(default)]
+    pub insecure_plaintext: bool,
 }
 
 // ── [metrics] ─────────────────────────────────────────────────────────────────
@@ -295,11 +321,16 @@ fn default_metrics_listen() -> String {
 pub struct ApiConfig {
     #[serde(default = "default_api_listen")]
     pub listen_addr: String,
+    /// Bearer tokens accepted by the REST API. The server refuses to start
+    /// without at least one, unless `insecure_no_auth` is set.
     #[serde(default)]
     pub api_keys: Vec<String>,
     /// If true, status/metrics endpoints skip auth.
     #[serde(default = "default_public_read")]
     pub public_read_endpoints: bool,
+    /// Development only: run the REST API with no credentials at all.
+    #[serde(default)]
+    pub insecure_no_auth: bool,
 }
 
 impl Default for ApiConfig {
@@ -308,6 +339,7 @@ impl Default for ApiConfig {
             listen_addr: default_api_listen(),
             api_keys: vec![],
             public_read_endpoints: default_public_read(),
+            insecure_no_auth: false,
         }
     }
 }
@@ -320,31 +352,6 @@ fn default_public_read() -> bool {
 }
 
 // ── [backup] ──────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum BackupFrequency {
-    Daily,
-    Weekly,
-    Monthly,
-}
-
-impl std::fmt::Display for BackupFrequency {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Daily => write!(f, "daily"),
-            Self::Weekly => write!(f, "weekly"),
-            Self::Monthly => write!(f, "monthly"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackupScheduleEntry {
-    pub frequency: BackupFrequency,
-    /// Number of completed backups of this frequency to retain.
-    pub retain: u32,
-}
 
 /// S3-compatible object storage configuration.
 /// Credentials are read from the environment: AWS_ACCESS_KEY_ID,
@@ -366,19 +373,40 @@ pub struct S3Config {
     pub path_style: bool,
 }
 
-/// Backup policy configuration. When this section is present, [backup.s3]
-/// is mandatory — pgcluster refuses to start without a valid S3 destination.
+/// A directory for backups, such as a mounted network share. It must be
+/// reachable at the same path from every node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PosixConfig {
+    pub path: String,
+}
+
+/// Backup policy configuration. Set exactly one of `[backup.s3]` and
+/// `[backup.posix]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupConfig {
     #[serde(default = "default_backup_enabled")]
     pub enabled: bool,
-    pub s3: S3Config,
-    /// Prefer running pg_basebackup against a replica (reduces primary load).
-    /// Falls back to the primary if no healthy replica is available.
+    #[serde(default)]
+    pub s3: Option<S3Config>,
+    #[serde(default)]
+    pub posix: Option<PosixConfig>,
+    /// Back up from a standby when one is healthy.
     #[serde(default = "default_prefer_replica")]
     pub prefer_replica: bool,
-    /// One entry per frequency tier. At least one entry is required.
-    pub schedule: Vec<BackupScheduleEntry>,
+    /// Seconds between backups.
+    #[serde(default = "default_backup_interval")]
+    pub interval_seconds: u64,
+    /// Delta backups between full ones: 6 with a daily interval gives a weekly
+    /// full backup.
+    #[serde(default = "default_delta_steps")]
+    pub delta_steps: u32,
+    /// Full backups to keep, with the deltas and WAL that depend on them.
+    #[serde(default = "default_retain_full")]
+    pub retain_full: u32,
+    /// Environment variable holding a base64 32-byte key. When set, data is
+    /// encrypted on the node before upload. Losing the key loses the backups.
+    #[serde(default)]
+    pub encryption_key_env: Option<String>,
 }
 
 fn default_backup_enabled() -> bool {
@@ -386,6 +414,15 @@ fn default_backup_enabled() -> bool {
 }
 fn default_prefer_replica() -> bool {
     true
+}
+fn default_backup_interval() -> u64 {
+    24 * 3600
+}
+fn default_delta_steps() -> u32 {
+    6
+}
+fn default_retain_full() -> u32 {
+    4
 }
 
 // ── Load helper ───────────────────────────────────────────────────────────────
@@ -468,6 +505,11 @@ health_check_interval_ms              = 500
 health_check_failures_before_failover = 3
 agent_heartbeat_timeout_seconds       = 10
 
+[tls]
+ca_cert = "/etc/pgcluster/ca.crt"
+cert    = "/etc/pgcluster/node.crt"
+key     = "/etc/pgcluster/node.key"
+
 [api]
 listen_addr = "0.0.0.0:8009"
 api_keys    = ["test-key"]
@@ -487,9 +529,9 @@ api_keys    = ["test-key"]
     fn defaults_applied_for_optional_sections() {
         let cfg: PgClusterConfig = toml::from_str(VALID_TOML).unwrap();
         assert_eq!(cfg.proxy.pool.max_connections_per_db_user, 25);
-        assert!(cfg.proxy.read_routing.enabled);
+        assert!(!cfg.proxy.read_routing.enabled);
         assert_eq!(cfg.metrics.listen_addr, "0.0.0.0:9190");
-        assert!(cfg.tls.auto_generate);
+        assert!(!cfg.tls.insecure_plaintext);
     }
 
     #[test]

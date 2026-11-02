@@ -50,7 +50,11 @@ replication_user         = "replicator"
 # Name of the environment variable that holds the replication password.
 replication_password_env = "PG_REPLICATION_PASSWORD"
 slot_prefix              = "pgcluster_"
-synchronous_standby_names = ""   # Set to "pg2,pg3" for synchronous replication
+# async, sync or sync_strict. This sets the mode of a new cluster; after that,
+# POST /api/replication/mode changes it with no restart.
+replication_mode             = "async"
+sync_degrade_timeout_seconds = 30      # How long sync stalls commits before falling back
+max_slot_wal_keep_size_mb    = 10240   # WAL a slot may hold back
 
 [proxy]
 # Client applications connect to this address.
@@ -65,9 +69,19 @@ max_connections_per_db_user = 25
 idle_timeout_seconds        = 600
 
 [proxy.read_routing]
-# Route SELECT statements to replicas when they are within lag threshold.
-enabled               = true
+# Route reads to replicas within the lag threshold. Off by default, because a
+# read that follows a write may then miss it.
+enabled = false
 max_replica_lag_bytes = 10485760   # 10 MiB
+
+# The role the proxy reads password verifiers with. pgcluster creates it. Set its
+# password in PGCLUSTER_AUTH_PASSWORD, the same on every instance.
+# auth_user         = "pgcluster_auth"
+# auth_password_env = "PGCLUSTER_AUTH_PASSWORD"
+
+# Stop routing this long after losing contact with the Raft majority. Must be
+# shorter than failover detection (interval × failures below).
+# quorum_lease_ms = 1000
 
 [failover]
 health_check_interval_ms              = 500   # How often to poll vk-agent on each node
@@ -75,15 +89,14 @@ health_check_failures_before_failover = 3     # Consecutive failures before trig
 agent_heartbeat_timeout_seconds       = 10    # vk-agent enters safe mode after this
 
 [tls]
-# Set auto_generate = true for development (generates self-signed certs).
-auto_generate = false
-# For production, provide cert + key paths:
-# ca_cert = "/etc/pgcluster/ca.crt"
-# cert    = "/etc/pgcluster/node.crt"
-# key     = "/etc/pgcluster/node.key"
+# Required. `pgcluster certs` generates a cluster CA and certificates.
+ca_cert = "/etc/pgcluster/ca.crt"
+cert    = "/etc/pgcluster/node.crt"
+key     = "/etc/pgcluster/node.key"
 
 [metrics]
 listen_addr = "0.0.0.0:9090"   # Prometheus /metrics endpoint
 
 [api]
 listen_addr = "0.0.0.0:8080"   # REST API for cluster management
+api_keys    = ["change-me"]    # Required. The server refuses to start without a key.

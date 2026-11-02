@@ -80,7 +80,7 @@ pgcluster failover --target pg2  # Force specific target
 
 ```bash
 pgcluster init --config /etc/pgcluster/pgcluster.toml
-# Creates Raft data directory, generates TLS certs, validates Postgres connectivity
+# Creates Raft data directory, validates Postgres connectivity
 ```
 
 ### Coordinator Mode (M5-A)
@@ -239,5 +239,5 @@ pub fn print_status(status: &ClusterStatusResponse, format: OutputFormat) {
 
 - All operator commands go through the REST API (`api_url`, default `localhost:8009`).
 - `pgcluster server` starts the full daemon in-process (no separate binary needed).
-- `pgcluster init` generates TLS certs via `tls_manager::generate_self_signed()` and validates `pgcluster.toml`.
+- `pgcluster certs` generates a cluster CA and certificates. `pgcluster init` validates `pgcluster.toml`.
 - `pgcluster config validate` parses and validates the config without starting any services.

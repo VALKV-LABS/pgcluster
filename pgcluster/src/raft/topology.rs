@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 // ── Core types ────────────────────────────────────────────────────────────────
 
@@ -25,6 +25,22 @@ impl std::fmt::Display for NodeRole {
     }
 }
 
+/// How commits relate to standbys. See "Replication" in the management plane
+/// specification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationMode {
+    /// Commit after a local flush.
+    #[default]
+    Async,
+    /// Commit after a flush on one standby, falling back to `Async` when no
+    /// standby is available for `sync_degrade_timeout_seconds`.
+    Sync,
+    /// Commit after a flush on one standby, with no fallback. Promote only if
+    /// every standby answers.
+    SyncStrict,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub node_id: String,
@@ -33,6 +49,19 @@ pub struct NodeConfig {
     pub priority: u32,
     #[serde(default)]
     pub tags: HashMap<String, String>,
+}
+
+/// Tag value for a node that follows the primary from outside the cluster.
+pub const EXTERNAL_ROLE: &str = "external";
+
+impl NodeConfig {
+    /// An external standby follows the primary, typically from another region.
+    /// It never votes, never takes part in synchronous commit, is never promoted
+    /// by a failover, and takes no backups. `POST /api/nodes/:id/detach` turns it
+    /// into an independent database.
+    pub fn is_external(&self) -> bool {
+        self.tags.get("role").is_some_and(|r| r == EXTERNAL_ROLE)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,8 +84,9 @@ pub struct BackupManifest {
     pub completed_at: i64,
     /// Total bytes uploaded across all tar files.
     pub size_bytes: u64,
-    /// S3 URI prefix for this backup, e.g. "s3://bucket/prefix/daily/backup-id/".
-    pub s3_uri: String,
+    /// Where the backup engine keeps this backup.
+    #[serde(alias = "s3_uri")]
+    pub location: String,
     pub status: BackupStatus,
 }
 
@@ -67,6 +97,10 @@ pub struct FailoverEvent {
     pub triggered_at: i64, // Unix seconds
     pub duration_ms: u64,
     pub reason: String, // "health_check_failure" | "operator_switchover"
+    /// True if the cluster had fallen back to async when this failover ran, so
+    /// no standby was guaranteed to hold the last commit.
+    #[serde(default)]
+    pub ran_degraded: bool,
 }
 
 // ── ClusterTopology — the Raft state machine ──────────────────────────────────
@@ -94,6 +128,17 @@ pub struct ClusterTopology {
     /// All known backup manifests, sorted most-recent first. Capped at 1 000.
     #[serde(default)]
     pub backups: Vec<BackupManifest>,
+    /// Current replication mode. Changes online, through Raft.
+    #[serde(default)]
+    pub replication_mode: ReplicationMode,
+    /// True once `Sync` has fallen back to async. Recorded before
+    /// `synchronous_standby_names` is cleared, so that a later failover knows
+    /// no standby is guaranteed current.
+    #[serde(default)]
+    pub sync_degraded: bool,
+    /// Standbys past `max_slot_wal_keep_size`, which must be seeded again.
+    #[serde(default)]
+    pub needs_reseed: BTreeSet<String>,
     /// Monotonically increasing version; incremented on every command
     pub version: u64,
     /// Unix seconds of last topology change
@@ -106,6 +151,39 @@ impl ClusterTopology {
         // Store cluster name in a simple way
         let _ = cluster_name; // used by callers for display
         t
+    }
+
+    /// The `synchronous_standby_names` value for the current state.
+    pub fn synchronous_standby_names(&self) -> String {
+        let required = match self.replication_mode {
+            ReplicationMode::Async => false,
+            ReplicationMode::Sync => !self.sync_degraded,
+            ReplicationMode::SyncStrict => true,
+        };
+        if !required {
+            return String::new();
+        }
+        self.standby_names()
+    }
+
+    /// `ANY 1 (...)` over every node except the primary, or empty if there are
+    /// none. Names are quoted because node IDs can contain any character.
+    pub fn standby_names(&self) -> String {
+        let mut standbys: Vec<&String> = self
+            .node_configs
+            .iter()
+            .filter(|(id, cfg)| **id != self.primary_node_id && !cfg.is_external())
+            .map(|(id, _)| id)
+            .collect();
+        if standbys.is_empty() {
+            return String::new();
+        }
+        standbys.sort();
+        let quoted: Vec<String> = standbys
+            .iter()
+            .map(|id| format!("\"{}\"", id.replace('"', "\"\"")))
+            .collect();
+        format!("ANY 1 ({})", quoted.join(", "))
     }
 
     /// Returns the Postgres address for the current primary, if any.
@@ -198,6 +276,79 @@ pub fn format_lsn(lsn: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn nodes(ids: &[&str], primary: &str) -> ClusterTopology {
+        let mut t = ClusterTopology {
+            primary_node_id: primary.into(),
+            ..Default::default()
+        };
+        for id in ids {
+            t.node_configs.insert(
+                id.to_string(),
+                NodeConfig {
+                    node_id: id.to_string(),
+                    agent_addr: "x".into(),
+                    postgres_addr: "y".into(),
+                    priority: 100,
+                    tags: Default::default(),
+                },
+            );
+        }
+        t
+    }
+
+    #[test]
+    fn async_clears_standby_names() {
+        assert_eq!(
+            nodes(&["pg1", "pg2"], "pg1").synchronous_standby_names(),
+            ""
+        );
+    }
+
+    #[test]
+    fn sync_names_every_standby() {
+        let mut t = nodes(&["pg3", "pg1", "pg2"], "pg1");
+        t.replication_mode = ReplicationMode::Sync;
+        assert_eq!(t.synchronous_standby_names(), r#"ANY 1 ("pg2", "pg3")"#);
+    }
+
+    #[test]
+    fn standby_names_follow_the_primary_and_membership() {
+        let mut t = nodes(&["pg1", "pg2", "pg3"], "pg2");
+        t.replication_mode = ReplicationMode::SyncStrict;
+        assert_eq!(t.synchronous_standby_names(), r#"ANY 1 ("pg1", "pg3")"#);
+        t.node_configs.remove("pg3");
+        assert_eq!(t.synchronous_standby_names(), r#"ANY 1 ("pg1")"#);
+    }
+
+    #[test]
+    fn degraded_sync_clears_names_but_strict_never_does() {
+        let mut t = nodes(&["pg1", "pg2"], "pg1");
+        t.sync_degraded = true;
+        t.replication_mode = ReplicationMode::Sync;
+        assert_eq!(t.synchronous_standby_names(), "");
+        t.replication_mode = ReplicationMode::SyncStrict;
+        assert_eq!(t.synchronous_standby_names(), r#"ANY 1 ("pg2")"#);
+    }
+
+    #[test]
+    fn external_standbys_are_not_synchronous() {
+        let mut t = nodes(&["pg1", "pg2", "pg3"], "pg1");
+        t.replication_mode = ReplicationMode::Sync;
+        t.node_configs
+            .get_mut("pg3")
+            .unwrap()
+            .tags
+            .insert("role".into(), EXTERNAL_ROLE.into());
+        assert_eq!(t.synchronous_standby_names(), r#"ANY 1 ("pg2")"#);
+    }
+
+    #[test]
+    fn node_ids_are_quoted() {
+        let mut t = nodes(&["pg1", "odd\"name"], "pg1");
+        t.replication_mode = ReplicationMode::Sync;
+        assert_eq!(t.synchronous_standby_names(), r#"ANY 1 ("odd""name")"#);
+    }
 
     #[test]
     fn parse_lsn_roundtrip() {

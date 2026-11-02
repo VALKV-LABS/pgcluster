@@ -42,7 +42,32 @@ Once a connection is assigned to a backend, it stays there until:
 
 `SET` commands and `LISTEN` / `NOTIFY` require session affinity (they have per-connection state). These always go to primary.
 
+### Client authentication
+
+The proxy authenticates clients with SCRAM-SHA-256, and logs in to Postgres on their behalf, the same arrangement as PgBouncer and Supavisor:
+
+1. It fetches the role's stored verifier from the primary, through `pgcluster.get_auth(name)`.
+2. It runs SCRAM with the client. The client's proof reveals its `ClientKey`, and the verifier shows that the key is right. The password itself never reaches the proxy.
+3. It uses the `ClientKey` as a SCRAM client to log in to any backend, which is what makes replica routing possible.
+
+The keys stay in memory for the session. pgcluster sets up the function and its role on the primary: `[proxy] auth_user` (default `pgcluster_auth`) with the password in the environment variable named by `auth_password_env` (default `PGCLUSTER_AUTH_PASSWORD`). The server refuses to start without it, and every instance needs the same one. `get_auth` is `SECURITY DEFINER`, and the role can do nothing else, so it needs no superuser.
+
+Limits:
+
+- Roles need a SCRAM password. One with an MD5 password fails as a wrong password would.
+- `pg_hba.conf` must use `scram-sha-256` or `md5` for the proxy, because the proxy cannot answer `password` or `cert`.
+- Clients with `channel_binding=require` are refused, because the proxy terminates their TLS and does not offer `SCRAM-SHA-256-PLUS`.
+- A wrong password and an unknown role fail identically.
+
+### Partitions
+
+Every instance probes the Raft voters four times per `quorum_lease_ms` (default 1000) and renews a lease when it reaches a majority. Once the lease expires, the proxy refuses new connections, ends existing sessions with `57P03` at their next statement, and `/health` returns `503`.
+
+The lease expires by the clock, so a hung probe cannot extend it. The server refuses to start unless `quorum_lease_ms` is shorter than failover detection (`health_check_interval_ms × health_check_failures_before_failover`), so an isolated proxy always stops before the majority can promote a new primary.
+
 ### Lag-Aware Read Routing
+
+Read routing is off by default, because a read that follows a write on a replica may miss it. Set `[proxy.read_routing] enabled = true` when clients can accept that. A session that runs `SET` stays on the primary, where the setting took effect.
 
 Replicas are ranked by replication lag (bytes behind primary). Replicas exceeding `max_replica_lag_bytes` are excluded from the read pool:
 

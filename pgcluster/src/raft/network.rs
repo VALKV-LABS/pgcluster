@@ -7,6 +7,8 @@ use openraft::{
     },
 };
 
+use tonic::transport::ClientTlsConfig;
+
 use crate::raft::types::{NodeId, RaftTypeConfig};
 
 // ── Generated proto module ────────────────────────────────────────────────────
@@ -24,16 +26,15 @@ mod raft_proto {
 /// Named `PgClusterNetworkFactory` (not `RaftNetworkFactory`) to avoid a name
 /// collision with the `RaftNetworkFactory` trait imported from openraft.
 ///
-/// Pass a PEM-encoded CA certificate to enable TLS for Raft peer connections.
+/// Pass a TLS config to verify peers and present this node's client certificate.
 pub struct PgClusterNetworkFactory {
-    /// PEM-encoded CA cert for verifying peer TLS certificates.
-    /// `None` → plaintext HTTP/2 (default for dev/test).
-    pub ca_pem: Option<Vec<u8>>,
+    /// `None` → plaintext HTTP/2, for development.
+    pub tls: Option<ClientTlsConfig>,
 }
 
 impl PgClusterNetworkFactory {
-    pub fn new(ca_pem: Option<Vec<u8>>) -> Self {
-        Self { ca_pem }
+    pub fn new(tls: Option<ClientTlsConfig>) -> Self {
+        Self { tls }
     }
 }
 
@@ -45,7 +46,7 @@ impl RaftNetworkFactory<RaftTypeConfig> for PgClusterNetworkFactory {
         RaftNetworkConnection {
             target,
             target_addr: node.addr.clone(),
-            ca_pem: self.ca_pem.clone(),
+            tls: self.tls.clone(),
         }
     }
 }
@@ -57,7 +58,7 @@ pub struct RaftNetworkConnection {
     #[allow(dead_code)]
     target: NodeId,
     target_addr: String,
-    ca_pem: Option<Vec<u8>>,
+    tls: Option<ClientTlsConfig>,
 }
 
 impl RaftNetworkConnection {
@@ -75,22 +76,15 @@ impl RaftNetworkConnection {
             )))
         };
 
-        let (scheme, tls_cfg) = if let Some(pem) = &self.ca_pem {
-            let ca = tonic::transport::Certificate::from_pem(pem);
-            let cfg = tonic::transport::ClientTlsConfig::new().ca_certificate(ca);
-            ("https", Some(cfg))
-        } else {
-            ("http", None)
-        };
-
+        let scheme = if self.tls.is_some() { "https" } else { "http" };
         let uri = format!("{scheme}://{}", self.target_addr)
             .parse::<tonic::transport::Uri>()
             .map_err(|e| net_err(&format!("invalid peer URI: {e}")))?;
 
         let mut builder = tonic::transport::Channel::builder(uri);
-        if let Some(cfg) = tls_cfg {
+        if let Some(cfg) = &self.tls {
             builder = builder
-                .tls_config(cfg)
+                .tls_config(cfg.clone())
                 .map_err(|e| net_err(&format!("TLS config: {e}")))?;
         }
 

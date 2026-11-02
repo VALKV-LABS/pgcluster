@@ -1,8 +1,22 @@
 /// Failover engine unit tests (no Docker needed for candidate selection).
 /// End-to-end failover tests are #[ignore].
-use pgcluster::failover::candidate::pick_candidate;
-use pgcluster::raft::topology::{ClusterTopology, NodeConfig, NodeRole};
+use pgcluster::agent_clients::agent_proto::agent_service_server::{
+    AgentService, AgentServiceServer,
+};
+use pgcluster::agent_clients::agent_proto::{
+    BackupDeleteRequest, BackupDeleteResponse, BackupPushRequest, BackupPushResponse,
+    BackupVerifyRequest, BackupVerifyResponse, ConfigureBackupsRequest, DemoteRequest,
+    DemoteResponse, DetachRequest, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
+    PromoteResponse, ReloadRequest, ReloadResponse, RestoreRequest, SeedRequest, SeedResponse,
+    SetParametersRequest, SetParametersResponse, SetProxyAuthRequest, StatusRequest,
+    StatusResponse, StopRequest, StopResponse,
+};
+use pgcluster::agent_clients::AgentClientPool;
+use pgcluster::failover::candidate::pick_live_candidate;
+use pgcluster::raft::topology::{ClusterTopology, NodeConfig, NodeRole, ReplicationMode};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tonic::{Request, Response, Status};
 
 fn node(id: &str, priority: u32) -> NodeConfig {
     NodeConfig {
@@ -14,36 +28,257 @@ fn node(id: &str, priority: u32) -> NodeConfig {
     }
 }
 
-#[test]
-fn pick_candidate_no_replicas_returns_none() {
-    let mut t = ClusterTopology::default();
-    t.node_configs.insert("pg1".into(), node("pg1", 100));
-    t.node_roles.insert("pg1".into(), NodeRole::Primary);
-    assert_eq!(pick_candidate(&t, "pg1"), None);
+// ── Candidate selection, against fake agents ─────────────────────────────────
+
+struct FakeAgent(StatusResponse);
+
+/// Accepts connections and never answers, like a node behind dropped packets.
+async fn hung_agent() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    addr
 }
 
-#[test]
-fn pick_candidate_excludes_offline_nodes() {
-    let mut t = ClusterTopology::default();
-    t.node_configs.insert("pg1".into(), node("pg1", 100));
-    t.node_configs.insert("pg2".into(), node("pg2", 90));
-    t.node_roles.insert("pg1".into(), NodeRole::Primary);
-    t.node_roles.insert("pg2".into(), NodeRole::Offline);
-    assert_eq!(pick_candidate(&t, "pg1"), None);
-}
-
-#[test]
-fn pick_candidate_picks_highest_lsn() {
-    let mut t = ClusterTopology::default();
-    for id in ["pg1", "pg2", "pg3"] {
-        t.node_configs.insert(id.into(), node(id, 100));
+#[tonic::async_trait]
+impl AgentService for FakeAgent {
+    async fn promote(&self, _: Request<PromoteRequest>) -> RpcResult<PromoteResponse> {
+        Err(Status::unimplemented("promote"))
     }
+    async fn demote(&self, _: Request<DemoteRequest>) -> RpcResult<DemoteResponse> {
+        Err(Status::unimplemented("demote"))
+    }
+    async fn get_status(&self, _: Request<StatusRequest>) -> RpcResult<StatusResponse> {
+        Ok(Response::new(self.0.clone()))
+    }
+    async fn heartbeat(&self, _: Request<HeartbeatRequest>) -> RpcResult<HeartbeatResponse> {
+        Err(Status::unimplemented("heartbeat"))
+    }
+    async fn stop_postgres(&self, _: Request<StopRequest>) -> RpcResult<StopResponse> {
+        Err(Status::unimplemented("stop_postgres"))
+    }
+    async fn reload_config(&self, _: Request<ReloadRequest>) -> RpcResult<ReloadResponse> {
+        Err(Status::unimplemented("reload_config"))
+    }
+    async fn set_parameters(
+        &self,
+        _: Request<SetParametersRequest>,
+    ) -> RpcResult<SetParametersResponse> {
+        Err(Status::unimplemented("set_parameters"))
+    }
+    async fn seed(&self, _: Request<SeedRequest>) -> RpcResult<SeedResponse> {
+        Err(Status::unimplemented("seed"))
+    }
+    async fn rewind(&self, _: Request<SeedRequest>) -> RpcResult<SeedResponse> {
+        Err(Status::unimplemented("rewind"))
+    }
+    async fn configure_backups(
+        &self,
+        _: Request<ConfigureBackupsRequest>,
+    ) -> RpcResult<SeedResponse> {
+        Err(Status::unimplemented("configure_backups"))
+    }
+    async fn backup_push(&self, _: Request<BackupPushRequest>) -> RpcResult<BackupPushResponse> {
+        Err(Status::unimplemented("backup_push"))
+    }
+    async fn backup_delete(
+        &self,
+        _: Request<BackupDeleteRequest>,
+    ) -> RpcResult<BackupDeleteResponse> {
+        Err(Status::unimplemented("backup_delete"))
+    }
+    async fn backup_verify(
+        &self,
+        _: Request<BackupVerifyRequest>,
+    ) -> RpcResult<BackupVerifyResponse> {
+        Err(Status::unimplemented("backup_verify"))
+    }
+    async fn restore(&self, _: Request<RestoreRequest>) -> RpcResult<SeedResponse> {
+        Err(Status::unimplemented("restore"))
+    }
+    async fn detach(&self, _: Request<DetachRequest>) -> RpcResult<SeedResponse> {
+        Err(Status::unimplemented("detach"))
+    }
+    async fn set_proxy_auth(&self, _: Request<SetProxyAuthRequest>) -> RpcResult<SeedResponse> {
+        Err(Status::unimplemented("set_proxy_auth"))
+    }
+}
+
+type RpcResult<T> = Result<Response<T>, Status>;
+
+fn standby_at(lsn: u64) -> StatusResponse {
+    StatusResponse {
+        is_in_recovery: true,
+        received_lsn: lsn,
+        replayed_lsn: lsn,
+        postgres_running: true,
+        ..Default::default()
+    }
+}
+
+/// Serve `status` from a fake agent and return its address.
+async fn fake_agent(status: StatusResponse) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(AgentServiceServer::new(FakeAgent(status)))
+            .serve_with_incoming(incoming),
+    );
+    addr.to_string()
+}
+
+/// A topology whose primary `pg1` has failed, with one replica per entry of
+/// `(id, agent address, cached position)`.
+fn cluster(replicas: &[(&str, &str, u64)]) -> ClusterTopology {
+    let mut t = ClusterTopology::default();
+    t.node_configs.insert("pg1".into(), node("pg1", 100));
     t.node_roles.insert("pg1".into(), NodeRole::Primary);
-    t.node_roles.insert("pg2".into(), NodeRole::Replica);
-    t.node_roles.insert("pg3".into(), NodeRole::Replica);
-    t.last_flush_lsns.insert("pg2".into(), 100);
-    t.last_flush_lsns.insert("pg3".into(), 999);
-    assert_eq!(pick_candidate(&t, "pg1").as_deref(), Some("pg3"));
+    for (id, addr, lsn) in replicas {
+        let mut cfg = node(id, 100);
+        cfg.agent_addr = addr.to_string();
+        t.node_configs.insert(id.to_string(), cfg);
+        t.node_roles.insert(id.to_string(), NodeRole::Replica);
+        t.last_flush_lsns.insert(id.to_string(), *lsn);
+    }
+    t
+}
+
+async fn pick(t: &ClusterTopology) -> Option<(String, u64)> {
+    pick_live_candidate(t, "pg1", &Arc::new(AgentClientPool::new())).await
+}
+
+#[tokio::test]
+async fn no_replicas_means_no_candidate() {
+    assert_eq!(pick(&cluster(&[])).await, None);
+}
+
+#[tokio::test]
+async fn offline_nodes_are_not_candidates() {
+    let addr = fake_agent(standby_at(100)).await;
+    let mut t = cluster(&[("pg2", &addr, 100)]);
+    t.node_roles.insert("pg2".into(), NodeRole::Offline);
+    assert_eq!(pick(&t).await, None);
+}
+
+#[tokio::test]
+async fn stale_cached_position_promotes_the_most_current_standby() {
+    let pg2 = fake_agent(standby_at(100)).await;
+    let pg3 = fake_agent(standby_at(999)).await;
+    // The cache has them the wrong way round.
+    let t = cluster(&[("pg2", &pg2, 999), ("pg3", &pg3, 100)]);
+    assert_eq!(pick(&t).await, Some(("pg3".into(), 999)));
+}
+
+#[tokio::test]
+async fn received_wal_counts_even_before_it_is_replayed() {
+    let pg2 = fake_agent(standby_at(500)).await;
+    let mut ahead = standby_at(100);
+    ahead.received_lsn = 900;
+    let pg3 = fake_agent(ahead).await;
+    let t = cluster(&[("pg2", &pg2, 0), ("pg3", &pg3, 0)]);
+    assert_eq!(pick(&t).await, Some(("pg3".into(), 900)));
+}
+
+#[tokio::test]
+async fn unreachable_standby_is_skipped() {
+    let reachable = fake_agent(standby_at(100)).await;
+    let t = cluster(&[("pg2", "127.0.0.1:1", 999), ("pg3", &reachable, 100)]);
+    assert_eq!(pick(&t).await, Some(("pg3".into(), 100)));
+}
+
+#[tokio::test]
+async fn node_not_in_recovery_is_skipped() {
+    let mut promoted = standby_at(999);
+    promoted.is_in_recovery = false;
+    let pg2 = fake_agent(promoted).await;
+    let pg3 = fake_agent(standby_at(100)).await;
+    let t = cluster(&[("pg2", &pg2, 0), ("pg3", &pg3, 0)]);
+    assert_eq!(pick(&t).await, Some(("pg3".into(), 100)));
+}
+
+#[tokio::test]
+async fn a_hung_agent_fails_its_health_check_instead_of_blocking() {
+    let addr = hung_agent().await;
+    let pool = AgentClientPool::new();
+    let check = pgcluster::node_monitor::health_check::check_node("pg1", &addr, &pool);
+    let result = tokio::time::timeout(Duration::from_secs(5), check)
+        .await
+        .expect("a hung agent must not block the monitor");
+    assert!(!result.reachable);
+}
+
+#[tokio::test]
+async fn an_external_standby_is_never_a_candidate() {
+    let pg2 = fake_agent(standby_at(100)).await;
+    let pg3 = fake_agent(standby_at(999)).await;
+    let mut t = cluster(&[("pg2", &pg2, 0), ("pg3", &pg3, 0)]);
+    t.node_configs
+        .get_mut("pg3")
+        .unwrap()
+        .tags
+        .insert("role".into(), "external".into());
+    assert_eq!(pick(&t).await, Some(("pg2".into(), 100)));
+}
+
+#[tokio::test]
+async fn sync_strict_does_not_wait_for_an_external_standby() {
+    let pg2 = fake_agent(standby_at(100)).await;
+    let mut t = cluster(&[("pg2", &pg2, 0), ("pg3", "127.0.0.1:1", 0)]);
+    t.replication_mode = ReplicationMode::SyncStrict;
+    t.node_configs
+        .get_mut("pg3")
+        .unwrap()
+        .tags
+        .insert("role".into(), "external".into());
+    assert_eq!(pick(&t).await, Some(("pg2".into(), 100)));
+}
+
+#[tokio::test]
+async fn sync_strict_promotes_when_every_standby_answers() {
+    let pg2 = fake_agent(standby_at(100)).await;
+    let pg3 = fake_agent(standby_at(999)).await;
+    let mut t = cluster(&[("pg2", &pg2, 0), ("pg3", &pg3, 0)]);
+    t.replication_mode = ReplicationMode::SyncStrict;
+    assert_eq!(pick(&t).await, Some(("pg3".into(), 999)));
+}
+
+#[tokio::test]
+async fn sync_strict_refuses_when_a_standby_does_not_answer() {
+    let pg3 = fake_agent(standby_at(999)).await;
+    let mut t = cluster(&[("pg2", "127.0.0.1:1", 0), ("pg3", &pg3, 0)]);
+    t.replication_mode = ReplicationMode::SyncStrict;
+    assert_eq!(pick(&t).await, None);
+}
+
+#[tokio::test]
+async fn sync_strict_counts_an_offline_standby_as_not_answering() {
+    let pg2 = fake_agent(standby_at(100)).await;
+    let pg3 = fake_agent(standby_at(999)).await;
+    let mut t = cluster(&[("pg2", &pg2, 0), ("pg3", &pg3, 0)]);
+    t.replication_mode = ReplicationMode::SyncStrict;
+    t.node_roles.insert("pg2".into(), NodeRole::Offline);
+    assert_eq!(pick(&t).await, None);
+}
+
+#[tokio::test]
+async fn sync_promotes_the_best_reachable_standby() {
+    let pg3 = fake_agent(standby_at(999)).await;
+    let mut t = cluster(&[("pg2", "127.0.0.1:1", 0), ("pg3", &pg3, 0)]);
+    t.replication_mode = ReplicationMode::Sync;
+    assert_eq!(pick(&t).await, Some(("pg3".into(), 999)));
+}
+
+#[tokio::test]
+async fn no_answer_aborts_rather_than_trusting_the_cache() {
+    let t = cluster(&[("pg2", "127.0.0.1:1", 999)]);
+    assert_eq!(pick(&t).await, None);
 }
 
 // ── E2E helpers ───────────────────────────────────────────────────────────────
@@ -275,6 +510,7 @@ async fn switchover_is_zero_data_loss() {
     // Trigger switchover — waits for zero lag before promoting.
     let sw_resp = http
         .post(format!("{api}/api/switchover"))
+        .bearer_auth("dev-api-key")
         .json(&serde_json::json!({
             "target_node_id": target,
             "max_lag_bytes": 0,

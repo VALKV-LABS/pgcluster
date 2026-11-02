@@ -1,51 +1,55 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{HeaderMap, Method, Request, StatusCode},
     middleware::Next,
     response::Response,
 };
 
 use super::ApiState;
+use crate::config::ApiConfig;
 
 /// Axum middleware that validates `Authorization: Bearer <token>` against the
 /// configured `api_keys` list.
-///
-/// Rules:
-/// - If `api_keys` is empty: all requests are allowed (auth disabled).
-/// - If `public_read_endpoints = true`: GET and HEAD requests bypass auth.
-/// - Otherwise: a valid `Authorization: Bearer <key>` header is required.
 pub async fn require_auth(
     State(s): State<ApiState>,
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // Auth is disabled when no keys are configured.
-    if s.config.api.api_keys.is_empty() {
-        return Ok(next.run(request).await);
+    if is_authorized(&s.config.api, request.method(), request.headers()) {
+        Ok(next.run(request).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// Decide whether a request may proceed.
+///
+/// Rules:
+/// - If `insecure_no_auth = true`: all requests are allowed.
+/// - If `public_read_endpoints = true`: GET and HEAD requests bypass auth.
+/// - Otherwise: a valid `Authorization: Bearer <key>` header is required, so
+///   an empty `api_keys` list rejects everything.
+fn is_authorized(api: &ApiConfig, method: &Method, headers: &HeaderMap) -> bool {
+    if api.insecure_no_auth {
+        return true;
     }
 
     // Public GET/HEAD endpoints bypass auth when configured.
-    if s.config.api.public_read_endpoints {
-        let method = request.method();
-        if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
-            return Ok(next.run(request).await);
-        }
+    if api.public_read_endpoints && (method == Method::GET || method == Method::HEAD) {
+        return true;
     }
 
     // Extract the Bearer token from the Authorization header.
-    let token = request
-        .headers()
+    let token = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(str::trim);
 
     match token {
-        Some(t) if s.config.api.api_keys.iter().any(|k| constant_time_eq(k, t)) => {
-            Ok(next.run(request).await)
-        }
-        _ => Err(StatusCode::UNAUTHORIZED),
+        Some(t) => api.api_keys.iter().any(|k| constant_time_eq(k, t)),
+        None => false,
     }
 }
 
@@ -92,10 +96,58 @@ mod tests {
         assert_eq!(token, Some("token-with-space"));
     }
 
+    fn api(keys: &[&str]) -> ApiConfig {
+        ApiConfig {
+            api_keys: keys.iter().map(|k| k.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
     #[test]
-    fn empty_api_keys_disables_auth() {
-        let keys: Vec<String> = vec![];
-        assert!(keys.is_empty());
+    fn empty_api_keys_rejects_everything() {
+        assert!(!is_authorized(&api(&[]), &Method::GET, &HeaderMap::new()));
+        assert!(!is_authorized(&api(&[]), &Method::GET, &bearer("anything")));
+    }
+
+    #[test]
+    fn missing_or_wrong_token_is_rejected() {
+        let cfg = api(&["secret"]);
+        assert!(!is_authorized(&cfg, &Method::POST, &HeaderMap::new()));
+        assert!(!is_authorized(&cfg, &Method::POST, &bearer("wrong")));
+    }
+
+    #[test]
+    fn valid_token_is_accepted() {
+        assert!(is_authorized(
+            &api(&["secret"]),
+            &Method::POST,
+            &bearer("secret")
+        ));
+    }
+
+    #[test]
+    fn public_reads_do_not_open_writes() {
+        let cfg = ApiConfig {
+            public_read_endpoints: true,
+            ..api(&["secret"])
+        };
+        assert!(is_authorized(&cfg, &Method::GET, &HeaderMap::new()));
+        assert!(!is_authorized(&cfg, &Method::POST, &HeaderMap::new()));
+    }
+
+    #[test]
+    fn development_flag_allows_everything() {
+        let cfg = ApiConfig {
+            insecure_no_auth: true,
+            ..api(&[])
+        };
+        assert!(is_authorized(&cfg, &Method::POST, &HeaderMap::new()));
     }
 
     #[test]

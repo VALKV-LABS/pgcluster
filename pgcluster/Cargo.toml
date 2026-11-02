@@ -62,9 +62,15 @@ prometheus = { version = "0.13", features = ["process"] }
 # SQL (for replication slot management on primary)
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "chrono"] }
 
+# SCRAM between the proxy and clients and backends
+sha2   = "0.10"
+hmac   = "0.12"
+base64 = "0.22"
+rand   = "0.8"
+
 # Backup
-object_store = { version = "0.10", features = ["aws"] }
 tempfile     = "3"
+tokio-stream = { version = "0.1", features = ["net"] }
 
 # Utils
 parking_lot = "0.12"

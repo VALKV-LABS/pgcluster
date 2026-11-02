@@ -15,6 +15,7 @@ pub struct HeartbeatTracker {
     timeout: Duration,
     in_safe_mode: Arc<AtomicBool>,
     safe_mode_since: Arc<Mutex<Option<Instant>>>,
+    detached: AtomicBool,
 }
 
 impl HeartbeatTracker {
@@ -27,6 +28,7 @@ impl HeartbeatTracker {
             timeout,
             in_safe_mode: Arc::new(AtomicBool::new(false)),
             safe_mode_since: Arc::new(Mutex::new(None)),
+            detached: AtomicBool::new(false),
         })
     }
 
@@ -41,12 +43,25 @@ impl HeartbeatTracker {
 
     /// Returns `true` when the agent is in safe mode (heartbeat lost).
     pub fn is_safe_mode(&self) -> bool {
-        self.in_safe_mode.load(Ordering::SeqCst)
+        !self.is_detached() && self.in_safe_mode.load(Ordering::SeqCst)
+    }
+
+    /// This node left the cluster, so no pgcluster will heartbeat it again, and
+    /// it must never enter safe mode or self-fence.
+    pub fn detach(&self) {
+        self.detached.store(true, Ordering::SeqCst);
+    }
+
+    fn is_detached(&self) -> bool {
+        self.detached.load(Ordering::SeqCst)
     }
 
     /// Returns how long the agent has been continuously in safe mode.
     /// Returns `None` if the agent is not currently in safe mode.
     pub fn time_in_safe_mode(&self) -> Option<Duration> {
+        if self.is_detached() {
+            return None;
+        }
         self.safe_mode_since.lock().unwrap().map(|t| t.elapsed())
     }
 
@@ -77,6 +92,17 @@ impl HeartbeatTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_detached_node_never_reports_safe_mode() {
+        let tracker = HeartbeatTracker::new(Duration::from_secs(1));
+        tracker.clone().spawn_watchdog();
+        tracker.detach();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(!tracker.is_safe_mode());
+        assert!(tracker.time_in_safe_mode().is_none());
+    }
 
     #[tokio::test]
     async fn starts_not_in_safe_mode() {

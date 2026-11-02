@@ -13,7 +13,7 @@
 | `proxy_layer` | [proxy_layer.md](proxy_layer.md) | Postgres-protocol proxy; write→primary, read→replicas; session routing |
 | `connection_pool` | [connection_pool.md](connection_pool.md) | Per-(db, user, backend) connection pools; transaction-mode multiplexing |
 | `config_manager` | [config_manager.md](config_manager.md) | `pgcluster.toml` load, validate, hot-reload |
-| `tls_manager` | [tls_manager.md](tls_manager.md) | TLS for Raft, agent gRPC, proxy; auto cert generation for dev |
+| `tls_manager` | [tls_manager.md](tls_manager.md) | TLS for Raft, agent gRPC and the proxy; certificate generation |
 | `rest_api` | [rest_api.md](rest_api.md) | HTTP API: status, switchover, failover, node management, backups |
 | `cli` | [cli.md](cli.md) | `pgcluster` binary: server mode + operator CLI subcommands |
 | `backup_coordinator` | [backup_coordinator.md](backup_coordinator.md) | Policy-scheduled base backups (daily/weekly/monthly); S3 upload; manifest tracking; retention |

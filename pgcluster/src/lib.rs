@@ -18,7 +18,7 @@ pub mod tls;
 
 use anyhow::Result;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Start the full pgcluster server from the given config file path.
 pub async fn run_server(config_path: &str) -> Result<()> {
@@ -32,20 +32,34 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
     logging::init();
     info!(cluster = %cfg.cluster.name, node_id = cfg.raft.node_id, "pgcluster starting");
+    if cfg.api.insecure_no_auth {
+        warn!("REST API is running with no credentials (insecure_no_auth = true)");
+    }
 
-    // Build TLS manager before Raft so we can share the CA cert for peer connections.
-    let tls_mgr: Option<Arc<tls::TlsManager>> = if cfg.tls.auto_generate || cfg.tls.cert.is_some() {
-        Some(Arc::new(tls::TlsManager::new(
-            &cfg.tls,
-            cfg.raft.node_id,
-            std::path::Path::new(&cfg.cluster.data_dir),
-        )?))
-    } else {
+    // Build TLS manager before Raft so peer connections can use it.
+    let tls_mgr: Option<Arc<tls::TlsManager>> = if cfg.tls.insecure_plaintext {
+        warn!("gRPC and Postgres connections are in plaintext (insecure_plaintext = true)");
         None
+    } else {
+        Some(Arc::new(tls::TlsManager::new(&cfg.tls)?))
     };
 
-    let raft_ca_pem = tls_mgr.as_ref().map(|t| t.ca_cert_pem().to_vec());
-    let raft_node = Arc::new(raft::RaftNode::start(&cfg, raft_ca_pem).await?);
+    let auth_password = std::env::var(&cfg.proxy.auth_password_env).unwrap_or_default();
+    if auth_password.is_empty() {
+        anyhow::bail!(
+            "[proxy] set {} to the password for the {} role",
+            cfg.proxy.auth_password_env,
+            cfg.proxy.auth_user
+        );
+    }
+    let auth_role = proxy::auth::AuthRole {
+        user: cfg.proxy.auth_user.clone(),
+        password: auth_password,
+        ca_pem: tls_mgr.as_ref().map(|t| t.ca_cert_pem().to_vec()),
+    };
+
+    let raft_tls = tls_mgr.as_ref().map(|t| t.tonic_client_tls_config());
+    let raft_node = Arc::new(raft::RaftNode::start(&cfg, raft_tls).await?);
     let topology_rx = raft_node.topology_rx.clone();
 
     // On bootstrap, seed the Raft topology from the TOML [[nodes.node]] list.
@@ -54,14 +68,23 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     if cfg.raft.bootstrap && !cfg.nodes.node.is_empty() {
         let seed_raft = raft_node.clone();
         let seed_nodes = cfg.nodes.node.clone();
+        let seed_topology = topology_rx.clone();
+        let seed_mode = cfg.replication.replication_mode;
         tokio::spawn(async move {
-            // Wait until this instance is the Raft leader (fast in single-node bootstrap).
+            // Wait until this instance is the Raft leader and has applied its
+            // log (fast in single-node bootstrap).
             for _ in 0..50u32 {
                 let m = seed_raft.raft.metrics().borrow().clone();
-                if m.current_leader == Some(m.id) {
+                let applied = m.last_applied.map(|id| id.index) >= m.last_log_index;
+                if m.current_leader == Some(m.id) && applied {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            // A restart must not repeat the seed: it would move the primary back
+            // to the highest-priority node and undo any online mode change.
+            if !seed_topology.current().node_configs.is_empty() {
+                return;
             }
             for node in &seed_nodes {
                 let cmd = raft::commands::TopologyCommand::AddNode(raft::topology::NodeConfig {
@@ -86,23 +109,34 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                     tracing::warn!(err = %e, "bootstrap seed: SetPrimary failed");
                 }
             }
+            let cmd = raft::commands::TopologyCommand::SetReplicationMode { mode: seed_mode };
+            if let Err(e) = seed_raft.raft.client_write(cmd).await {
+                tracing::warn!(err = %e, "bootstrap seed: SetReplicationMode failed");
+            }
             tracing::info!(count = seed_nodes.len(), "bootstrap seed complete");
         });
     }
     let metrics = metrics_registry::Metrics::new()?;
 
-    // Use TLS-verified connections to vk-agents when a CA cert is available.
     let pool = Arc::new(match tls_mgr.as_ref() {
-        Some(t) => agent_clients::AgentClientPool::new_with_ca(t.ca_cert_pem().to_vec()),
+        Some(t) => agent_clients::AgentClientPool::new_with_tls(t.tonic_client_tls_config()),
         None => agent_clients::AgentClientPool::new(),
     });
 
     // Build the proxy Router early so it can be shared between the ProxyServer
     // (which uses it for routing) and ApiState (which uses it for drain control).
-    let proxy_router = Arc::new(proxy::Router::new(
-        topology_rx.clone(),
-        cfg.proxy.read_routing.clone(),
+    let quorum = Arc::new(raft::lease::QuorumLease::new(
+        std::time::Duration::from_millis(cfg.proxy.quorum_lease_ms),
     ));
+    raft::lease::spawn_renewal(
+        quorum.clone(),
+        raft_node.raft.clone(),
+        tls_mgr.as_ref().map(|t| t.tonic_client_tls_config()),
+    );
+    let proxy_router = Arc::new(
+        proxy::Router::new(topology_rx.clone(), cfg.proxy.read_routing.clone())
+            .with_quorum(quorum.clone()),
+    );
 
     // Shared op_in_progress flag: prevents concurrent automatic failover (node_monitor)
     // and operator-initiated failover/switchover (API handlers) from running simultaneously.
@@ -118,8 +152,6 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         op_in_progress.clone(),
     );
 
-    let raft_grpc = raft::RaftGrpcServer::new(raft_node.raft.clone());
-    let (raft_svc, topo_svc) = raft_grpc.into_services();
     let raft_peer_addr = cfg
         .raft
         .peers
@@ -140,6 +172,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     {
         let addr_str = raft_grpc_addr.clone();
         let raft_tls = tls_mgr.as_ref().map(|t| t.tonic_server_tls_config());
+        let raft = raft_node.raft.clone();
         tasks.push(tokio::spawn(async move {
             let addr: std::net::SocketAddr = match addr_str.parse() {
                 Ok(a) => a,
@@ -148,22 +181,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                     return;
                 }
             };
-            let mut builder = tonic::transport::Server::builder();
-            if let Some(tls_cfg) = raft_tls {
-                builder = match builder.tls_config(tls_cfg) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        error!(err = %e, "Raft gRPC TLS config failed");
-                        return;
-                    }
-                };
-            }
-            if let Err(e) = builder
-                .add_service(raft_svc)
-                .add_service(topo_svc)
-                .serve(addr)
-                .await
-            {
+            if let Err(e) = raft::serve_grpc(raft, addr, raft_tls).await {
                 error!(err = %e, "Raft gRPC server failed");
             }
         }));
@@ -227,6 +245,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
             proxy_router.clone(),
             proxy_tls,
             proxy_metrics,
+            Arc::new(proxy::auth::AuthQuery::new(auth_role.clone())),
         ));
 
         let srv2 = Arc::clone(&srv);
@@ -251,10 +270,14 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         let pool = pool.clone();
         let fcfg = cfg.failover.clone();
         let mon_metrics = metrics.clone();
-        let repl_user = cfg.replication.replication_user.clone();
+        let replication = cfg.replication.clone();
+        let backup_settings = cfg
+            .backup
+            .as_ref()
+            .filter(|b| b.enabled)
+            .map(backup::walg::settings);
         let repl_password =
             std::env::var(&cfg.replication.replication_password_env).unwrap_or_default();
-        let slot_prefix = cfg.replication.slot_prefix.clone();
         tasks.push(tokio::spawn(async move {
             let mut monitor = node_monitor::NodeMonitor::new(
                 raft,
@@ -262,10 +285,12 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                 pool,
                 fcfg,
                 mon_metrics,
-                repl_user,
+                &replication,
+                &auth_role,
+                backup_settings,
                 repl_password,
-                slot_prefix,
                 op_in_progress.clone(),
+                quorum,
             );
             monitor.run().await;
         }));
@@ -273,19 +298,13 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
     // Backup scheduler (only started when [backup] section is present in config)
     if let Some(backup_cfg) = cfg.backup.clone() {
-        let raft = raft_node.clone();
-        let topo = topology_rx.clone();
-        let repl_user = cfg.replication.replication_user.clone();
-        let repl_password =
-            std::env::var(&cfg.replication.replication_password_env).unwrap_or_default();
-        tasks.push(tokio::spawn(async move {
-            match backup::BackupScheduler::new(raft, topo, backup_cfg, repl_user, repl_password) {
-                Ok(mut scheduler) => scheduler.run().await,
-                Err(e) => {
-                    error!(err = %e, "backup scheduler failed to initialize (check S3 config)")
-                }
-            }
-        }));
+        let mut scheduler = backup::BackupScheduler::new(
+            raft_node.clone(),
+            topology_rx.clone(),
+            backup_cfg,
+            pool.clone(),
+        );
+        tasks.push(tokio::spawn(async move { scheduler.run().await }));
     }
 
     info!(raft_grpc = %raft_grpc_addr, api = %cfg.api.listen_addr,

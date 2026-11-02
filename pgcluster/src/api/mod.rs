@@ -4,10 +4,13 @@ pub mod config;
 pub mod failover;
 pub mod forward;
 pub mod maintenance;
+pub mod members;
 pub mod metrics;
 pub mod nodes;
 pub mod pg_hba;
 pub mod replication;
+pub mod replication_mode;
+pub mod restart;
 pub mod status;
 pub mod switchover;
 
@@ -37,6 +40,10 @@ pub struct ApiState {
     pub proxy_drain: Option<Arc<ProxyRouter>>,
     /// TLS-aware agent client pool shared by all API handlers.
     pub pool: Arc<AgentClientPool>,
+    /// The most recent rolling restart run from this instance.
+    pub restart_status: Arc<std::sync::Mutex<restart::RestartStatus>>,
+    /// The most recent restore run from this instance.
+    pub restore_status: Arc<std::sync::Mutex<restart::RestartStatus>>,
 }
 
 impl ApiState {
@@ -57,6 +64,8 @@ impl ApiState {
             op_in_progress,
             proxy_drain,
             pool,
+            restart_status: Default::default(),
+            restore_status: Default::default(),
         }
     }
 }
@@ -76,9 +85,26 @@ pub fn router(state: ApiState) -> Router {
                     get(nodes::get_node).delete(nodes::remove_node),
                 )
                 .route("/nodes/add", post(nodes::add_node))
+                .route("/nodes/:node_id/seed", post(nodes::seed_node))
+                .route("/nodes/:node_id/detach", post(nodes::detach_node))
+                .route(
+                    "/members",
+                    get(members::list_members).post(members::add_member),
+                )
+                .route(
+                    "/members/:id",
+                    axum::routing::delete(members::remove_member),
+                )
+                .route("/members/:id/promote", post(members::promote_member))
                 .route("/failover", post(failover::trigger_failover))
                 .route("/failover/history", get(failover::failover_history))
                 .route("/switchover", post(switchover::trigger_switchover))
+                .route(
+                    "/restart",
+                    get(restart::get_restart).post(restart::start_restart),
+                )
+                .route("/replication", get(replication_mode::get_replication))
+                .route("/replication/mode", post(replication_mode::set_mode))
                 .route("/replication/slots", get(replication::list_slots))
                 .route("/config", get(config::get_config))
                 .route(
@@ -89,6 +115,11 @@ pub fn router(state: ApiState) -> Router {
                 .route(
                     "/backups",
                     get(backup::list_backups).post(backup::trigger_backup),
+                )
+                .route("/backups/verify", get(backup::verify_backups))
+                .route(
+                    "/backups/restore",
+                    get(backup::get_restore).post(backup::start_restore),
                 )
                 .route(
                     "/backups/:backup_id",

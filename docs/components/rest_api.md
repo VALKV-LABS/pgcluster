@@ -17,6 +17,10 @@ api_keys    = ["key1-for-ops", "key2-for-monitoring"]
 public_read_endpoints = false   # true lets GET and HEAD through without a key
 ```
 
+The server refuses to start with no keys. For local development only, `insecure_no_auth = true` runs the API with no credentials, and logs a warning.
+
+The CLI sends the key in the `PGCLUSTER_API_KEY` environment variable.
+
 `/health` is always public, for load balancers and Docker health checks.
 
 ## Endpoints
@@ -26,6 +30,19 @@ public_read_endpoints = false   # true lets GET and HEAD through without a key
 | `GET` | `/health` | `200` | Health; `503` when no primary is known |
 | `GET` | `/api/status` | `200` | Cluster summary |
 | `GET` | `/api/topology` | `200` | Full topology snapshot |
+| `GET` | `/api/replication` | `200` | Replication mode, fallback state and standbys that need seeding |
+| `POST` | `/api/replication/mode` | `204` | Change the mode online: `{"mode": "async"}`, `"sync"` or `"sync_strict"` |
+| `POST` | `/api/nodes/:node_id/seed` | `202` | Seed a node from the primary. `{"force": true}` discards data already on it, and `{"from_backup": true}` uses the latest backup |
+| `POST` | `/api/restart` | `202` | Start a rolling restart, on the Raft leader |
+| `GET` | `/api/restart` | `200` | Whether a rolling restart is running on this instance, and any error |
+| `GET` | `/api/backups/verify` | `200` | Check the WAL archive for gaps |
+| `POST` | `/api/nodes/:node_id/detach` | `204` | Turn an external standby into an independent database, on the Raft leader |
+| `POST` | `/api/backups/restore` | `202` | Restore onto a separate agent, optionally to a point in time |
+| `GET` | `/api/backups/restore` | `200` | Whether a restore is running on this instance, and any error |
+| `GET` | `/api/members` | `200` | List Raft voters and learners |
+| `POST` | `/api/members` | `201` | Add a learner, `{"id": 4, "addr": "host:7000"}`, and wait for it to catch up |
+| `POST` | `/api/members/:id/promote` | `204` | Promote a learner to voter |
+| `DELETE` | `/api/members/:id` | `204` | Remove a voter or learner |
 | `GET` | `/api/nodes` | `200` | List nodes |
 | `GET` | `/api/nodes/:node_id` | `200` | One node |
 | `POST` | `/api/nodes/add` | `201` | Register a Postgres node |
@@ -193,3 +210,7 @@ pgcluster/src/api/
   backup.rs       /api/backups
   metrics.rs      /metrics
 ```
+
+Member changes go to the Raft leader. Any other instance answers `503` with the leader's address.
+
+To replace a member, start the new instance with `bootstrap = false`, add it, promote it, then remove the old one. That order keeps the cluster at full strength throughout.

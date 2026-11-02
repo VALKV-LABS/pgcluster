@@ -93,7 +93,9 @@ pub struct ReplicationConfig {
     pub replication_password_env: String,
     pub slot_prefix: String,            // default: "pgcluster_"
     #[serde(default)]
-    pub synchronous_standby_names: String,
+    pub replication_mode: ReplicationMode,
+    pub sync_degrade_timeout_seconds: u64,
+    pub max_slot_wal_keep_size_mb: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

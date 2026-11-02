@@ -241,3 +241,35 @@ impl FailoverEngine {
 - `proxy_layer` reads new topology from Raft state machine — no direct call needed.
 - `vk_agent` receives Promote (step 4) and Demote (step 8) gRPC calls.
 - `rest_api` and alerting webhook receive `ClusterEvent::FailoverComplete`.
+
+## Replication modes
+
+The mode lives in Raft. `[replication] replication_mode` sets it for a new cluster, and `POST /api/replication/mode` changes it online. On every tick the leader compares the primary's settings with what the mode requires and applies any difference, so a mode change, a membership change and a new primary all take the same path.
+
+| | `async` | `sync` | `sync_strict` |
+|---|---|---|---|
+| `synchronous_standby_names` | empty | `ANY 1 (...)` over every standby | `ANY 1 (...)` over every standby |
+| No standby streaming | No effect | Commits stall for `sync_degrade_timeout_seconds`, then fall back | Commits block until a standby returns |
+| Primary lost | Promote the best reachable standby | Promote the best reachable standby | Promote only when every standby answers |
+
+Standbys are matched by `application_name`, which must be the node ID. Demote sets it, and a node seeded by other means needs it in `primary_conninfo`.
+
+The fallback is recorded through Raft before the setting is cleared, so a later failover knows no standby is guaranteed current. It logs a warning and sets `ran_degraded` in the failover history. When a standby streams again, the setting is restored first and the record cleared after.
+
+`max_slot_wal_keep_size_mb` caps the WAL a slot can hold back. A standby past that limit cannot catch up by streaming, and appears under `needs_reseed` in `GET /api/replication`.
+
+Failover retries until it succeeds. If the primary returns first, it keeps its role.
+
+## Old primaries
+
+A node that accepts writes but is not the cluster's primary has diverged, and those writes are lost when it rejoins. After `health_check_failures_before_failover` sightings in a row, outside any failover or switchover, the leader creates its slot and has its agent run `pg_rewind` and restart it as a standby. If the rewind fails, it seeds the node again.
+
+`pg_rewind` needs data checksums or `wal_log_hints`. Seeding and rewinding need an agent that owns Postgres, so an agent with `manage_postgres = false` refuses both.
+
+## External standbys
+
+An external standby follows the primary, typically from another region, and has no pgcluster instance of its own, so it is outside Raft. Failover never promotes it, synchronous commit and `sync_strict` promotion ignore it, and backups and rolling restarts skip it. It is repointed like any other standby when the primary changes.
+
+`POST /api/nodes/:id/detach` promotes it into an independent database. It stops following the primary, stops archiving to the cluster's repository and stops expecting heartbeats, so it never fences itself. The cluster forgets the node and drops its slot.
+
+It needs the same Postgres major version and CPU architecture as the cluster.

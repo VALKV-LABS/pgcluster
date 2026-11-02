@@ -28,7 +28,10 @@ fn vk_agent_version_exits_zero() {
     // workspace root's target directory relative to this manifest.
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent().expect("workspace root");
-    let bin = workspace_root.join("target/debug/vk-agent");
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| workspace_root.join("target"));
+    let bin = target_dir.join("debug/vk-agent");
     let out = Command::new(&bin)
         .arg("--version")
         .output()

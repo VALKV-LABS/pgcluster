@@ -98,6 +98,7 @@ fn failover_history_capped_at_max() {
             triggered_at: i as i64,
             duration_ms: 100,
             reason: "test".into(),
+            ran_degraded: false,
         });
     }
     assert_eq!(t.failover_history.len(), cap);

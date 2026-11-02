@@ -2,6 +2,7 @@ pub mod candidate;
 pub mod events;
 pub mod promote;
 pub mod repoint;
+pub mod seed;
 pub mod slots;
 
 use std::sync::Arc;
@@ -20,7 +21,8 @@ use crate::raft::RaftNode;
 /// consecutive health checks.
 ///
 /// Steps:
-/// 1. Pick the best replica candidate (highest LSN, then priority).
+/// 1. Ask reachable replicas for their position and pick the best (highest
+///    LSN, then priority).
 /// 2. Promote the candidate via the Promote RPC.
 /// 3. Propose `SetPrimary` to Raft so all cluster members update their view.
 /// 4. Record the failover event in Raft history.
@@ -40,15 +42,14 @@ pub async fn trigger_failover(
     info!(failed_primary, "starting automatic failover");
 
     // ── 1. Pick candidate ────────────────────────────────────────────────────
-    let candidate = match candidate::pick_candidate(topology, failed_primary) {
-        Some(c) => c,
-        None => {
-            error!(
-                failed_primary,
-                "failover aborted: no eligible replica found"
-            );
-            return;
-        }
+    let Some((candidate, at_lsn)) =
+        candidate::pick_live_candidate(topology, failed_primary, pool).await
+    else {
+        error!(
+            failed_primary,
+            "failover aborted: no eligible replica answered"
+        );
+        return;
     };
 
     let candidate_cfg = match topology.node_configs.get(&candidate) {
@@ -61,6 +62,13 @@ pub async fn trigger_failover(
             return;
         }
     };
+
+    if topology.sync_degraded {
+        warn!(
+            candidate,
+            "sync had fallen back to async: no standby is guaranteed current"
+        );
+    }
 
     // ── 2. Promote candidate ─────────────────────────────────────────────────
     if let Err(e) = promote::promote_node(&candidate, &candidate_cfg.agent_addr, pool).await {
@@ -92,11 +100,6 @@ pub async fn trigger_failover(
     }
 
     // ── 3. Propose SetPrimary ────────────────────────────────────────────────
-    let at_lsn = topology
-        .last_flush_lsns
-        .get(&candidate)
-        .copied()
-        .unwrap_or(0);
     let new_timeline = 1u32; // will be refreshed by the next health-check poll
     if let Err(e) = raft
         .raft
@@ -118,6 +121,7 @@ pub async fn trigger_failover(
         candidate.clone(),
         started,
         "health_check_failure".to_string(),
+        topology.sync_degraded,
     );
     let _ = raft
         .raft
@@ -127,6 +131,7 @@ pub async fn trigger_failover(
             triggered_at: event.triggered_at,
             duration_ms: event.duration_ms,
             reason: event.reason.clone(),
+            ran_degraded: event.ran_degraded,
         })
         .await;
 

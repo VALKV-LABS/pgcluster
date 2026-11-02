@@ -21,18 +21,20 @@ The switchover engine handles **planned, zero-data-loss primary handoff**. Unlik
 ### Sequence
 
 ```
-1. Validate target replica is healthy and streaming
-2. Pause new write transactions on proxy (WritePause → Draining)
-3. Wait for in-flight transactions to complete (max: drain_timeout)
-4. Force StandbyStatusUpdate from target: send keepalive with reply_requested=true
-5. Wait for target flush_lsn == current primary LSN (zero lag)
-6. Send Promote RPC to target vk-agent
-7. Confirm target is now primary (poll vk-agent status)
-8. Propose SetPrimary to Raft → topology updated
-9. Send Demote RPC to old primary vk-agent (restart as replica)
-10. Update proxy WritePause → Accepting (write to new primary)
-11. Emit switchover complete event
+1. Validate that the target replica is healthy and streaming
+2. Wait for the target to be within max_lag_bytes of the primary
+3. Drain the proxy: refuse new connections and let transactions finish
+4. Demote the old primary: write standby.signal and primary_conninfo
+5. Stop the old primary. A fast shutdown waits until standbys hold all its WAL
+6. Wait for the target's position to settle
+7. Promote the target and confirm it, or restore the old primary and abort
+8. Propose SetPrimary to Raft, and end the drain
+9. Create the other nodes' slots on the new primary
+10. Repoint them. primary_conninfo applies on a reload, with no restart
 ```
+
+The old primary must stop before the target is promoted. Its shutdown record then falls before the new timeline, so every node can follow it. Promoting first forks the timeline behind that record, and no other node could follow.
+
 
 ---
 
@@ -193,3 +195,7 @@ match *write_pause.lock().await {
 - `vk_agent` receives Promote and Demote gRPC calls.
 - `raft_consensus` commits the `SetPrimary` topology change at step 8.
 - `event_tx` channel delivers the event to REST API push and alerting webhook.
+
+## Rolling restart
+
+`POST /api/restart` restarts every node: each standby in turn, waiting until it streams again, then a switchover to the most current standby, which restarts the old primary as a standby. The primary moves, and stays moved. It stops at the first failure, and refuses to start if a standby is already unhealthy.

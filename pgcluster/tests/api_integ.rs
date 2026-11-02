@@ -60,7 +60,7 @@ fn backup_manifest_serializes_completed_status() {
         started_at: 1_000_000,
         completed_at: 1_000_300,
         size_bytes: 512 * 1024 * 1024,
-        s3_uri: "s3://bucket/prefix/daily/abc-123/".into(),
+        location: "s3://bucket/prefix/daily/abc-123/".into(),
         status: BackupStatus::Completed,
     };
     let json = serde_json::to_string(&m).unwrap();
@@ -85,7 +85,7 @@ fn backup_manifest_serializes_failed_status() {
         started_at: 2_000_000,
         completed_at: 2_000_001,
         size_bytes: 0,
-        s3_uri: "s3://bucket/prefix/manual/xyz-456/".into(),
+        location: "s3://bucket/prefix/manual/xyz-456/".into(),
         status: BackupStatus::Failed,
     };
     let json = serde_json::to_string(&m).unwrap();
@@ -108,7 +108,7 @@ fn backup_list_response_serializes() {
             started_at: 1_000,
             completed_at: 1_100,
             size_bytes: 1024,
-            s3_uri: "s3://b/p/weekly/id-1/".into(),
+            location: "s3://b/p/weekly/id-1/".into(),
             status: BackupStatus::Completed,
         }],
     };
@@ -404,6 +404,7 @@ async fn post_switchover_executes_and_changes_primary() {
         .expect("at least one non-primary node");
     let resp = c
         .post(format!("{base}/api/switchover"))
+        .bearer_auth("dev-api-key")
         .json(&serde_json::json!({
             "target_node_id": target,
             "max_lag_bytes": 10_485_760,

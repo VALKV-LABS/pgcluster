@@ -58,7 +58,7 @@ An operator enrols their hosts, calls `POST /v1/databases`, and gets a running P
  │  ┌───────────── instance (one per node) ───────┐  │
  │  │  pgcluster   Raft, failover, proxy, pool    │  │
  │  │  vk-agent    executes pgcluster's commands  │  │
- │  │  PostgreSQL + pgBackRest                    │  │
+ │  │  PostgreSQL + WAL-G                         │  │
  │  └─────────────────────────────────────────────┘  │
  └───────────────────────────────────────────────────┘
         ▲                              │
@@ -70,7 +70,7 @@ An operator enrols their hosts, calls `POST /v1/databases`, and gets a running P
 | `pgcluster-admin` | New | Admin API, agent API, desired state, reconciler, scheduler, operations |
 | `vk-agent host` | New mode | Enrolment, capacity reports, config rendering, process and storage management, certificate rotation |
 | `pgcluster`, `vk-agent` | Extended | See §10 |
-| Node image | New | Packer recipe with Postgres majors, extensions, pgBackRest and all binaries, pinned. Published as a public AMI with each release |
+| Node image | New | Packer recipe with Postgres majors, extensions, WAL-G and all binaries, pinned. Published as a public AMI with each release |
 | AWS template | New | Terraform that launches a test fleet in your own account (§12) |
 
 **One binary, two modes**
@@ -265,7 +265,7 @@ Each database has a `spec` and a `generation`. `vk-agent host` long-polls for de
 
 1. Validate the request, choose hosts and allocate ports.
 2. Each `vk-agent host` picks up its instance from desired state.
-3. Node 1 runs `initdb --data-checksums` and `pgbackrest stanza-create`. Other nodes seed from it.
+3. Node 1 runs `initdb --data-checksums`. Other nodes seed from it.
 4. pgcluster forms the Raft group.
 5. Apply the replication mode, install extensions, create the owner role.
 6. Take the first full backup.
@@ -313,11 +313,14 @@ Every database has point-in-time restore.
 
 | Setting | Value |
 |---|---|
-| Tool | pgBackRest 2.60.0 or later |
-| WAL | `archive_command` with `archive-async=y`; `archive_timeout` 60 s |
-| Base backups | Weekly full, daily differential, `backup-standby=prefer` |
-| Storage | S3-compatible or POSIX, with `repo-bundle=y` and `repo-block=y` |
-| Encryption | `repo-cipher-type=aes-256-cbc`, one passphrase per database, encrypted at rest in `pgcluster-admin` |
+| Tool | WAL-G, pinned in the node image and driven by the backup coordinator |
+| WAL | `archive_command` runs `wal-g wal-push`; `archive_timeout` 60 s |
+| Base backups | Weekly full, daily delta, from a standby when one is available |
+| Storage | S3-compatible or POSIX |
+| Encryption | libsodium on the node before upload, one key per database, encrypted at rest in `pgcluster-admin` |
+| Verification | Page checksums during backup, and `wal-g wal-verify` for WAL integrity |
+
+The coordinator talks to `vk-agent` through backup RPCs that name no tool, and the API and topology carry nothing specific to WAL-G, so another engine can replace it.
 
 Restore always creates a new database, so the source stays up and a failed restore harms nothing. `restore-window` returns the earliest and latest restorable times.
 
@@ -341,7 +344,7 @@ Each instance uses a block of ten consecutive ports from `port_base`:
 | 2 | Postgres | Peers |
 | 3 | Raft | Peers |
 | 4 | vk-agent | Peers |
-| 5 | pgBackRest TLS server | Peers |
+| 5 | Reserved | None |
 | 6 | Proxy health | Local |
 | 7 | REST API | Local |
 | 8 | Metrics | Local |
@@ -384,7 +387,7 @@ The management plane depends on the data plane meeting these requirements:
 | Authentication | Every gRPC endpoint requires a client certificate from the cluster CA. The REST API refuses to run without credentials. Proxy-to-Postgres traffic uses TLS |
 | Membership | Raft learners, voter promotion and member removal, exposed through the REST API |
 | Node lifecycle | Seed a node from backup or from the primary through vk-agent, and rejoin an old primary with `pg_rewind` |
-| Backups | A pgBackRest engine in the backup coordinator, with WAL archiving |
+| Backups | A WAL-G engine in the backup coordinator, with WAL archiving |
 | Restarts | Rolling restart across standbys, then switchover, then the old primary |
 | Replicas | An external standby role that is excluded from failover and from Raft |
 | Slots | `max_slot_wal_keep_size` set, so a dead standby cannot fill the primary's disk |
@@ -432,6 +435,6 @@ Terraform prints the admin API URL and a generated API key. `terraform destroy` 
 |---|---|---|
 | **1. One node** | `pgcluster-admin`, `vk-agent host`, agent API, node image and public AMI, CLI, AWS template, one-node databases | A host enrols and a one-node database is created through the API, locally and after one `terraform apply` on AWS |
 | **2. High availability** | Three nodes, replication modes, node replacement, the §10 requirements except backups | A three-node database survives primary loss, a network partition and node replacement in all three modes, by automated test |
-| **3. Backups** | pgBackRest, repositories, restore | A point-in-time restore is verified by automated test |
+| **3. Backups** | WAL-G, repositories, restore | A point-in-time restore is verified by automated test |
 | **4. Shared hosts** | Scheduler, isolation, disk quotas, ports | Several databases share a host under load without one starving another |
 | **5. Day-two** | Rolling upgrades, resizing, cross-region replicas | Each operation passes under client load |

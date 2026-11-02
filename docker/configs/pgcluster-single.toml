@@ -1,0 +1,39 @@
+[cluster]
+name     = "pgcluster-single"
+data_dir = "/var/lib/pgcluster/node"
+
+[raft]
+node_id   = 1
+bootstrap = true
+
+[[raft.peers]]
+id   = 1
+addr = "pgcluster:7000"
+
+[[nodes.node]]
+id            = "pg1"
+agent_addr    = "pg:7001"
+postgres_addr = "pg:5432"
+priority      = 100
+
+[replication]
+replication_user         = "postgres"
+replication_password_env = "POSTGRES_PASSWORD"
+
+[proxy]
+listen_addr        = "0.0.0.0:5432"
+admin_listen_addr  = "0.0.0.0:5433"
+health_listen_addr = "0.0.0.0:8008"
+
+[tls]
+ca_cert = "/certs/ca.crt"
+cert    = "/certs/pgcluster.crt"
+key     = "/certs/pgcluster.key"
+
+[metrics]
+listen_addr = "0.0.0.0:9190"
+
+[api]
+listen_addr = "0.0.0.0:8009"
+api_keys    = ["dev-api-key"]
+public_read_endpoints = true

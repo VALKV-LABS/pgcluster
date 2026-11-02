@@ -305,3 +305,9 @@ if self.heartbeat.is_safe_mode() {
 - pgcluster's `node_monitor` calls `AgentService::GetStatus()` every `health_check_interval_ms`.
 - pgcluster calls `AgentService::Heartbeat()` every `heartbeat_interval_ms`.
 - `vk-agent` connects to local Postgres via Unix domain socket (no network, no auth overhead).
+
+## Safe mode and self-fencing
+
+The Raft leader heartbeats every agent, but only while it holds quorum. With no heartbeat for `heartbeat_timeout_seconds` (default 10), the agent enters safe mode and refuses `Promote`. After a further `fence_timeout_seconds` (default 30), it stops Postgres with `pg_ctl stop -m immediate` and exits. `fence_timeout_seconds = 0` turns self-fencing off.
+
+If every pgcluster instance is down for that long, every Postgres on those nodes stops too.

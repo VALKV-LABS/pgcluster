@@ -1,7 +1,32 @@
+use std::collections::HashMap;
+use std::time::Duration;
+
 use anyhow::{anyhow, Context, Result};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
 use crate::server::agent::ReplicaStatus;
+
+/// How long a query waits for a connection. A status call on a node with no
+/// Postgres must answer well inside pgcluster's two-second health check.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The settings pgcluster may change through `set_parameters`.
+pub const MANAGED_PARAMETERS: &[&str] = &["synchronous_standby_names", "max_slot_wal_keep_size"];
+
+/// `name` must already be checked against `MANAGED_PARAMETERS`: identifiers
+/// cannot be bound as parameters, and neither can `ALTER SYSTEM` values.
+fn alter_system_sql(name: &str, value: &str) -> String {
+    format!("ALTER SYSTEM SET {name} = {}", quote_literal(value))
+}
+
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
 
 /// Wraps a `sqlx` connection pool to the local Postgres instance and exposes
 /// the queries that vk-agent needs to report status and verify LSNs.
@@ -17,6 +42,16 @@ impl LocalPostgres {
         let pool = PgPool::connect(url)
             .await
             .with_context(|| format!("failed to connect to postgres at {url}"))?;
+        Ok(Self { pool })
+    }
+
+    /// Build a pool that connects on first use, because a node waiting to be
+    /// seeded has no Postgres yet.
+    pub fn connect_lazy(url: &str) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(ACQUIRE_TIMEOUT)
+            .connect_lazy(url)
+            .with_context(|| format!("invalid postgres url {url}"))?;
         Ok(Self { pool })
     }
 
@@ -99,6 +134,157 @@ impl LocalPostgres {
             .collect())
     }
 
+    /// Returns the current value of every setting in `MANAGED_PARAMETERS`.
+    pub async fn get_parameters(&self) -> Result<HashMap<String, String>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, setting FROM pg_settings WHERE name = ANY($1)")
+                .bind(MANAGED_PARAMETERS)
+                .fetch_all(&self.pool)
+                .await
+                .context("get_parameters query failed")?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Apply `parameters` with `ALTER SYSTEM`, then reload. Only names in
+    /// `MANAGED_PARAMETERS` are accepted, and the file write does not wait for
+    /// a synchronous standby, so this works while commits are stalled.
+    pub async fn set_parameters(&self, parameters: &HashMap<String, String>) -> Result<()> {
+        for (name, value) in parameters {
+            if !MANAGED_PARAMETERS.contains(&name.as_str()) {
+                anyhow::bail!("{name} is not a setting pgcluster manages");
+            }
+            sqlx::query(&alter_system_sql(name, value))
+                .execute(&self.pool)
+                .await
+                .with_context(|| format!("ALTER SYSTEM SET {name} failed"))?;
+        }
+        sqlx::query("SELECT pg_reload_conf()")
+            .execute(&self.pool)
+            .await
+            .context("pg_reload_conf failed")?;
+        Ok(())
+    }
+
+    /// Point `archive_command` at `command`, with a `archive_timeout` so a quiet
+    /// database still archives. `archive_mode` must already be on, because
+    /// changing it needs a restart.
+    pub async fn set_archive_command(&self, command: &str) -> Result<()> {
+        for (name, value) in [("archive_command", command), ("archive_timeout", "60")] {
+            sqlx::query(&alter_system_sql(name, value))
+                .execute(&self.pool)
+                .await
+                .with_context(|| format!("ALTER SYSTEM SET {name} failed"))?;
+        }
+        sqlx::query("SELECT pg_reload_conf()")
+            .execute(&self.pool)
+            .await
+            .context("pg_reload_conf failed")?;
+        Ok(())
+    }
+
+    /// Promote, and drop the settings that tie this node to its old cluster.
+    /// `archive_command` is replaced rather than cleared, because with
+    /// `archive_mode` on an empty command would hold WAL forever.
+    pub async fn detach(&self) -> Result<()> {
+        sqlx::query("SELECT pg_promote(true, 30)")
+            .execute(&self.pool)
+            .await
+            .context("pg_promote failed")?;
+        for name in ["primary_conninfo", "primary_slot_name"] {
+            sqlx::query(&format!("ALTER SYSTEM RESET {name}"))
+                .execute(&self.pool)
+                .await
+                .with_context(|| format!("ALTER SYSTEM RESET {name} failed"))?;
+        }
+        for (name, value) in [
+            ("archive_command", "/bin/true"),
+            ("synchronous_standby_names", ""),
+        ] {
+            sqlx::query(&alter_system_sql(name, value))
+                .execute(&self.pool)
+                .await
+                .with_context(|| format!("ALTER SYSTEM SET {name} failed"))?;
+        }
+        sqlx::query("SELECT pg_reload_conf()")
+            .execute(&self.pool)
+            .await
+            .context("pg_reload_conf failed")?;
+        Ok(())
+    }
+
+    /// Create the role and function the proxy reads password verifiers with.
+    ///
+    /// `pg_authid` is readable only by superusers, so the function runs as its
+    /// owner, and the role can do nothing but call it. The version goes in the
+    /// function's comment, and everything commits together. Commit does not
+    /// wait for standbys, so this works while `sync_strict` is blocking writes.
+    pub async fn set_proxy_auth(&self, user: &str, password: &str, version: &str) -> Result<()> {
+        let role = quote_ident(user);
+        let mut tx = self.pool.begin().await.context("begin")?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+                .bind(user)
+                .fetch_one(&mut *tx)
+                .await
+                .context("look up the auth role")?;
+        let statements = [
+            "SET LOCAL synchronous_commit = local".to_string(),
+            if exists {
+                String::new()
+            } else {
+                format!("CREATE ROLE {role} LOGIN")
+            },
+            format!(
+                "ALTER ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD {}",
+                quote_literal(password)
+            ),
+            "CREATE SCHEMA IF NOT EXISTS pgcluster".to_string(),
+            "CREATE OR REPLACE FUNCTION pgcluster.get_auth(role_name name) RETURNS text \
+             LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog AS $$ \
+             SELECT rolpassword FROM pg_authid WHERE rolname = role_name AND rolcanlogin \
+             AND (rolvaliduntil IS NULL OR rolvaliduntil > now()) $$"
+                .to_string(),
+            "REVOKE ALL ON SCHEMA pgcluster FROM PUBLIC".to_string(),
+            "REVOKE ALL ON FUNCTION pgcluster.get_auth(name) FROM PUBLIC".to_string(),
+            format!("GRANT USAGE ON SCHEMA pgcluster TO {role}"),
+            format!("GRANT EXECUTE ON FUNCTION pgcluster.get_auth(name) TO {role}"),
+            format!(
+                "COMMENT ON FUNCTION pgcluster.get_auth(name) IS {}",
+                quote_literal(version)
+            ),
+        ];
+        for statement in statements.iter().filter(|s| !s.is_empty()) {
+            sqlx::query(statement)
+                .execute(&mut *tx)
+                .await
+                .context("set up the auth role")?;
+        }
+        tx.commit().await.context("commit")
+    }
+
+    /// The version from the last `set_proxy_auth`, if it has run.
+    pub async fn get_proxy_auth_version(&self) -> Result<String> {
+        let version: Option<String> = sqlx::query_scalar(
+            "SELECT obj_description(to_regprocedure('pgcluster.get_auth(name)'), 'pg_proc')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("get_proxy_auth_version query failed")?;
+        Ok(version.unwrap_or_default())
+    }
+
+    /// Returns replication slots whose WAL has been removed. Their standbys
+    /// can no longer catch up by streaming.
+    pub async fn get_lost_slots(&self) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT slot_name::text FROM pg_replication_slots WHERE wal_status = 'lost'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("get_lost_slots query failed")?;
+        Ok(rows.into_iter().map(|(name,)| name).collect())
+    }
+
     /// Returns the number of active non-idle connections (excluding this one).
     pub async fn get_active_connections(&self) -> Result<u32> {
         let row: (i64,) = sqlx::query_as(
@@ -161,6 +347,20 @@ pub fn parse_lsn(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_and_values_are_quoted() {
+        assert_eq!(quote_literal("it's"), "'it''s'");
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn alter_system_escapes_quotes() {
+        assert_eq!(
+            alter_system_sql("synchronous_standby_names", "ANY 1 (\"a'b\")"),
+            "ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 (\"a''b\")'"
+        );
+    }
 
     #[test]
     fn parse_lsn_basic() {

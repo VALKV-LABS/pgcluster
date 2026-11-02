@@ -27,7 +27,10 @@ fn postgres_url_tcp() {
         postgres_password: None,
         postgres_dbname: "postgres".into(),
         heartbeat_timeout_seconds: 10,
-        fence_timeout_seconds: None,
+        fence_timeout_seconds: 0,
+        manage_postgres: true,
+        walg_path: "wal-g".into(),
+        backup_config_path: "/tmp/walg.json".into(),
         tls: Default::default(),
         pg_ctl_path: "pg_ctl".into(),
     };
@@ -48,7 +51,10 @@ fn postgres_url_with_password() {
         postgres_password: Some("s3cr3t".into()),
         postgres_dbname: "postgres".into(),
         heartbeat_timeout_seconds: 10,
-        fence_timeout_seconds: None,
+        fence_timeout_seconds: 0,
+        manage_postgres: true,
+        walg_path: "wal-g".into(),
+        backup_config_path: "/tmp/walg.json".into(),
         tls: Default::default(),
         pg_ctl_path: "pg_ctl".into(),
     };

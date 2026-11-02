@@ -7,11 +7,20 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use dashmap::DashMap;
+use tokio_rustls::TlsConnector;
 
 use super::backend::BackendConnection;
+use super::scram::{login_to_backend, BackendLoginError, Credentials};
 use crate::config::PoolConfig;
+
+/// What it takes to open a connection for a client session.
+pub struct Login {
+    /// The client's startup message, re-encoded.
+    pub startup: Vec<u8>,
+    pub credentials: Credentials,
+}
 
 // ── PoolKey ───────────────────────────────────────────────────────────────────
 
@@ -79,20 +88,39 @@ pub struct ConnectionPool {
     // DashMap key is the string form of PoolKey for simpler hashing.
     pools: DashMap<String, Arc<PoolBucket>>,
     config: PoolConfig,
+    /// Encrypts and verifies backend connections. `None` → plain TCP.
+    backend_tls: Option<TlsConnector>,
 }
 
 impl ConnectionPool {
-    pub fn new(config: PoolConfig) -> Self {
+    pub fn new(config: PoolConfig, backend_tls: Option<TlsConnector>) -> Self {
         Self {
             pools: DashMap::new(),
             config,
+            backend_tls,
         }
+    }
+
+    /// Open a new connection and log in as the session's user, outside the
+    /// pool's accounting. Returns what the backend sent after authenticating.
+    pub async fn login(
+        &self,
+        node_id: &str,
+        addr: &str,
+        session: &Login,
+    ) -> Result<(BackendConnection, Vec<u8>), BackendLoginError> {
+        let conn = BackendConnection::connect(node_id, addr, self.backend_tls.as_ref()).await?;
+        let rest = {
+            let mut stream = conn.stream.lock().await;
+            login_to_backend(&mut *stream, &session.startup, &session.credentials).await?
+        };
+        Ok((conn, rest))
     }
 
     /// Borrow an idle connection for `(database, user, backend_addr)`.
     ///
     /// - If an idle healthy connection exists it is returned immediately.
-    /// - Otherwise a new TCP connection is opened (if under the pool limit).
+    /// - Otherwise a new connection is logged in as `session` (if under the limit).
     /// - If the limit is reached the call waits up to `connect_timeout_seconds`.
     pub async fn acquire(
         &self,
@@ -100,6 +128,7 @@ impl ConnectionPool {
         user: &str,
         backend_addr: &str,
         node_id: &str,
+        session: &Login,
     ) -> Result<Arc<BackendConnection>> {
         let key = PoolKey::new(database, user, node_id, backend_addr);
         let skey = key.string_key();
@@ -133,14 +162,14 @@ impl ConnectionPool {
             if prev_total < bucket.max {
                 // Reserve a slot before the async connect
                 bucket.increment();
-                match BackendConnection::connect(node_id, backend_addr).await {
-                    Ok(conn) => {
+                match self.login(node_id, backend_addr, session).await {
+                    Ok((conn, _)) => {
                         conn.mark_in_use();
                         return Ok(Arc::new(conn));
                     }
                     Err(e) => {
                         bucket.decrement();
-                        return Err(e).context("open new backend connection");
+                        bail!("open new backend connection: {e}");
                     }
                 }
             }
@@ -222,6 +251,12 @@ impl ConnectionPool {
         conn.mark_idle();
         let _ = conn.touch().await;
         let mut idle = bucket.idle.lock().await;
+        // Every login brings its own connection, so short-lived clients would
+        // otherwise pile up backends until Postgres runs out.
+        if idle.len() >= bucket.max {
+            idle.remove(0);
+            bucket.decrement();
+        }
         idle.push(conn);
         drop(idle);
         bucket.released.notify_one();

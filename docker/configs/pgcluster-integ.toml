@@ -35,10 +35,12 @@ health_check_interval_ms              = 500
 health_check_failures_before_failover = 3
 agent_heartbeat_timeout_seconds       = 10
 
+[tls]
+insecure_plaintext = true
+
 [metrics]
 listen_addr = "0.0.0.0:9190"
 
 [api]
 listen_addr            = "0.0.0.0:8009"
-api_keys               = []
-public_read_endpoints  = true
+insecure_no_auth       = true

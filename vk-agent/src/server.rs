@@ -7,26 +7,37 @@ pub mod agent {
 use std::path::Path;
 use std::sync::Arc;
 
+use tokio::sync::{Mutex, MutexGuard};
+use tonic::transport::{Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
-use agent::agent_service_server::AgentService;
+use agent::agent_service_server::{AgentService, AgentServiceServer};
 use agent::{
-    DemoteRequest, DemoteResponse, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
-    PromoteResponse, ReloadRequest, ReloadResponse, StatusRequest, StatusResponse, StopRequest,
-    StopResponse,
+    BackupDeleteRequest, BackupDeleteResponse, BackupPushRequest, BackupPushResponse,
+    BackupVerifyRequest, BackupVerifyResponse, ConfigureBackupsRequest, DemoteRequest,
+    DemoteResponse, DetachRequest, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
+    PromoteResponse, ReloadRequest, ReloadResponse, RestoreRequest, SeedRequest, SeedResponse,
+    SetParametersRequest, SetParametersResponse, SetProxyAuthRequest, StatusRequest,
+    StatusResponse, StopRequest, StopResponse,
 };
 
 use crate::config::AgentConfig;
-use crate::files::write_signal_file;
 use crate::heartbeat::HeartbeatTracker;
 use crate::postgres::LocalPostgres;
 use crate::process::PgCtl;
+use crate::standby::configure_standby;
+use crate::walg::WalG;
+
+/// In the data directory of a node that has left its cluster.
+pub const DETACHED_MARKER: &str = "pgcluster.detached";
 
 pub struct AgentServiceImpl {
     config: Arc<AgentConfig>,
     heartbeat: Arc<HeartbeatTracker>,
     pg: Arc<LocalPostgres>,
     pg_ctl: Arc<PgCtl>,
+    seeding: Mutex<()>,
+    walg: WalG,
 }
 
 impl AgentServiceImpl {
@@ -36,13 +47,61 @@ impl AgentServiceImpl {
         pg: Arc<LocalPostgres>,
         pg_ctl: Arc<PgCtl>,
     ) -> Self {
+        let walg = WalG::new(&config);
         Self {
             config,
             heartbeat,
             pg,
             pg_ctl,
+            seeding: Mutex::new(()),
+            walg,
         }
     }
+
+    async fn has_data(&self) -> bool {
+        crate::seed::has_data(Path::new(&self.config.data_dir))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Stop Postgres. When this agent owns the process it starts it again, so a
+    /// demoted primary comes back as a standby. Otherwise its owner restarts it.
+    async fn stop_and_restart(&self) -> anyhow::Result<()> {
+        self.pg_ctl.stop_fast().await?;
+        if self.config.manage_postgres {
+            self.pg_ctl.start().await?;
+        }
+        Ok(())
+    }
+
+    /// Seed and rewind stop Postgres, so they need this agent to own it, and
+    /// only one runs at a time.
+    fn begin_lifecycle_change(&self) -> anyhow::Result<MutexGuard<'_, ()>> {
+        if !self.config.manage_postgres {
+            anyhow::bail!("this agent does not manage Postgres (manage_postgres = false)");
+        }
+        self.seeding
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("a seed or rewind is already running"))
+    }
+}
+
+/// Serve the agent gRPC service until the server fails. `tls` of `None` means
+/// plaintext, for development.
+pub async fn serve(
+    svc: AgentServiceImpl,
+    addr: std::net::SocketAddr,
+    tls: Option<ServerTlsConfig>,
+) -> anyhow::Result<()> {
+    let mut builder = Server::builder();
+    if let Some(tls) = tls {
+        builder = builder.tls_config(tls)?;
+    }
+    builder
+        .add_service(AgentServiceServer::new(svc))
+        .serve(addr)
+        .await?;
+    Ok(())
 }
 
 #[tonic::async_trait]
@@ -103,76 +162,185 @@ impl AgentService for AgentServiceImpl {
         let req = request.into_inner();
         let data_dir = Path::new(&self.config.data_dir);
 
-        if let Err(e) = write_signal_file(data_dir, "standby.signal").await {
-            return Ok(Response::new(DemoteResponse {
-                success: false,
-                error: e.to_string(),
-            }));
-        }
-
-        // Write new primary_conninfo and slot_name to postgresql.auto.conf.
-        if !req.new_primary_conninfo.is_empty() {
-            let (conninfo, maybe_password) = extract_conninfo_password(&req.new_primary_conninfo);
-
-            // If the conninfo carried a password, persist it to .pgpass and use
-            // passfile= so the password is never stored in the config file.
-            let final_conninfo = if let Some(password) = maybe_password {
-                let host = conninfo_value(&req.new_primary_conninfo, "host")
-                    .unwrap_or_else(|| "*".to_string());
-                let port = conninfo_value(&req.new_primary_conninfo, "port")
-                    .unwrap_or_else(|| "5432".to_string());
-                let user = conninfo_value(&req.new_primary_conninfo, "user")
-                    .unwrap_or_else(|| "*".to_string());
-
-                if let Err(e) = crate::files::write_pgpass(
-                    data_dir,
-                    &host,
-                    &port,
-                    "replication",
-                    &user,
-                    &password,
-                )
-                .await
-                {
-                    return Ok(Response::new(DemoteResponse {
-                        success: false,
-                        error: format!("write_pgpass failed: {e}"),
-                    }));
-                }
-
-                let passfile = data_dir.join(".pgpass");
-                format!("{} passfile={}", conninfo, passfile.display())
-            } else {
-                conninfo
-            };
-
-            if let Err(e) =
-                crate::files::update_auto_conf(data_dir, "primary_conninfo", &final_conninfo).await
-            {
-                return Ok(Response::new(DemoteResponse {
-                    success: false,
-                    error: e.to_string(),
-                }));
-            }
-        }
-
-        if !req.slot_name.is_empty() {
-            if let Err(e) =
-                crate::files::update_auto_conf(data_dir, "primary_slot_name", &req.slot_name).await
-            {
-                return Ok(Response::new(DemoteResponse {
-                    success: false,
-                    error: e.to_string(),
-                }));
-            }
-        }
+        let result = configure_standby(
+            data_dir,
+            &req.new_primary_conninfo,
+            &req.slot_name,
+            &req.application_name,
+        )
+        .await;
 
         // Remove promote.signal if present; ignore errors.
         let _ = tokio::fs::remove_file(data_dir.join("promote.signal")).await;
 
+        // primary_conninfo applies on reload, so a running standby switches to
+        // the new primary now. A primary ignores it until it restarts.
+        if result.is_ok() {
+            if let Err(e) = self.pg_ctl.reload().await {
+                tracing::warn!(err = %e, "reload after demote failed");
+            }
+        }
+
         Ok(Response::new(DemoteResponse {
-            success: true,
-            error: String::new(),
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        }))
+    }
+
+    /// Seed this node from the primary.
+    async fn seed(&self, request: Request<SeedRequest>) -> Result<Response<SeedResponse>, Status> {
+        let data_dir = Path::new(&self.config.data_dir);
+        let req = request.into_inner();
+        let result = match self.begin_lifecycle_change() {
+            Ok(_guard) => crate::seed::seed(&self.pg_ctl, data_dir, &req).await,
+            Err(e) => Err(e),
+        };
+        Ok(Response::new(SeedResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        }))
+    }
+
+    /// Rewind this node to the primary.
+    async fn rewind(
+        &self,
+        request: Request<SeedRequest>,
+    ) -> Result<Response<SeedResponse>, Status> {
+        let data_dir = Path::new(&self.config.data_dir);
+        let req = request.into_inner();
+        let result = match self.begin_lifecycle_change() {
+            Ok(_guard) => crate::seed::rewind(&self.pg_ctl, data_dir, &req).await,
+            Err(e) => Err(e),
+        };
+        Ok(Response::new(SeedResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        }))
+    }
+
+    async fn configure_backups(
+        &self,
+        request: Request<ConfigureBackupsRequest>,
+    ) -> Result<Response<SeedResponse>, Status> {
+        let req = request.into_inner();
+        let result = self
+            .walg
+            .configure(&self.pg, &req.settings, &req.version)
+            .await;
+        Ok(Response::new(SeedResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        }))
+    }
+
+    async fn backup_push(
+        &self,
+        _request: Request<BackupPushRequest>,
+    ) -> Result<Response<BackupPushResponse>, Status> {
+        let data_dir = Path::new(&self.config.data_dir);
+        Ok(Response::new(match self.walg.backup_push(data_dir).await {
+            Ok((backup_name, size_bytes)) => BackupPushResponse {
+                success: true,
+                error: String::new(),
+                backup_name,
+                size_bytes,
+            },
+            Err(e) => BackupPushResponse {
+                success: false,
+                error: format!("{e:#}"),
+                ..Default::default()
+            },
+        }))
+    }
+
+    async fn backup_delete(
+        &self,
+        request: Request<BackupDeleteRequest>,
+    ) -> Result<Response<BackupDeleteResponse>, Status> {
+        let req = request.into_inner();
+        Ok(Response::new(
+            match self.walg.delete(req.retain_full, &req.target).await {
+                Ok(remaining) => BackupDeleteResponse {
+                    success: true,
+                    error: String::new(),
+                    remaining,
+                },
+                Err(e) => BackupDeleteResponse {
+                    success: false,
+                    error: format!("{e:#}"),
+                    remaining: vec![],
+                },
+            },
+        ))
+    }
+
+    async fn backup_verify(
+        &self,
+        _request: Request<BackupVerifyRequest>,
+    ) -> Result<Response<BackupVerifyResponse>, Status> {
+        Ok(Response::new(match self.walg.verify().await {
+            Ok(report) => BackupVerifyResponse {
+                success: true,
+                error: String::new(),
+                report,
+            },
+            Err(e) => BackupVerifyResponse {
+                success: false,
+                error: format!("{e:#}"),
+                report: String::new(),
+            },
+        }))
+    }
+
+    async fn restore(
+        &self,
+        request: Request<RestoreRequest>,
+    ) -> Result<Response<SeedResponse>, Status> {
+        let data_dir = Path::new(&self.config.data_dir);
+        let req = request.into_inner();
+        let result = match self.begin_lifecycle_change() {
+            Ok(_guard) => self.walg.restore(&self.pg_ctl, data_dir, &req).await,
+            Err(e) => Err(e),
+        };
+        Ok(Response::new(SeedResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        }))
+    }
+
+    /// Leave the cluster as an independent primary. The marker keeps this node
+    /// from fencing itself after a restart, when no pgcluster will heartbeat it.
+    async fn detach(
+        &self,
+        _request: Request<DetachRequest>,
+    ) -> Result<Response<SeedResponse>, Status> {
+        let data_dir = Path::new(&self.config.data_dir);
+        self.heartbeat.detach();
+        let result = async {
+            tokio::fs::write(data_dir.join(DETACHED_MARKER), b"")
+                .await
+                .map_err(anyhow::Error::from)?;
+            self.pg.detach().await
+        }
+        .await;
+        Ok(Response::new(SeedResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        }))
+    }
+
+    async fn set_proxy_auth(
+        &self,
+        request: Request<SetProxyAuthRequest>,
+    ) -> Result<Response<SeedResponse>, Status> {
+        let req = request.into_inner();
+        let result = self
+            .pg
+            .set_proxy_auth(&req.user, &req.password, &req.version)
+            .await;
+        Ok(Response::new(SeedResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
         }))
     }
 
@@ -198,6 +366,11 @@ impl AgentService for AgentServiceImpl {
                 postgres_running: false,
                 replicas: vec![],
                 replication_conninfo: String::new(),
+                parameters: Default::default(),
+                lost_slots: vec![],
+                has_data: self.has_data().await,
+                backup_config_version: self.walg.config_version().await,
+                proxy_auth_version: String::new(),
             }));
         }
 
@@ -217,6 +390,11 @@ impl AgentService for AgentServiceImpl {
                     postgres_running: false,
                     replicas: vec![],
                     replication_conninfo: String::new(),
+                    parameters: Default::default(),
+                    lost_slots: vec![],
+                    has_data: self.has_data().await,
+                    backup_config_version: self.walg.config_version().await,
+                    proxy_auth_version: String::new(),
                 }));
             }
         };
@@ -249,6 +427,13 @@ impl AgentService for AgentServiceImpl {
             String::new()
         };
 
+        let parameters = self.pg.get_parameters().await.unwrap_or_default();
+        let lost_slots = if is_recovery {
+            vec![]
+        } else {
+            self.pg.get_lost_slots().await.unwrap_or_default()
+        };
+
         let _ = safe_mode; // exposed indirectly through heartbeat; not in StatusResponse proto
 
         Ok(Response::new(StatusResponse {
@@ -262,6 +447,24 @@ impl AgentService for AgentServiceImpl {
             postgres_running: true,
             replicas,
             replication_conninfo,
+            parameters,
+            lost_slots,
+            has_data: true,
+            backup_config_version: self.walg.config_version().await,
+            proxy_auth_version: self.pg.get_proxy_auth_version().await.unwrap_or_default(),
+        }))
+    }
+
+    /// Apply settings pgcluster manages. Never touches the rest of the config.
+    async fn set_parameters(
+        &self,
+        request: Request<SetParametersRequest>,
+    ) -> Result<Response<SetParametersResponse>, Status> {
+        let parameters = request.into_inner().parameters;
+        let result = self.pg.set_parameters(&parameters).await;
+        Ok(Response::new(SetParametersResponse {
+            success: result.is_ok(),
+            error: result.err().map(|e| format!("{e:#}")).unwrap_or_default(),
         }))
     }
 
@@ -283,7 +486,8 @@ impl AgentService for AgentServiceImpl {
         &self,
         _request: Request<StopRequest>,
     ) -> Result<Response<StopResponse>, Status> {
-        match self.pg_ctl.stop_fast().await {
+        let result = self.stop_and_restart().await;
+        match result {
             Ok(()) => Ok(Response::new(StopResponse {
                 success: true,
                 error: String::new(),
@@ -310,90 +514,5 @@ impl AgentService for AgentServiceImpl {
                 error: e.to_string(),
             })),
         }
-    }
-}
-
-/// Split `password=<value>` out of a libpq keyword/value conninfo string.
-///
-/// Returns `(conninfo_without_password, Some(password))` when a `password`
-/// keyword is present, or `(original, None)` otherwise.
-///
-/// This handles the plain-token format we generate internally
-/// (`key=value` pairs separated by whitespace). Values may be surrounded by
-/// single quotes; the returned password has those quotes stripped.
-fn extract_conninfo_password(conninfo: &str) -> (String, Option<String>) {
-    let mut password: Option<String> = None;
-    let filtered: Vec<&str> = conninfo
-        .split_whitespace()
-        .filter(|token| {
-            if let Some(raw) = token.strip_prefix("password=") {
-                let pw = raw.trim_matches('\'').to_string();
-                password = Some(pw);
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
-    (filtered.join(" "), password)
-}
-
-/// Extract a single keyword value from a libpq conninfo string.
-///
-/// Returns `Some(value)` for the first `key=value` or `key='value'` token
-/// that matches `key`, stripping surrounding single quotes from the value.
-fn conninfo_value(conninfo: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}=");
-    conninfo.split_whitespace().find_map(|token| {
-        token
-            .strip_prefix(&prefix)
-            .map(|v| v.trim_matches('\'').to_string())
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_password_removes_token_and_returns_value() {
-        let conninfo = "host=pg-primary port=5432 user=replicator password=s3cr3t";
-        let (new, pw) = extract_conninfo_password(conninfo);
-        assert_eq!(pw, Some("s3cr3t".to_string()));
-        assert!(!new.contains("password="), "password must be stripped");
-        assert!(new.contains("host=pg-primary"));
-        assert!(new.contains("port=5432"));
-        assert!(new.contains("user=replicator"));
-    }
-
-    #[test]
-    fn extract_password_no_password_returns_none() {
-        let conninfo = "host=pg-primary port=5432 user=replicator";
-        let (new, pw) = extract_conninfo_password(conninfo);
-        assert_eq!(pw, None);
-        assert_eq!(new, conninfo);
-    }
-
-    #[test]
-    fn extract_password_strips_surrounding_quotes() {
-        // Single-quoted unspaced value (e.g. password='p@ss!').
-        let conninfo = "host=pg-primary password='p@ss!'";
-        let (_, pw) = extract_conninfo_password(conninfo);
-        assert_eq!(pw, Some("p@ss!".to_string()));
-    }
-
-    #[test]
-    fn conninfo_value_finds_host() {
-        let conninfo = "host=pg-primary port=5432 user=replicator";
-        assert_eq!(
-            conninfo_value(conninfo, "host"),
-            Some("pg-primary".to_string())
-        );
-    }
-
-    #[test]
-    fn conninfo_value_missing_key_returns_none() {
-        let conninfo = "host=pg-primary port=5432";
-        assert_eq!(conninfo_value(conninfo, "user"), None);
     }
 }

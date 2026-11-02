@@ -55,6 +55,10 @@ pub struct SessionState {
     /// Reserved for the M5-A coordinator; `None` in regular proxy mode.
     pub shard_key: Option<String>,
 
+    /// The session ran `SET`, which took effect on the primary only, so its
+    /// reads must stay there.
+    pub used_set: bool,
+
     /// The node ID of the backend this session is currently pinned to.
     /// `None` while in `Idle` state (no active backend).
     pub pinned_backend: Option<String>,
@@ -70,6 +74,7 @@ impl Default for SessionState {
             application_name: String::new(),
             set_vars: HashMap::new(),
             shard_key: None,
+            used_set: false,
             pinned_backend: None,
         }
     }
@@ -134,10 +139,11 @@ impl SessionState {
             }
             StatementIntent::SetLocal => {
                 // SET commands are session-affine; route to primary to be safe.
+                self.used_set = true;
                 RouteTarget::Primary
             }
             StatementIntent::Read => {
-                if self.needs_primary() {
+                if self.needs_primary() || self.used_set {
                     // Inside a write transaction: stay on primary.
                     RouteTarget::Primary
                 } else {
@@ -162,6 +168,17 @@ pub enum RouteTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_stay_on_the_primary_after_set() {
+        let mut s = SessionState::default();
+        assert_eq!(
+            s.route_intent(&StatementIntent::Read),
+            RouteTarget::ReplicaOrPrimary
+        );
+        s.route_intent(&StatementIntent::SetLocal);
+        assert_eq!(s.route_intent(&StatementIntent::Read), RouteTarget::Primary);
+    }
 
     #[test]
     fn txn_state_transitions() {

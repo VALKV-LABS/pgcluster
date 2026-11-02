@@ -1,11 +1,13 @@
 //! Proxy layer: PostgreSQL wire protocol proxy with connection pooling
 //! and read/write routing.
 
+pub mod auth;
 pub mod backend;
 pub mod connection;
 pub mod pool;
 pub mod protocol;
 pub mod router;
+pub mod scram;
 pub mod session;
 pub mod ssl;
 
@@ -20,6 +22,7 @@ use tracing::{error, info};
 
 use crate::{config::ProxyConfig, metrics_registry::Metrics, tls::TlsManager};
 
+use auth::AuthQuery;
 use pool::ConnectionPool;
 pub use router::Router;
 
@@ -32,6 +35,7 @@ pub struct ProxyServer {
     pool: Arc<ConnectionPool>,
     tls: Option<Arc<TlsManager>>,
     metrics: Arc<Metrics>,
+    auth: Arc<AuthQuery>,
 }
 
 impl ProxyServer {
@@ -46,8 +50,10 @@ impl ProxyServer {
         router: Arc<Router>,
         tls: Option<Arc<TlsManager>>,
         metrics: Arc<Metrics>,
+        auth: Arc<AuthQuery>,
     ) -> Self {
-        let pool = Arc::new(ConnectionPool::new(config.pool.clone()));
+        let backend_tls = tls.as_ref().map(|t| t.client_tls_connector());
+        let pool = Arc::new(ConnectionPool::new(config.pool.clone(), backend_tls));
 
         Self {
             config,
@@ -55,6 +61,7 @@ impl ProxyServer {
             pool,
             tls,
             metrics,
+            auth,
         }
     }
 
@@ -97,13 +104,14 @@ impl ProxyServer {
             let pool = Arc::clone(&self.pool);
             let tls_clone = tls_acceptor.clone();
             let m = Arc::clone(&self.metrics);
+            let auth = Arc::clone(&self.auth);
 
             tokio::spawn(async move {
                 m.proxy_connections_total.inc();
                 m.connected_clients.inc();
                 tracing::debug!(%peer_addr, "client connected");
                 if let Err(e) =
-                    connection::ProxyConnection::run(stream, router, pool, tls_clone).await
+                    connection::ProxyConnection::run(stream, router, pool, tls_clone, auth).await
                 {
                     tracing::debug!(%peer_addr, "connection ended: {e}");
                 }
@@ -115,7 +123,8 @@ impl ProxyServer {
     /// Bind a health-check HTTP server on `config.health_listen_addr`.
     ///
     /// Routes:
-    /// - `GET /health` → 200 OK if a primary is known, 503 if not.
+    /// - `GET /health` → 200 OK if a primary is known and the proxy has quorum,
+    ///   503 if not.
     pub async fn run_health_endpoint(&self) -> Result<()> {
         let router_state = Arc::clone(&self.router);
 
@@ -140,7 +149,9 @@ impl ProxyServer {
 // ── Health handler ────────────────────────────────────────────────────────────
 
 async fn health_handler(State(router): State<Arc<Router>>) -> impl IntoResponse {
-    if router.primary_addr().is_some() {
+    if !router.has_quorum() {
+        (StatusCode::SERVICE_UNAVAILABLE, "no quorum")
+    } else if router.primary_addr().is_some() {
         (StatusCode::OK, "ok")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "no primary")

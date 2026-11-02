@@ -4,47 +4,49 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 
 ## Part 1: Release and project basics
 
-- [ ] **1.1 Publish `v0.1.3`.** Add the Docker Hub secrets, then push the tag. *Done when:* `valkvlabs/pgcluster:0.1.3` and `valkvlabs/vk-agent:0.1.3` pull, and the GitHub release exists.
-- [ ] **1.2 Publish `latest` from releases.** The workflow now sets it explicitly on every release. *Done when:* a release updates `latest`.
+- [x] **1.1 Publish `v0.1.3`.** Add the Docker Hub secrets, then push the tag. *Done when:* `valkvlabs/pgcluster:0.1.3` and `valkvlabs/vk-agent:0.1.3` pull, and the GitHub release exists.
+- [x] **1.2 Publish `latest` from releases.** The workflow now sets it explicitly on every release. *Done when:* a release updates `latest`.
 - [x] **1.3 Add `CONTRIBUTING.md`, `SECURITY.md` and `CHANGELOG.md`, and choose a CLA or DCO.** The project uses the DCO. *Done when:* contributors have a documented path and security reports have a private route.
 - [x] **1.4 Fix documentation drift.** *Done when:* every README link resolves and the API doc matches the routes.
 - [x] **1.5 Run the Docker integration and end-to-end tests in CI.** *Done when:* they run on every PR.
-- [ ] **1.6 Build release images natively.** Each architecture builds on its own runner, with dependencies in a cached layer, and pushes to `main` keep the cache warm. *Done when:* a push to `main` publishes `edge` for both architectures, and a release takes under 15 minutes.
+- [ ] **1.6 Build release images natively.** Each architecture builds on its own runner, with dependencies in a cached layer, and pushes to `main` keep the cache warm. *Done when:* a push to `main` publishes `edge` for both architectures, and a release takes under 15 minutes. **Pending verification:** `edge` is published for both architectures. A release no longer repeats CI that passed on `main`, but the 15-minute target can only be measured by the next tag.
 
 ## Part 2: Secure defaults
 
-- [ ] **2.1 Require credentials on the REST API.** *Done when:* the server refuses to start without API keys, unless an explicit development flag is set.
-- [ ] **2.2 Require client certificates on every gRPC endpoint.** Covers `vk-agent` and Raft, signed by the cluster CA. *Done when:* a connection without a valid client certificate is rejected, by automated test.
-- [ ] **2.3 Use TLS between the proxy and Postgres.** *Done when:* the connection is encrypted and certificates are verified.
-- [ ] **2.4 Update docs.** *Done when:* the README and `docs/components/tls_manager.md` describe what 2.1 to 2.3 deliver.
+- [x] **2.1 Require credentials on the REST API.** *Done when:* the server refuses to start without API keys, unless an explicit development flag is set.
+- [x] **2.2 Require client certificates on every gRPC endpoint.** Covers `vk-agent` and Raft, signed by the cluster CA. *Done when:* a connection without a valid client certificate is rejected, by automated test.
+- [x] **2.3 Use TLS between the proxy and Postgres.** The proxy terminates SCRAM from stored verifiers, as Supavisor does, which also makes replica reads possible. *Done when:* the connection is encrypted and certificates are verified.
+- [x] **2.4 Update docs.** *Done when:* the README and `docs/components/tls_manager.md` describe what 2.1 to 2.3 deliver.
 
 ## Part 3: Safe failover
 
-- [ ] **3.1 Choose the failover candidate from live status.** Query reachable standbys at failover time. *Done when:* a test with a stale cached position promotes the most current standby.
-- [ ] **3.2 Stop writes on a proxy without quorum.** It must stop before a new primary can be promoted. *Done when:* a partition test shows no writes accepted on both sides.
-- [ ] **3.3 Turn self-fencing on by default.** Align its timeout with 3.2 and with failover timing, and validate the settings at startup. *Done when:* an invalid timing combination fails config validation.
-- [ ] **3.4 Add a partition test to the end-to-end suite.** *Done when:* it runs in CI and passes for 3.2 and 3.3.
+- [x] **3.1 Choose the failover candidate from live status.** Query reachable standbys at failover time. *Done when:* a test with a stale cached position promotes the most current standby.
+- [x] **3.2 Stop writes on a proxy without quorum.** It must stop before a new primary can be promoted. *Done when:* a partition test shows no writes accepted on both sides.
+- [x] **3.3 Turn self-fencing on by default.** Align its timeout with 3.2 and with failover timing, and validate the settings at startup. *Done when:* an invalid timing combination fails config validation.
+- [x] **3.4 Add a partition test to the end-to-end suite.** *Done when:* it runs in CI and passes for 3.2 and 3.3.
 
 ## Part 4: Replication modes
 
-- [ ] **4.1 Add `replication_mode` to the config.** Values are `async`, `sync` and `sync_strict`, replacing the unused `synchronous_standby_names` setting and its sample comment. *Done when:* the setting is validated, and changing it applies without a restart.
-- [ ] **4.2 Apply `synchronous_standby_names` from the mode.** Use `ANY 1 (...)`, and update it when membership changes. *Done when:* `sync` commits wait for a standby, by test.
-- [ ] **4.3 Implement the fallback for `sync`.** Record the fallback through Raft before clearing the setting. *Done when:* writes resume after `sync_degrade_timeout` with both standbys down, and a later failover knows no standby is guaranteed current.
-- [ ] **4.4 Implement `sync_strict`.** Writes block with no standby, and promotion needs both standbys to answer. *Done when:* each case is covered by test.
-- [ ] **4.5 Set `max_slot_wal_keep_size`.** *Done when:* a dead standby cannot fill the primary's disk, and a standby past the limit is flagged for re-seeding.
+- [x] **4.1 Add `replication_mode` to the config.** Values are `async`, `sync` and `sync_strict`, replacing the unused `synchronous_standby_names` setting and its sample comment. *Done when:* the setting is validated, and changing it applies without a restart.
+- [x] **4.2 Apply `synchronous_standby_names` from the mode.** Use `ANY 1 (...)`, and update it when membership changes. *Done when:* `sync` commits wait for a standby, by test.
+- [x] **4.3 Implement the fallback for `sync`.** Record the fallback through Raft before clearing the setting. *Done when:* writes resume after `sync_degrade_timeout` with both standbys down, and a later failover knows no standby is guaranteed current.
+- [x] **4.4 Implement `sync_strict`.** Writes block with no standby, and promotion needs both standbys to answer. *Done when:* each case is covered by test.
+- [x] **4.5 Set `max_slot_wal_keep_size`.** *Done when:* a dead standby cannot fill the primary's disk, and a standby past the limit is flagged for re-seeding.
 
 ## Part 5: Node lifecycle and backups
 
-- [ ] **5.1 Add Raft membership changes.** Learners, voter promotion and member removal, through the REST API. *Done when:* a member can be replaced with no loss of quorum.
-- [ ] **5.2 Move node seeding into `vk-agent`.** It lives in `docker/init-replica.sh` today. *Done when:* a new node seeds through an RPC, from the primary.
-- [ ] **5.3 Rejoin an old primary with `pg_rewind`.** Re-seed if rewind fails. *Done when:* a diverged old primary rejoins automatically, by test.
-- [ ] **5.4 Add rolling restart.** Standbys, then switchover, then the old primary. *Done when:* it completes under client load with no failed commits beyond the switchover.
-- [ ] **5.5 Add a pgBackRest engine to the backup coordinator.** Use 2.60.0 or later, with data checksums. *Done when:* scheduled backups run from a standby and survive a leader change.
-- [ ] **5.6 Add WAL archiving.** *Done when:* `archive_command` works from whichever node is primary, including after failover.
-- [ ] **5.7 Add restore.** Seed from backup, and restore to a point in time. *Done when:* a point-in-time restore is verified by automated test, and 5.2 can seed from backup.
-- [ ] **5.8 Test one-node recovery.** *Done when:* a one-node cluster recovers after its VM is replaced and its volume reattached.
-- [ ] **5.9 Add an external standby role.** Excluded from failover and from Raft. *Done when:* it follows the primary and can be promoted into an independent cluster.
-- [ ] **5.10 Release `v0.2.0`.** *Done when:* the full end-to-end suite passes and images are published.
+- [x] **5.1 Add Raft membership changes.** Learners, voter promotion and member removal, through the REST API. *Done when:* a member can be replaced with no loss of quorum.
+- [x] **5.2 Move node seeding into `vk-agent`.** It lives in `docker/init-replica.sh` today. *Done when:* a new node seeds through an RPC, from the primary.
+- [x] **5.3 Rejoin an old primary with `pg_rewind`.** Re-seed if rewind fails. *Done when:* a diverged old primary rejoins automatically, by test.
+- [x] **5.4 Add rolling restart.** Standbys, then switchover, then the old primary. *Done when:* it completes under client load with no failed commits beyond the switchover.
+- [x] **5.5 Add a WAL-G engine to the backup coordinator.** Behind backup RPCs that name no tool, run by `vk-agent`, with data checksums and a pinned version. Weekly full, daily delta. *Done when:* scheduled backups run from a standby and survive a leader change.
+- [x] **5.6 Add WAL archiving.** `archive_command` runs `wal-g wal-push`. *Done when:* archiving works from whichever node is primary, including after failover, and `wal-g wal-verify` finds no gaps.
+- [x] **5.7 Add restore.** Seed from backup, and restore to a point in time with `wal-g backup-fetch` and `wal-fetch`. *Done when:* a point-in-time restore is verified by automated test, and 5.2 can seed from backup.
+- [x] **5.8 Test one-node recovery.** *Done when:* a one-node cluster recovers after its VM is replaced and its volume reattached.
+- [x] **5.9 Add an external standby role.** Excluded from failover and from Raft. *Done when:* it follows the primary and can be promoted into an independent cluster.
+- [ ] **5.10 Release `v0.2.0`.** *Done when:* the full end-to-end suite passes and images are published. **Pending go-ahead:** the suite passes locally. This needs the PR merged to `main`, CI there, and a pushed tag, which publishes images.
+
+**Pause here.** Stop after Part 5 and wait for the go-ahead before starting Part 6.
 
 ## Part 6: Management plane, one node (Stage 1)
 
@@ -73,7 +75,7 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 
 ## Part 8: Management plane, backups (Stage 3)
 
-- [ ] **8.1 Add backup repositories.** S3-compatible and POSIX, with per-database encryption. *Done when:* a repository is verified when registered.
+- [ ] **8.1 Add backup repositories.** S3-compatible and POSIX, with per-database libsodium encryption on the node before upload. *Done when:* a repository is verified when registered.
 - [ ] **8.2 Add the backup API.** Retention, on-demand backups, listing and the restore window. *Done when:* the window matches what can actually be restored.
 - [ ] **8.3 Add restore as a new database.** *Done when:* a restore to a chosen time is verified by automated test and the source stays up.
 - [ ] **8.4 Require a first backup before access.** *Done when:* no database becomes `active` without a restorable backup.

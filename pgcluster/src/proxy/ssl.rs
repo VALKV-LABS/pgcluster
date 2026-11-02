@@ -20,7 +20,7 @@ use tokio_rustls::TlsAcceptor;
 
 /// The 8 bytes that constitute a Postgres SSL request.
 /// `\x00\x00\x00\x08` (length = 8) + `\x04\xd2\x16\x2f` (SSL request code).
-const SSL_REQUEST_BYTES: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f];
+pub(super) const SSL_REQUEST_BYTES: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f];
 
 // ── MaybeTlsStream ────────────────────────────────────────────────────────────
 

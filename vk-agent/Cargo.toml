@@ -27,13 +27,6 @@ tracing-subscriber.workspace = true
 bytes.workspace      = true
 chrono.workspace     = true
 
-# TLS (gRPC server)
-rustls           = { version = "0.23", features = ["ring"] }
-rustls-pki-types = "1"
-tokio-rustls     = "0.26"
-rustls-pemfile   = "2"
-rcgen            = { version = "0.13", features = ["pem"] }
-
 # Postgres
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls"] }
 
@@ -51,3 +44,4 @@ tonic-build = "0.11"
 tokio    = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 toml     = "0.8"
+pgcluster = { path = "../pgcluster" }

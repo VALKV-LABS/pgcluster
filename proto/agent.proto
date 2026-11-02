@@ -16,6 +16,29 @@ service AgentService {
   rpc StopPostgres(StopRequest) returns (StopResponse);
   // Reload Postgres config (SIGHUP)
   rpc ReloadConfig(ReloadRequest) returns (ReloadResponse);
+  // Apply settings pgcluster manages, with ALTER SYSTEM and a reload
+  rpc SetParameters(SetParametersRequest) returns (SetParametersResponse);
+  // Replace this node's data with a base backup of the primary, then start
+  // Postgres as a standby. Runs as long as the backup takes.
+  rpc Seed(SeedRequest) returns (SeedResponse);
+  // Rewind this node to the primary with pg_rewind, then start it as a standby.
+  // Uses SeedRequest, ignoring force.
+  rpc Rewind(SeedRequest) returns (SeedResponse);
+  // Write the backup tool's config and turn on WAL archiving
+  rpc ConfigureBackups(ConfigureBackupsRequest) returns (SeedResponse);
+  // Take a base backup of this node. Runs as long as the backup takes.
+  rpc BackupPush(BackupPushRequest) returns (BackupPushResponse);
+  // Apply retention, or delete one backup
+  rpc BackupDelete(BackupDeleteRequest) returns (BackupDeleteResponse);
+  // Check the WAL archive for gaps
+  rpc BackupVerify(BackupVerifyRequest) returns (BackupVerifyResponse);
+  // Replace this node's data from a backup and start Postgres
+  rpc Restore(RestoreRequest) returns (SeedResponse);
+  // Promote this external standby and leave the cluster: it stops expecting
+  // heartbeats, following the primary and archiving to the cluster's repository.
+  rpc Detach(DetachRequest) returns (SeedResponse);
+  // Create the role and function the proxy reads password verifiers with
+  rpc SetProxyAuth(SetProxyAuthRequest) returns (SeedResponse);
 }
 
 // ── Promote ──────────────────────────────────────────────────────────────────
@@ -41,6 +64,9 @@ message DemoteRequest {
   string new_primary_conninfo = 1;
   // Replication slot name to use (primary_slot_name)
   string slot_name            = 2;
+  // application_name for the WAL receiver: the name synchronous_standby_names
+  // uses for this node. Pass the node ID.
+  string application_name     = 3;
 }
 
 message DemoteResponse {
@@ -67,6 +93,17 @@ message StatusResponse {
   // Empty when this node is the primary or when WAL receiver is not running.
   // Used by node_monitor to detect a stale primary_conninfo after failover.
   string replication_conninfo = 10;
+  // Current values of the settings pgcluster manages.
+  map<string, string> parameters = 11;
+  // Replication slots whose WAL has been removed (wal_status = 'lost').
+  repeated string lost_slots = 12;
+  // Whether the data directory holds a cluster. A reachable node without one
+  // is waiting to be seeded.
+  bool has_data = 13;
+  // The version from the last ConfigureBackups applied here.
+  string backup_config_version = 14;
+  // The version from the last SetProxyAuth, kept in the database.
+  string proxy_auth_version = 15;
 }
 
 message ReplicaStatus {
@@ -109,4 +146,99 @@ message ReloadRequest {}
 message ReloadResponse {
   bool   success = 1;
   string error   = 2;
+}
+
+// ── SetParameters ────────────────────────────────────────────────────────────
+
+message SetParametersRequest {
+  map<string, string> parameters = 1;
+}
+
+message SetParametersResponse {
+  bool   success = 1;
+  string error   = 2;
+}
+
+// ── Seed ─────────────────────────────────────────────────────────────────────
+
+message SeedRequest {
+  string primary_host     = 1;
+  uint32 primary_port     = 2;
+  string user             = 3;
+  string password         = 4;
+  // Replication slot to hold WAL for this node. It must already exist.
+  string slot_name        = 5;
+  // application_name for the WAL receiver. Pass the node ID.
+  string application_name = 6;
+  // Discard an existing data directory. Without this, a node with data refuses.
+  bool   force            = 7;
+}
+
+message SeedResponse {
+  bool   success = 1;
+  string error   = 2;
+}
+
+// ── Backups ──────────────────────────────────────────────────────────────────
+
+message ConfigureBackupsRequest {
+  map<string, string> settings = 1;
+  // Identifies these settings, so pgcluster can tell when a node is out of date.
+  string version = 2;
+}
+
+message BackupPushRequest {}
+
+message BackupPushResponse {
+  bool   success     = 1;
+  string error       = 2;
+  string backup_name = 3;
+  uint64 size_bytes  = 4;
+}
+
+message BackupDeleteRequest {
+  // Keep this many full backups. 0 applies no retention.
+  uint32 retain_full = 1;
+  // Delete this backup. Empty deletes none by name.
+  string target      = 2;
+}
+
+message BackupDeleteResponse {
+  bool            success   = 1;
+  string          error     = 2;
+  repeated string remaining = 3;
+}
+
+message BackupVerifyRequest {}
+
+message BackupVerifyResponse {
+  bool   success = 1;
+  string error   = 2;
+  string report  = 3;
+}
+
+message RestoreRequest {
+  // Backup to restore. Empty means the latest.
+  string backup_name = 1;
+  // Recover to this time. Empty means the end of the WAL archive.
+  string target_time = 2;
+  // Discard an existing data directory.
+  bool   force       = 3;
+  // Set to follow a primary afterwards, rather than become independent.
+  SeedRequest standby = 4;
+  // Settings for the backup tool, which this node may not have yet.
+  map<string, string> settings = 5;
+}
+
+// ── Detach ───────────────────────────────────────────────────────────────────
+
+message DetachRequest {}
+
+// ── Proxy authentication ─────────────────────────────────────────────────────
+
+message SetProxyAuthRequest {
+  string user     = 1;
+  string password = 2;
+  // Identifies these settings, so pgcluster can tell when they are out of date.
+  string version  = 3;
 }

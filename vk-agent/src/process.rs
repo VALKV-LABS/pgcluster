@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
@@ -27,6 +29,20 @@ impl PgCtl {
         self.run_pg_ctl(&["stop", "-D", &self.data_dir, "-m", "immediate"])
             .await
             .context("pg_ctl stop -m immediate failed")
+    }
+
+    /// pg_ctl start -D data_dir, waiting until Postgres accepts connections.
+    /// Runs the data directory's own configuration.
+    pub async fn start(&self) -> Result<()> {
+        let log = format!("{}/startup.log", self.data_dir);
+        self.run_pg_ctl(&["start", "-D", &self.data_dir, "-l", &log, "-w", "-t", "600"])
+            .await
+            .context("pg_ctl start failed")
+    }
+
+    /// The path of another Postgres program, from the same directory as pg_ctl.
+    pub fn tool(&self, name: &str) -> PathBuf {
+        Path::new(&self.pg_ctl_path).with_file_name(name)
     }
 
     /// pg_ctl reload -D data_dir
