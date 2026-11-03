@@ -62,6 +62,12 @@ pub struct AgentConfig {
     /// Path to pg_ctl binary (used for stop/start commands).
     #[serde(default = "default_pg_ctl")]
     pub pg_ctl_path: String,
+
+    /// Run Postgres from this config file, in place of the data directory's.
+    /// A base backup or rewind copies a data directory from another node, so
+    /// anything specific to this node has to live outside it.
+    #[serde(default)]
+    pub postgres_config_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -245,6 +251,7 @@ listen_addr = "0.0.0.0:7001"
             walg_path: default_walg_path(),
             backup_config_path: default_backup_config_path(),
             pg_ctl_path: "pg_ctl".into(),
+            postgres_config_file: None,
         };
         assert_eq!(
             cfg.postgres_url(),

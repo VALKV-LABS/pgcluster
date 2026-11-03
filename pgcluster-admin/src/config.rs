@@ -11,6 +11,10 @@ pub struct AdminConfig {
     /// instance secrets at rest. Losing it loses access to those secrets.
     #[serde(default = "default_secret_key_env")]
     pub secret_key_env: String,
+    /// Environment variable holding the key being replaced. With this set, the
+    /// next start seals everything with `secret_key_env`, and it can then go.
+    #[serde(default = "default_old_secret_key_env")]
+    pub old_secret_key_env: String,
     pub api: ApiConfig,
     #[serde(default)]
     pub agent_api: AgentApiConfig,
@@ -79,6 +83,9 @@ fn default_database_url_env() -> String {
 }
 fn default_secret_key_env() -> String {
     "PGCLUSTER_ADMIN_SECRET_KEY".into()
+}
+fn default_old_secret_key_env() -> String {
+    "PGCLUSTER_ADMIN_OLD_SECRET_KEY".into()
 }
 fn default_api_listen() -> String {
     "0.0.0.0:8443".into()

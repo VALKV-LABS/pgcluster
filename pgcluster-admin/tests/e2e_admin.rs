@@ -29,9 +29,18 @@ fn root() -> std::path::PathBuf {
 fn compose_command(args: &[&str]) -> Command {
     let mut command = Command::new("docker");
     command
-        .args(["compose", "-p", PROJECT, "--profile", "systemd"])
+        .args([
+            "compose",
+            "-p",
+            PROJECT,
+            "--profile",
+            "systemd",
+            "--profile",
+            "ha",
+        ])
         .args(["-f", "docker/e2e-compose.yml"])
-        .args(["-f", "docker/admin-compose.yml"]);
+        .args(["-f", "docker/admin-compose.yml"])
+        .args(["-f", "docker/ha-compose.yml"]);
     if let Ok(path) = std::env::var("E2E_COMPOSE_OVERRIDE") {
         command.args(["-f", &path]);
     }
@@ -112,7 +121,12 @@ fn admin_client() -> reqwest::Client {
         .unwrap()
 }
 
-async fn api(client: &reqwest::Client, method: &str, path: &str, body: Option<Value>) -> Value {
+async fn api_call(
+    client: &reqwest::Client,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
     let mut request = client
         .request(method.parse().unwrap(), format!("{ADMIN_URL}{path}"))
         .bearer_auth(API_KEY);
@@ -120,10 +134,25 @@ async fn api(client: &reqwest::Client, method: &str, path: &str, body: Option<Va
         request = request.json(&body);
     }
     let response = request.send().await.unwrap();
-    let status = response.status();
-    let body: Value = response.json().await.unwrap_or(Value::Null);
-    assert!(status.is_success(), "{method} {path}: {status} {body}");
-    body
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
+async fn api(client: &reqwest::Client, method: &str, path: &str, body: Option<Value>) -> Value {
+    let (status, reply) = api_call(client, method, path, body).await;
+    assert!(
+        (200..300).contains(&status),
+        "{method} {path}: {status} {reply}"
+    );
+    reply
+}
+
+/// Every test's databases keep their backups in one directory the hosts share.
+async fn add_repository(client: &reqwest::Client) -> String {
+    let body = serde_json::json!({ "name": "main", "type": "posix", "path": "/backups" });
+    let reply = api(client, "POST", "/v1/backup-repositories", Some(body)).await;
+    assert_eq!(reply["status"], "verified", "{reply}");
+    reply["id"].as_str().unwrap().to_string()
 }
 
 async fn wait_for(what: &str, timeout: Duration, mut check: impl AsyncFnMut() -> bool) {
@@ -272,6 +301,7 @@ async fn e2e_admin_one_node_database() {
     let _stack = Stack::up(&[HOST]);
     let client = admin_client();
     wait_online(&client, HOST).await;
+    add_repository(&client).await;
 
     // `vk-agent host` runs alone and opens no port.
     let pid = sh(
@@ -455,6 +485,7 @@ async fn e2e_admin_certificate_renewal_keeps_clients_connected() {
     let _stack = Stack::up(&[HOST]);
     let client = admin_client();
     wait_online(&client, HOST).await;
+    add_repository(&client).await;
     let output = cli(HOST, "database create orders --allow 0.0.0.0/0 --wait");
     let created = parse_created(&output);
     let id = created.id.as_str();
@@ -529,7 +560,7 @@ async fn e2e_admin_certificate_renewal_keeps_clients_connected() {
         "{}",
         database["status_reason"]
     );
-    assert_eq!(database["generation"], 2);
+    assert_eq!(database["generation"], 3, "create takes two generations");
 }
 
 /// Every supported major gets every extension.
@@ -539,6 +570,7 @@ async fn e2e_admin_each_postgres_version() {
     let _stack = Stack::up(&[HOST]);
     let client = admin_client();
     wait_online(&client, HOST).await;
+    add_repository(&client).await;
     for version in ["16", "17", "18"] {
         let mut args =
             format!("database create pg{version} --version {version} --allow 0.0.0.0/0 --wait");
@@ -580,6 +612,7 @@ async fn e2e_admin_systemd_runner() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     wait_online(&client, SYSTEMD_HOST).await;
+    add_repository(&client).await;
 
     // Start.
     let output = cli(
@@ -736,6 +769,15 @@ async fn e2e_admin_console_full_stack() {
         .unwrap();
     assert_eq!(rebound.status(), 403);
 
+    // Register a repository, which a host checks.
+    let repository = console(
+        &client,
+        "POST",
+        "/admin/v1/backup-repositories",
+        Some(serde_json::json!({ "name": "main", "type": "posix", "path": "/backups" })),
+    )
+    .await;
+
     // Create a database, and check it as its owner over verified TLS.
     let secret = console(&client, "POST", "/console/password", None).await;
     let operation = console(
@@ -749,6 +791,7 @@ async fn e2e_admin_console_full_stack() {
             "owner": { "username": "app_owner", "scram_verifier": secret["scram_verifier"] },
             "allowed_cidrs": ["0.0.0.0/0"],
             "extensions": ["vector"],
+            "backup": { "repository_id": repository["id"], "retention_days": 7 },
         })),
     )
     .await;
@@ -897,4 +940,1110 @@ async fn e2e_admin_console_full_stack() {
     let (status, _) =
         console_call(&client, "GET", &format!("/admin/v1/databases/{id}"), None).await;
     assert_eq!(status, 404);
+}
+
+// ── Three nodes ───────────────────────────────────────────────────────────────
+
+const HA_HOSTS: [&str; 5] = [
+    "host-ha-1",
+    "host-ha-2",
+    "host-ha-3",
+    "host-ha-4",
+    "host-ha-5",
+];
+
+struct HaDatabase {
+    id: String,
+    password: String,
+}
+
+async fn wait_ha_hosts(client: &reqwest::Client) {
+    for host in HA_HOSTS {
+        wait_online(client, host).await;
+    }
+}
+
+/// A three-node database, and how to reach it.
+async fn create_ha(client: &reqwest::Client, name: &str, mode: &str) -> HaDatabase {
+    let hosts = "--host host-ha-1 --host host-ha-2 --host host-ha-3";
+    let output = cli(
+        "host-ha-1",
+        &format!("database create {name} --ha --mode {mode} {hosts} --allow 0.0.0.0/0 --wait"),
+    );
+    let created = parse_created(&output);
+    let database = api(
+        client,
+        "GET",
+        &format!("/v1/databases/{}", created.id),
+        None,
+    )
+    .await;
+    assert_eq!(database["status"], "active", "{database}");
+    assert_eq!(database["replication_mode"], mode);
+    assert_eq!(database["endpoints"].as_array().unwrap().len(), 3);
+    HaDatabase {
+        id: created.id,
+        password: created.password,
+    }
+}
+
+fn node_endpoint(database: &Value, index: usize) -> Endpoint {
+    let address = &database["endpoints"][index];
+    Endpoint {
+        host: address["host"].as_str().unwrap().into(),
+        port: address["port"].as_u64().unwrap() as u16,
+        database: database["endpoint"]["database"].as_str().unwrap().into(),
+        ca: database["endpoint"]["ca_cert_pem"].as_str().unwrap().into(),
+    }
+}
+
+impl HaDatabase {
+    async fn get(&self, client: &reqwest::Client) -> Value {
+        api(client, "GET", &format!("/v1/databases/{}", self.id), None).await
+    }
+
+    /// `(node, host name)` of each node.
+    async fn nodes(&self, client: &reqwest::Client) -> Vec<(String, String)> {
+        let nodes = api(
+            client,
+            "GET",
+            &format!("/v1/databases/{}/nodes", self.id),
+            None,
+        )
+        .await;
+        nodes["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| {
+                (
+                    n["node"].as_str().unwrap().to_string(),
+                    n["host_name"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    async fn primary(&self, client: &reqwest::Client) -> Option<String> {
+        self.get(client).await["primary"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// Wait for the leader to report a primary other than `not`.
+    async fn wait_new_primary(&self, client: &reqwest::Client, not: &str) -> String {
+        let mut found = None;
+        wait_for("a new primary", Duration::from_secs(120), async || {
+            found = self.primary(client).await.filter(|p| p != not);
+            found.is_some()
+        })
+        .await;
+        found.unwrap()
+    }
+
+    async fn host_of(&self, client: &reqwest::Client, node: &str) -> String {
+        self.nodes(client)
+            .await
+            .into_iter()
+            .find(|(name, _)| name == node)
+            .unwrap()
+            .1
+    }
+
+    /// Every node streaming again, seen from whichever proxy answers.
+    async fn wait_healthy(&self, client: &reqwest::Client, nodes: usize) {
+        let database = self.get(client).await;
+        let endpoints = database["endpoints"].as_array().unwrap().len();
+        wait_for(
+            "every standby to stream",
+            Duration::from_secs(180),
+            async || {
+                for index in 0..endpoints {
+                    let endpoint = node_endpoint(&self.get(client).await, index);
+                    let Ok(mut connection) = endpoint.connect(&self.password).await else {
+                        continue;
+                    };
+                    let streaming: Result<i64, _> =
+                        sqlx::query_scalar("SELECT count(*) FROM pg_stat_replication")
+                            .persistent(false)
+                            .fetch_one(&mut connection)
+                            .await;
+                    connection.close().await.ok();
+                    if streaming.is_ok_and(|n| n as usize == nodes - 1) {
+                        return true;
+                    }
+                }
+                false
+            },
+        )
+        .await;
+    }
+
+    async fn run(&self, client: &reqwest::Client, method: &str, path: &str, body: Option<Value>) {
+        let path = format!("/v1/databases/{}/{path}", self.id);
+        let operation = api(client, method, &path, body).await;
+        self.wait_operation(client, &operation).await;
+    }
+
+    async fn wait_operation(&self, client: &reqwest::Client, operation: &Value) {
+        let path = format!(
+            "/v1/databases/{}/operations/{}",
+            operation["database_id"].as_str().unwrap(),
+            operation["id"].as_str().unwrap()
+        );
+        wait_for("the operation", Duration::from_secs(300), async || {
+            let current = api(client, "GET", &path, None).await;
+            assert_ne!(current["status"], "failed", "{current}");
+            current["status"] == "succeeded"
+        })
+        .await;
+    }
+
+    /// Status follows a sweep every few seconds, so it settles a little after
+    /// the cluster does.
+    async fn wait_active(&self, client: &reqwest::Client) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let last = self.get(client).await;
+            if last["status"] == "active" {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "still {}: {}",
+                last["status"],
+                last["status_reason"]
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn latest_logs(&self, client: &reqwest::Client) -> String {
+        let path = format!("/v1/databases/{}/operations", self.id);
+        let operations = api(client, "GET", &path, None).await;
+        let mut items = operations["items"].as_array().unwrap().clone();
+        items.sort_by_key(|o| o["created_at"].as_str().unwrap().to_string());
+        let latest = items.last().unwrap()["id"].as_str().unwrap().to_string();
+        let detail = api(client, "GET", &format!("{path}/{latest}"), None).await;
+        detail["logs"].to_string()
+    }
+}
+
+/// Clients writing as fast as they can, each commit numbered, so a test can ask
+/// which were lost after a failover.
+struct Load {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    acked: std::sync::Arc<std::sync::Mutex<Vec<i64>>>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Load {
+    async fn start(database: &HaDatabase, client: &reqwest::Client, table: &str) -> Self {
+        let endpoints: Vec<Endpoint> = {
+            let snapshot = database.get(client).await;
+            (0..snapshot["endpoints"].as_array().unwrap().len())
+                .map(|index| node_endpoint(&snapshot, index))
+                .collect()
+        };
+        let mut owner = endpoints[0].wait_connectable(&database.password).await;
+        sqlx::query(&format!("CREATE TABLE IF NOT EXISTS {table} (n bigint)"))
+            .persistent(false)
+            .execute(&mut owner)
+            .await
+            .unwrap();
+        owner.close().await.ok();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let acked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (flag, record, misses) = (stop.clone(), acked.clone(), failed.clone());
+        let password = database.password.clone();
+        let insert = format!("INSERT INTO {table} VALUES ($1)");
+        let task = tokio::spawn(async move {
+            use std::sync::atomic::Ordering;
+            let mut n = 0i64;
+            let mut connection: Option<PgConnection> = None;
+            let mut next_endpoint = 0;
+            while !flag.load(Ordering::SeqCst) {
+                if connection.is_none() {
+                    let endpoint = &endpoints[next_endpoint % endpoints.len()];
+                    next_endpoint += 1;
+                    let attempt =
+                        tokio::time::timeout(Duration::from_secs(3), endpoint.connect(&password))
+                            .await;
+                    match attempt {
+                        Ok(Ok(open)) => connection = Some(open),
+                        _ => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    }
+                }
+                n += 1;
+                let write = sqlx::query(&insert)
+                    .bind(n)
+                    .persistent(false)
+                    .execute(connection.as_mut().unwrap());
+                match tokio::time::timeout(Duration::from_secs(5), write).await {
+                    Ok(Ok(_)) => record.lock().unwrap().push(n),
+                    _ => {
+                        misses.fetch_add(1, Ordering::SeqCst);
+                        connection = None;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        Self {
+            stop,
+            acked,
+            failed,
+            task,
+        }
+    }
+
+    fn acked_count(&self) -> usize {
+        self.acked.lock().unwrap().len()
+    }
+
+    /// Let more commits land, to show the database is serving.
+    async fn wait_progress(&self) {
+        let start = self.acked_count();
+        wait_for("clients to commit", Duration::from_secs(120), async || {
+            self.acked_count() >= start + 20
+        })
+        .await;
+    }
+
+    async fn stop(self) -> (Vec<i64>, u64) {
+        use std::sync::atomic::Ordering;
+        self.stop.store(true, Ordering::SeqCst);
+        self.task.await.unwrap();
+        let acked = self.acked.lock().unwrap().clone();
+        (acked, self.failed.load(Ordering::SeqCst))
+    }
+}
+
+/// Which of `acked` are gone.
+async fn lost(
+    database: &HaDatabase,
+    client: &reqwest::Client,
+    table: &str,
+    acked: &[i64],
+) -> usize {
+    let snapshot = database.get(client).await;
+    let count = snapshot["endpoints"].as_array().unwrap().len();
+    for index in 0..count {
+        let endpoint = node_endpoint(&snapshot, index);
+        let Ok(mut owner) = endpoint.connect(&database.password).await else {
+            continue;
+        };
+        let stored: Result<Vec<i64>, _> = sqlx::query_scalar(&format!("SELECT n FROM {table}"))
+            .persistent(false)
+            .fetch_all(&mut owner)
+            .await;
+        owner.close().await.ok();
+        if let Ok(stored) = stored {
+            let stored: std::collections::HashSet<i64> = stored.into_iter().collect();
+            return acked.iter().filter(|n| !stored.contains(n)).count();
+        }
+    }
+    panic!("no node answered");
+}
+
+fn cut_off(host: &str, peers: &[&str]) {
+    let peers = peers.join(", ");
+    sh(
+        host,
+        &format!(
+            "nft add table inet partition && \
+             nft 'add chain inet partition input {{ type filter hook input priority -10; }}' && \
+             nft 'add chain inet partition output {{ type filter hook output priority -10; }}' && \
+             nft 'add rule inet partition input ip saddr {{ {peers} }} drop' && \
+             nft 'add rule inet partition output ip daddr {{ {peers} }} drop'"
+        ),
+    );
+}
+
+fn heal(host: &str) {
+    sh(host, "nft delete table inet partition");
+}
+
+fn address_of(host: &str) -> String {
+    let number: u32 = host.rsplit('-').next().unwrap().parse().unwrap();
+    format!("172.31.77.{}", 10 + number)
+}
+
+fn can_reach(from: &str, address: &str, port: u16) -> bool {
+    exec_on(
+        from,
+        &format!("timeout 3 bash -c '</dev/tcp/{address}/{port}'"),
+    )
+    .status
+    .success()
+}
+
+/// Nodes land apart, peers reach each other, and nobody else reaches them.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn e2e_admin_three_nodes_are_placed_apart_and_fenced_off() {
+    let _stack = Stack::up(&HA_HOSTS);
+    let client = admin_client();
+    wait_ha_hosts(&client).await;
+    add_repository(&client).await;
+
+    // host-ha-5 shares a rack with host-ha-1, and placement must not use both.
+    let database = create_ha_placed("orders").await;
+    let hosts: Vec<String> = database
+        .nodes(&client)
+        .await
+        .into_iter()
+        .map(|n| n.1)
+        .collect();
+    assert_eq!(hosts.len(), 3);
+    assert!(
+        !(hosts.iter().any(|h| h == "host-ha-1") && hosts.iter().any(|h| h == "host-ha-5")),
+        "{hosts:?} share a failure domain"
+    );
+
+    // Refused outright when named: the two share a rack.
+    let (status, body) = api_call(
+        &client,
+        "POST",
+        "/v1/databases",
+        Some(serde_json::json!({
+            "name": "too_close",
+            "version": "18",
+            "ha": true,
+            "hosts": ["host-ha-1", "host-ha-5", "host-ha-2"],
+            "resources": { "vcpu": 1, "memory_gb": 1, "storage_gb": 10 },
+            "owner": { "username": "app_owner", "scram_verifier":
+                "SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy" },
+            "backup": { "repository_id": "none", "retention_days": 7 },
+        })),
+    )
+    .await;
+    assert_eq!(status, 422, "{body}");
+
+    let outside = HA_HOSTS
+        .iter()
+        .find(|h| !hosts.iter().any(|used| used == *h))
+        .unwrap();
+    let nodes = api(
+        &client,
+        "GET",
+        &format!("/v1/databases/{}/nodes", database.id),
+        None,
+    )
+    .await;
+    let (first, second) = (&nodes["items"][0], &nodes["items"][1]);
+    let first_host = first["host_name"].as_str().unwrap();
+    let second_host = second["host_name"].as_str().unwrap();
+    let target = address_of(second_host);
+    let base = second["port_base"].as_u64().unwrap() as u16;
+    for offset in [2, 3, 4] {
+        assert!(
+            can_reach(first_host, &target, base + offset),
+            "a peer must reach port {offset}"
+        );
+        assert!(
+            !can_reach(outside, &target, base + offset),
+            "{outside} must not reach port {offset}"
+        );
+    }
+
+    // The allowlist reaches the host firewall, and an empty one closes the proxy
+    // to everyone, with connected clients left alone.
+    let endpoint = node_endpoint(&database.get(&client).await, 1);
+    let mut owner = endpoint.wait_connectable(&database.password).await;
+    assert!(can_reach(outside, &target, base));
+    database
+        .run(
+            &client,
+            "PUT",
+            "allowlist",
+            Some(serde_json::json!({ "allowed_cidrs": [] })),
+        )
+        .await;
+    assert!(!can_reach(outside, &target, base));
+    assert_eq!(
+        scalar(&mut owner, "SELECT 'still here'").await,
+        "still here"
+    );
+
+    // Deleting takes the rules with it.
+    let delete = api(
+        &client,
+        "DELETE",
+        &format!("/v1/databases/{}", database.id),
+        None,
+    )
+    .await;
+    database.wait_operation(&client, &delete).await;
+    let tables = sh(second_host, "nft list tables");
+    assert!(!tables.contains("pgcluster_"), "{tables}");
+}
+
+async fn create_ha_placed(name: &str) -> HaDatabase {
+    let output = cli(
+        "host-ha-1",
+        &format!("database create {name} --ha --allow 0.0.0.0/0 --wait"),
+    );
+    let created = parse_created(&output);
+    HaDatabase {
+        id: created.id,
+        password: created.password,
+    }
+}
+
+/// Mode, switchover and restart, each through the API, under client load.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn e2e_admin_day_to_day_operations_run_online() {
+    let _stack = Stack::up(&HA_HOSTS);
+    let client = admin_client();
+    wait_ha_hosts(&client).await;
+    add_repository(&client).await;
+    let database = create_ha(&client, "orders", "async").await;
+    database.wait_healthy(&client, 3).await;
+    let load = Load::start(&database, &client, "load_ops").await;
+    load.wait_progress().await;
+
+    // The mode changes with no restart.
+    let endpoint = node_endpoint(&database.get(&client).await, 0);
+    let path = format!("/v1/databases/{}", database.id);
+    let operation = api(
+        &client,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "replication_mode": "sync" })),
+    )
+    .await;
+    database.wait_operation(&client, &operation).await;
+    wait_for(
+        "synchronous replication",
+        Duration::from_secs(30),
+        async || {
+            let Ok(mut owner) = endpoint.connect(&database.password).await else {
+                return false;
+            };
+            let names = scalar(&mut owner, "SHOW synchronous_standby_names").await;
+            owner.close().await.ok();
+            names.starts_with("ANY 1")
+        },
+    )
+    .await;
+    assert_eq!(database.get(&client).await["replication_mode"], "sync");
+
+    // Switchover, as an operation with logs.
+    let before = database.primary(&client).await.unwrap();
+    database
+        .run(&client, "POST", "switchover", Some(serde_json::json!({})))
+        .await;
+    let after = database.wait_new_primary(&client, &before).await;
+    assert_ne!(before, after);
+    assert!(
+        database.latest_logs(&client).await.contains("switchover"),
+        "{}",
+        database.latest_logs(&client).await
+    );
+    load.wait_progress().await;
+
+    // Rolling restart.
+    database.wait_healthy(&client, 3).await;
+    database.run(&client, "POST", "restart", None).await;
+    assert!(database
+        .latest_logs(&client)
+        .await
+        .contains("rolling_restart"));
+    load.wait_progress().await;
+
+    // A preload extension installs by rolling restart, not by stopping all three.
+    database.wait_healthy(&client, 3).await;
+    database
+        .run(
+            &client,
+            "PUT",
+            "extensions",
+            Some(serde_json::json!({ "extensions": ["pg_cron", "vector"] })),
+        )
+        .await;
+    load.wait_progress().await;
+    let (acked, _) = load.stop().await;
+    assert_eq!(lost(&database, &client, "load_ops", &acked).await, 0);
+    let mut owner = endpoint.wait_connectable(&database.password).await;
+    let cron = scalar(
+        &mut owner,
+        "SELECT extname::text FROM pg_extension WHERE extname = 'pg_cron'",
+    )
+    .await;
+    assert_eq!(cron, "pg_cron");
+}
+
+/// What the spec asks of three nodes: survive primary loss, a partition and a
+/// replacement, in every replication mode.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn e2e_admin_ha_suite_in_every_mode() {
+    let _stack = Stack::up(&HA_HOSTS);
+    let client = admin_client();
+    wait_ha_hosts(&client).await;
+    add_repository(&client).await;
+
+    for mode in ["async", "sync", "sync_strict"] {
+        eprintln!("── {mode}");
+        let name = format!("ha_{mode}");
+        let database = create_ha(&client, &name, mode).await;
+        database.wait_healthy(&client, 3).await;
+        let safe = mode != "async";
+
+        // Primary loss.
+        let table = "load_loss";
+        let load = Load::start(&database, &client, table).await;
+        load.wait_progress().await;
+        let old = database.primary(&client).await.unwrap();
+        let old_host = database.host_of(&client, &old).await;
+        compose(&["kill", &old_host]);
+        let new = database.wait_new_primary(&client, &old).await;
+        assert_ne!(old, new);
+        load.wait_progress().await;
+        let (acked, _) = load.stop().await;
+        let missing = lost(&database, &client, table, &acked).await;
+        if safe {
+            assert_eq!(missing, 0, "{mode} lost {missing} commits");
+        }
+
+        // It rejoins with no help, and diverged writes do not come back.
+        compose(&["start", &old_host]);
+        wait_online(&client, &old_host).await;
+        database.wait_healthy(&client, 3).await;
+
+        // A network partition: the primary alone, on the wrong side.
+        let table = "load_split";
+        let load = Load::start(&database, &client, table).await;
+        load.wait_progress().await;
+        let old = database.primary(&client).await.unwrap();
+        let old_host = database.host_of(&client, &old).await;
+        let peers: Vec<String> = database
+            .nodes(&client)
+            .await
+            .into_iter()
+            .filter(|(_, host)| *host != old_host)
+            .map(|(_, host)| address_of(&host))
+            .collect();
+        let peers: Vec<&str> = peers.iter().map(String::as_str).collect();
+        cut_off(&old_host, &peers);
+        let new = database.wait_new_primary(&client, &old).await;
+        load.wait_progress().await;
+
+        // The cut-off proxy takes no writes, so there is one history.
+        let snapshot = database.get(&client).await;
+        let isolated_index = database
+            .nodes(&client)
+            .await
+            .iter()
+            .position(|(name, _)| *name == old)
+            .unwrap();
+        let isolated = node_endpoint(&snapshot, isolated_index);
+        if let Ok(mut connection) = isolated.connect(&database.password).await {
+            let write = sqlx::query("INSERT INTO load_split VALUES (-1)")
+                .persistent(false)
+                .execute(&mut connection);
+            let outcome = tokio::time::timeout(Duration::from_secs(5), write).await;
+            assert!(
+                !matches!(outcome, Ok(Ok(_))),
+                "an isolated proxy accepted a write"
+            );
+        }
+        heal(&old_host);
+        let (acked, _) = load.stop().await;
+        database.wait_healthy(&client, 3).await;
+        let missing = lost(&database, &client, table, &acked).await;
+        if safe {
+            assert_eq!(missing, 0, "{mode} lost {missing} commits");
+        }
+        assert_eq!(
+            database.primary(&client).await.as_deref(),
+            Some(new.as_str())
+        );
+
+        // Replace a standby under load, through a proxy that stays.
+        let primary = database.primary(&client).await.unwrap();
+        let nodes = database.nodes(&client).await;
+        let (leaving, _) = nodes.iter().find(|(name, _)| *name != primary).unwrap();
+        let spare = "host-ha-4";
+        let table = "load_swap";
+        let load = Load::start(&database, &client, table).await;
+        load.wait_progress().await;
+        let operation = api(
+            &client,
+            "POST",
+            &format!("/v1/databases/{}/nodes/{leaving}/replace", database.id),
+            Some(serde_json::json!({ "host_id": spare })),
+        )
+        .await;
+        database.wait_operation(&client, &operation).await;
+        load.wait_progress().await;
+        let (acked, _) = load.stop().await;
+        assert_eq!(lost(&database, &client, table, &acked).await, 0);
+        let nodes = database.nodes(&client).await;
+        assert_eq!(nodes.len(), 3, "{nodes:?}");
+        assert!(nodes.iter().any(|(_, host)| host == spare), "{nodes:?}");
+        assert!(!nodes.iter().any(|(name, _)| name == leaving), "{nodes:?}");
+        database.wait_healthy(&client, 3).await;
+        database.wait_active(&client).await;
+
+        // Hosts are needed for the next mode.
+        let delete = api(
+            &client,
+            "DELETE",
+            &format!("/v1/databases/{}", database.id),
+            None,
+        )
+        .await;
+        database.wait_operation(&client, &delete).await;
+    }
+
+    // Tooling can follow all of that without polling a database.
+    let events = api(&client, "GET", "/v1/events?limit=500", None).await;
+    let kinds: Vec<&str> = events["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    for kind in [
+        "node_offline",
+        "node_online",
+        "failover_completed",
+        "backup_completed",
+    ] {
+        assert!(kinds.contains(&kind), "no {kind} in {kinds:?}");
+    }
+}
+
+// ── Backups ───────────────────────────────────────────────────────────────────
+
+/// A point-in-time restore lands on exactly the commits before the target, with
+/// the source untouched, in a database that works on its own.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn e2e_admin_restore_to_a_point_in_time() {
+    let _stack = Stack::up(&[HOST]);
+    let client = admin_client();
+    wait_online(&client, HOST).await;
+    let repository = add_repository(&client).await;
+
+    let output = cli(HOST, "database create orders --allow 0.0.0.0/0 --wait");
+    let created = parse_created(&output);
+    let id = created.id.as_str();
+    let source = endpoint(&client, id).await;
+    let mut owner = source.wait_connectable(&created.password).await;
+
+    // The first backup existed before the database opened, and the leader reports it.
+    wait_for_backups(&client, id, 1).await;
+    let (status, _) = api_call(
+        &client,
+        "DELETE",
+        &format!("/v1/backup-repositories/{repository}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 409, "a repository in use stays");
+
+    // Backups are encrypted on the node before they reach the repository.
+    let stored = sh(
+        HOST,
+        &format!("find /backups/{id} -type f -name '*.br' -o -type f -name '*.zst' | head -1"),
+    );
+    if !stored.is_empty() {
+        let header = sh(HOST, &format!("head -c 4 {stored} | od -An -tx1"));
+        assert!(!header.contains("28 b5 2f fd"), "a plain zstd frame");
+    }
+
+    sqlx::query("CREATE TABLE t (v text)")
+        .persistent(false)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO t VALUES ('before')")
+        .persistent(false)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let target = scalar(
+        &mut owner,
+        "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    sqlx::query("INSERT INTO t VALUES ('after')")
+        .persistent(false)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_switch_wal()")
+        .persistent(false)
+        .execute(&mut owner)
+        .await
+        .ok();
+
+    // The window reaches the target only once the archive really does.
+    let window_path = format!("/v1/databases/{id}/restore-window");
+    wait_for(
+        "the window to pass the target",
+        Duration::from_secs(180),
+        async || {
+            let (status, window) = api_call(&client, "GET", &window_path, None).await;
+            status == 200
+                && window["latest"].as_str().is_some_and(|latest| {
+                    chrono::DateTime::parse_from_rfc3339(latest).unwrap()
+                        >= chrono::DateTime::parse_from_rfc3339(&target).unwrap()
+                })
+        },
+    )
+    .await;
+
+    // Outside the window is refused.
+    let (status, _) = api_call(
+        &client,
+        "POST",
+        &format!("/v1/databases/{id}/restore"),
+        Some(serde_json::json!({ "name": "too_old", "target_time": "2001-01-01T00:00:00Z" })),
+    )
+    .await;
+    assert_eq!(status, 422);
+
+    let operation = api(
+        &client,
+        "POST",
+        &format!("/v1/databases/{id}/restore"),
+        Some(serde_json::json!({ "name": "orders_copy", "target_time": target })),
+    )
+    .await;
+    let restored_id = operation["database_id"].as_str().unwrap().to_string();
+    let restored_db = HaDatabase {
+        id: restored_id.clone(),
+        password: created.password.clone(),
+    };
+    restored_db.wait_operation(&client, &operation).await;
+
+    let restored = endpoint(&client, &restored_id).await;
+    assert_eq!(restored.database, "orders_copy");
+    let mut copy = restored.wait_connectable(&created.password).await;
+    let rows = scalar(&mut copy, "SELECT string_agg(v, ',' ORDER BY v) FROM t").await;
+    assert_eq!(rows, "before", "only what committed before the target");
+
+    // It takes writes, and they stay out of the source.
+    sqlx::query("INSERT INTO t VALUES ('copy')")
+        .persistent(false)
+        .execute(&mut copy)
+        .await
+        .unwrap();
+    let source_rows = scalar(&mut owner, "SELECT string_agg(v, ',' ORDER BY v) FROM t").await;
+    assert_eq!(source_rows, "after,before");
+
+    // It has a backup of its own, and archives to its own place.
+    wait_for_backups(&client, &restored_id, 1).await;
+    let files = sh(HOST, &format!("ls /backups/{restored_id}"));
+    assert!(!files.is_empty());
+
+    // An on-demand backup appears in the list.
+    let operation = api(&client, "POST", &format!("/v1/databases/{id}/backup"), None).await;
+    restored_db.wait_operation(&client, &operation).await;
+    wait_for("the new backup", Duration::from_secs(60), async || {
+        let backups = api(&client, "GET", &format!("/v1/databases/{id}/backups"), None).await;
+        backups["items"].as_array().unwrap().len() == 2
+    })
+    .await;
+}
+
+async fn wait_for_backups(client: &reqwest::Client, id: &str, count: usize) {
+    let path = format!("/v1/databases/{id}/backups");
+    wait_for("the backups", Duration::from_secs(60), async || {
+        let backups = api(client, "GET", &path, None).await;
+        backups["items"].as_array().unwrap().len() == count
+    })
+    .await;
+}
+
+/// With a repository that cannot be written to, a database never opens.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn e2e_admin_a_bad_repository_is_refused() {
+    let _stack = Stack::up(&[HOST]);
+    let client = admin_client();
+    wait_online(&client, HOST).await;
+    let (status, body) = api_call(
+        &client,
+        "POST",
+        "/v1/backup-repositories",
+        Some(serde_json::json!({ "name": "nope", "type": "posix", "path": "/proc/nowhere" })),
+    )
+    .await;
+    assert_eq!(status, 422, "{body}");
+    let list = api(&client, "GET", "/v1/backup-repositories", None).await;
+    assert_eq!(list["items"], serde_json::json!([]));
+}
+
+// ── Secret rotation ───────────────────────────────────────────────────────────
+
+/// Each secret rotates under client load, and the old one stops working.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn e2e_admin_secrets_rotate_under_load() {
+    let _stack = Stack::up(&HA_HOSTS);
+    let client = admin_client();
+    wait_ha_hosts(&client).await;
+    add_repository(&client).await;
+    let database = create_ha(&client, "orders", "sync").await;
+    database.wait_healthy(&client, 3).await;
+    let load = Load::start(&database, &client, "load_keys").await;
+    load.wait_progress().await;
+
+    let host = database.nodes(&client).await[0].1.clone();
+    let instance = format!(
+        "/var/lib/pgcluster/instances/{}-{}",
+        database.id,
+        database.nodes(&client).await[0].0
+    );
+    let read = |file: &str| sh(&host, &format!("cat {instance}/{file}"));
+    let port_base = api(
+        &client,
+        "GET",
+        &format!("/v1/databases/{}/nodes", database.id),
+        None,
+    )
+    .await["items"][0]["port_base"]
+        .as_u64()
+        .unwrap() as u16;
+
+    // Internal passwords.
+    let old_env = read("instance.env");
+    let old_config = read("pgcluster.toml");
+    let old_key = old_config
+        .lines()
+        .find(|l| l.contains("api_keys"))
+        .unwrap()
+        .to_string();
+    let old_key = old_key.split('"').nth(1).unwrap().to_string();
+    let postmaster = sh(&host, &format!("head -1 {instance}/pgdata/postmaster.pid"));
+    database
+        .run(&client, "POST", "rotate-passwords", None)
+        .await;
+    assert_ne!(read("instance.env"), old_env);
+    assert_eq!(
+        sh(&host, &format!("head -1 {instance}/pgdata/postmaster.pid")),
+        postmaster,
+        "no restart"
+    );
+    let refused = sh(
+        &host,
+        &format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' -X POST -H 'Authorization: Bearer {old_key}' \
+             -H 'Content-Type: application/json' -d '{{}}' http://127.0.0.1:{}/api/backups",
+            port_base + 7
+        ),
+    );
+    assert_eq!(refused, "401", "the old API key must stop working");
+    let old_super = sh(
+        &host,
+        &format!(
+            "grep -o 'postgres_password = \"[^\"]*\"' {instance}/vk-agent.toml | cut -d'\"' -f2"
+        ),
+    );
+    assert!(!old_super.is_empty());
+    load.wait_progress().await;
+    database.wait_healthy(&client, 3).await;
+
+    // The database's CA. Clients that take the bundle from the API stay current.
+    let before = database.get(&client).await;
+    let old_ca = before["endpoint"]["ca_cert_pem"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let endpoint_before = node_endpoint(&before, 0);
+    database.run(&client, "POST", "rotate-ca", None).await;
+    let after = database.get(&client).await;
+    assert_ne!(after["endpoint"]["ca_cert_pem"].as_str().unwrap(), old_ca);
+    load.wait_progress().await;
+    let (acked, failed) = load.stop().await;
+    assert_eq!(failed, 0, "no commit may fail");
+    assert_eq!(lost(&database, &client, "load_keys", &acked).await, 0);
+    assert_eq!(
+        sh(&host, &format!("head -1 {instance}/pgdata/postmaster.pid")),
+        postmaster,
+        "no restart"
+    );
+    // A client holding the old CA can no longer verify the proxy.
+    assert!(endpoint_before.connect(&database.password).await.is_err());
+    let fresh = node_endpoint(&after, 0);
+    fresh.wait_connectable(&database.password).await;
+
+    // The admin CA: hosts move with no restart, and old certificates stop working.
+    let old_bundle = api(&client, "GET", "/v1/admin-ca", None).await["bundle_pem"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let old_host_cert = sh(&host, "cat /var/lib/vk-agent-host/host.crt");
+    let old_host_key = sh(&host, "cat /var/lib/vk-agent-host/host.key");
+    let status = api(&client, "POST", "/v1/admin-ca/rotate", None).await;
+    let both = status["bundle_pem"].as_str().unwrap().to_string();
+    let rotating = reqwest::Client::builder()
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(reqwest::Certificate::from_pem(both.as_bytes()).unwrap())
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(
+                both.split_inclusive("-----END CERTIFICATE-----\n")
+                    .last()
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let mut new_ca = String::new();
+    wait_for(
+        "the rotation to end",
+        Duration::from_secs(180),
+        async || {
+            let Ok(response) = rotating
+                .get(format!("{ADMIN_URL}/v1/admin-ca"))
+                .bearer_auth(API_KEY)
+                .send()
+                .await
+            else {
+                return false;
+            };
+            let status: Value = response.json().await.unwrap_or(Value::Null);
+            new_ca = status["bundle_pem"].as_str().unwrap_or("").to_string();
+            status["phase"].is_null() && !new_ca.is_empty()
+        },
+    )
+    .await;
+    assert_ne!(new_ca, old_bundle);
+    let renewed = sh(&host, "cat /var/lib/vk-agent-host/host.crt");
+    assert_ne!(renewed, old_host_cert, "hosts move to the new CA");
+    assert_eq!(
+        sh(&host, "cat /var/lib/vk-agent-host/ca.crt").trim(),
+        new_ca.trim(),
+        "hosts drop the old CA"
+    );
+    wait_online_with(&rotating, &host).await;
+
+    // A certificate from the old CA no longer gets through.
+    let identity = format!("{old_host_cert}\n{old_host_key}\n");
+    let impostor = reqwest::Client::builder()
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(reqwest::Certificate::from_pem(new_ca.as_bytes()).unwrap())
+        .identity(reqwest::Identity::from_pem(identity.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let attempt = impostor
+        .get("https://localhost:18444/agent/v1/desired-state?wait_seconds=0")
+        .send()
+        .await;
+    assert!(attempt.is_err(), "{attempt:?}");
+
+    // The key that encrypts instance secrets: a restart seals everything anew.
+    let old_row = sh(
+        "admin-db",
+        "psql -U postgres -d pgcluster_admin -Atc 'SELECT encode(secrets, $$hex$$) FROM databases LIMIT 1'",
+    );
+    const NEW_KEY: &str = "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=";
+    let override_file = root().join("docker/rotate-secret-key.yml");
+    std::fs::write(
+        &override_file,
+        format!(
+            "services:\n  pgcluster-admin:\n    environment:\n      PGCLUSTER_ADMIN_SECRET_KEY: \"{NEW_KEY}\"\n      PGCLUSTER_ADMIN_OLD_SECRET_KEY: \"nvQ1nHZ3hYkq0m4oGQ3p3k5u2u8Zt7y6vX1cR0eJm9U=\"\n"
+        ),
+    )
+    .unwrap();
+    let up = compose_command(&[
+        "-f",
+        "docker/rotate-secret-key.yml",
+        "up",
+        "-d",
+        "--no-deps",
+        "--no-build",
+        "--wait",
+        "pgcluster-admin",
+    ])
+    .output()
+    .unwrap();
+    std::fs::remove_file(&override_file).ok();
+    assert!(
+        up.status.success(),
+        "{}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    let new_row = sh(
+        "admin-db",
+        "psql -U postgres -d pgcluster_admin -Atc 'SELECT encode(secrets, $$hex$$) FROM databases LIMIT 1'",
+    );
+    assert_ne!(old_row, new_row);
+    // Desired state still decrypts, so a change reaches hosts. A new client,
+    // because the old one's connections were to the process that stopped.
+    let rotating = reqwest::Client::builder()
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(reqwest::Certificate::from_pem(new_ca.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let path = format!("/v1/databases/{}/backup", database.id);
+    let response = rotating
+        .post(format!("{ADMIN_URL}{path}"))
+        .bearer_auth(API_KEY)
+        .send()
+        .await
+        .unwrap();
+    let operation: Value = response.json().await.unwrap();
+    wait_for(
+        "a backup after the rekey",
+        Duration::from_secs(120),
+        async || {
+            let path = format!(
+                "/v1/databases/{}/operations/{}",
+                database.id,
+                operation["id"].as_str().unwrap()
+            );
+            let current: Value = rotating
+                .get(format!("{ADMIN_URL}{path}"))
+                .bearer_auth(API_KEY)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_ne!(current["status"], "failed", "{current}");
+            current["status"] == "succeeded"
+        },
+    )
+    .await;
+}
+
+async fn wait_online_with(client: &reqwest::Client, name: &str) {
+    wait_for("the host to report", Duration::from_secs(60), async || {
+        let Ok(response) = client
+            .get(format!("{ADMIN_URL}/v1/hosts"))
+            .bearer_auth(API_KEY)
+            .send()
+            .await
+        else {
+            return false;
+        };
+        let hosts: Value = response.json().await.unwrap_or(Value::Null);
+        hosts["items"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|h| h["name"] == name && h["status"] == "online")
+        })
+    })
+    .await;
 }

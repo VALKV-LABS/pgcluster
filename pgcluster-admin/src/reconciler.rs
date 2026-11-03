@@ -8,11 +8,15 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use serde_json::{json, Value};
 use sqlx::{FromRow, Postgres, Transaction};
 
-use crate::model::DatabaseSpec;
-use crate::operations::{self, Kind};
-use crate::secrets::{random_token, DatabaseSecrets, NodeSecrets};
+use crate::ca::Ca;
+use crate::model::{choose_hosts, DatabaseSpec, HA_NODES};
+use crate::operations::{self, event, Kind};
+use crate::secrets::{
+    random_backup_key, random_token, DatabaseSecrets, NextPasswords, NodeSecrets,
+};
 use crate::state::AdminState;
 
 /// A host that has not reported for this long counts as offline.
@@ -28,6 +32,11 @@ const WAIT_RETRY: Duration = Duration::from_secs(1);
 /// to be away for weeks before anything expires.
 const CERT_RENEW_DAYS: i32 = 30;
 const SWEEP_EVERY_TICKS: u32 = 10;
+/// How long a node stays away before tooling is told to replace it. A reboot
+/// should not bring up a new machine.
+const REPLACEMENT_AFTER_SECONDS: f64 = 300.0;
+/// The label of the backup every database starts with.
+const FIRST_BACKUP_LABEL: &str = "first-backup";
 
 type Tx<'a> = Transaction<'a, Postgres>;
 
@@ -41,6 +50,7 @@ struct Claimed {
     kind: String,
     target_generation: i64,
     past_deadline: bool,
+    params: sqlx::types::Json<Value>,
 }
 
 enum Outcome {
@@ -81,6 +91,9 @@ impl Reconciler {
                 if let Err(e) = self.renew_certificates().await {
                     tracing::error!(err = format!("{e:#}"), "certificate renewal failed");
                 }
+                if let Err(e) = crate::rotation::advance(&self.state).await {
+                    tracing::error!(err = format!("{e:#}"), "admin CA rotation failed");
+                }
             }
             tokio::time::sleep(self.tick).await;
         }
@@ -91,7 +104,7 @@ impl Reconciler {
         let mut tx = self.state.pool.begin().await?;
         let claimed = sqlx::query_as::<_, Claimed>(
             "SELECT s.operation_id, s.seq, s.name, s.attempts, o.database_id, o.kind, \
-                    o.target_generation, o.deadline < now() AS past_deadline \
+                    o.target_generation, o.deadline < now() AS past_deadline, o.params \
              FROM operation_steps s \
              JOIN operations o ON o.id = s.operation_id \
              WHERE s.status = 'pending' \
@@ -170,7 +183,11 @@ impl Reconciler {
     async fn run_step(&self, tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
         match step.name.as_str() {
             "place" => self.place(tx, step).await,
-            "wait_applied" => wait_applied(tx, step).await,
+            "wait_applied" => wait_applied(tx, step, None).await,
+            "wait_peers" => {
+                let new = step.params["new_node"].as_str().map(str::to_string);
+                wait_applied(tx, step, new.as_deref()).await
+            }
             "activate" => {
                 set_status(tx, &step.database_id, "active", None).await?;
                 Ok(Outcome::Done)
@@ -179,12 +196,183 @@ impl Reconciler {
             "retract" => retract(tx, step).await,
             "wait_removed" => wait_removed(tx, step).await,
             "finalize" => finalize(tx, step).await,
+            "first_backup" => {
+                let label = json!({ "label": FIRST_BACKUP_LABEL });
+                run_task(tx, step, "backup", "leader", label).await
+            }
+            "backup" => {
+                let label = step.params["label"].clone();
+                run_task(tx, step, "backup", "leader", json!({ "label": label })).await
+            }
+            "open_access" => {
+                sqlx::query("UPDATE databases SET access_open = true WHERE id = $1")
+                    .bind(&step.database_id)
+                    .execute(&mut **tx)
+                    .await?;
+                new_generation(tx, step).await?;
+                Ok(Outcome::Done)
+            }
+            "new_generation" => {
+                new_generation(tx, step).await?;
+                Ok(Outcome::Done)
+            }
+            "rolling_restart" => run_task(tx, step, "rolling_restart", "leader", json!({})).await,
+            "switchover" => {
+                let params = json!({ "target": step.params["target"] });
+                run_task(tx, step, "switchover", "leader", params).await
+            }
+            "set_replication_mode" => {
+                let params = json!({ "mode": step.params["mode"] });
+                run_task(tx, step, "replication_mode", "leader", params).await
+            }
+            "replace_member" => {
+                let params = step.params.0.clone();
+                run_task(tx, step, "replace_member", "leader", params).await
+            }
+            "retract_old" => retract_old(tx, step).await,
+            "wait_old_removed" => wait_old_removed(tx, step).await,
+            "drop_old" => drop_old(tx, step).await,
+            "ca_trust_both" => self.ca_trust_both(tx, step).await,
+            "ca_issue" => self.ca_issue(tx, step).await,
+            "ca_trust_new" => self.ca_trust_new(tx, step).await,
+            "passwords_offer" => self.passwords_offer(tx, step).await,
+            "passwords_alter" => run_task(tx, step, "alter_passwords", "primary", json!({})).await,
+            "passwords_commit" => self.passwords_commit(tx, step).await,
             other => Ok(Outcome::Fail(format!("unknown step {other}"))),
         }
     }
 
-    /// Choose a host, allocate ports, generate the instance's secrets and
-    /// publish it to the host.
+    async fn database_secrets(
+        &self,
+        tx: &mut Tx<'_>,
+        database_id: &str,
+    ) -> Result<DatabaseSecrets> {
+        let sealed: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT secrets FROM databases WHERE id = $1")
+                .bind(database_id)
+                .fetch_one(&mut **tx)
+                .await?;
+        let sealed = sealed.context("the database has no secrets")?;
+        self.state.secrets.open(database_id, &sealed)
+    }
+
+    async fn store_secrets(
+        &self,
+        tx: &mut Tx<'_>,
+        database_id: &str,
+        secrets: &DatabaseSecrets,
+    ) -> Result<()> {
+        sqlx::query("UPDATE databases SET secrets = $2, ca_cert_pem = $3 WHERE id = $1")
+            .bind(database_id)
+            .bind(self.state.secrets.seal(database_id, secrets)?)
+            .bind(secrets.ca_bundle())
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    /// Bring in a new CA alongside the old one. Nothing presents its certificates
+    /// yet, but every node, and every client that reads the bundle, trusts them.
+    async fn ca_trust_both(&self, tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+        let mut secrets = self.database_secrets(tx, &step.database_id).await?;
+        let (name,): (String,) = sqlx::query_as("SELECT name FROM databases WHERE id = $1")
+            .bind(&step.database_id)
+            .fetch_one(&mut **tx)
+            .await?;
+        // Distinct from the old one's, so that nothing mistakes one for the other.
+        let suffix = &random_token()[..8];
+        let ca = Ca::generate(&format!("pgcluster-{name}-{suffix}"))?;
+        secrets.previous_ca_cert_pem = Some(secrets.ca_cert_pem.clone());
+        secrets.ca_cert_pem = ca.cert_pem().to_string();
+        secrets.ca_key_pem = ca.key_pem();
+        self.store_secrets(tx, &step.database_id, &secrets).await?;
+        new_generation(tx, step).await?;
+        Ok(Outcome::Done)
+    }
+
+    /// Give every node a certificate from the new CA.
+    async fn ca_issue(&self, tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+        let secrets = self.database_secrets(tx, &step.database_id).await?;
+        let ca = Ca::from_pem(&secrets.ca_cert_pem, &secrets.ca_key_pem)?;
+        let nodes: Vec<(String, String)> = sqlx::query_as(
+            "SELECT n.node, h.address FROM nodes n JOIN hosts h ON h.id = n.host_id \
+             WHERE n.database_id = $1 AND NOT n.retracted",
+        )
+        .bind(&step.database_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        for (node, address) in nodes {
+            self.reissue(tx, &step.database_id, &node, &address, &ca)
+                .await?;
+        }
+        new_generation(tx, step).await?;
+        Ok(Outcome::Done)
+    }
+
+    async fn reissue(
+        &self,
+        tx: &mut Tx<'_>,
+        database_id: &str,
+        node: &str,
+        address: &str,
+        ca: &Ca,
+    ) -> Result<()> {
+        let issued = ca.issue_node(&node_names(address))?;
+        let not_after = issued.not_after;
+        let node_secrets = NodeSecrets {
+            cert_pem: issued.cert_pem,
+            key_pem: issued.key_pem,
+        };
+        sqlx::query(
+            "UPDATE nodes SET secrets = $3, cert_not_after = $4 \
+             WHERE database_id = $1 AND node = $2",
+        )
+        .bind(database_id)
+        .bind(node)
+        .bind(
+            self.state
+                .secrets
+                .seal(&format!("{database_id}/{node}"), &node_secrets)?,
+        )
+        .bind(not_after)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// With every node on the new CA, stop trusting the old one.
+    async fn ca_trust_new(&self, tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+        let mut secrets = self.database_secrets(tx, &step.database_id).await?;
+        secrets.previous_ca_cert_pem = None;
+        self.store_secrets(tx, &step.database_id, &secrets).await?;
+        new_generation(tx, step).await?;
+        Ok(Outcome::Done)
+    }
+
+    /// Tell every node the passwords to come, before any role changes.
+    async fn passwords_offer(&self, tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+        let mut secrets = self.database_secrets(tx, &step.database_id).await?;
+        secrets.next = Some(NextPasswords::generate());
+        self.store_secrets(tx, &step.database_id, &secrets).await?;
+        new_generation(tx, step).await?;
+        Ok(Outcome::Done)
+    }
+
+    /// The roles have moved, so the new passwords become the current ones.
+    async fn passwords_commit(&self, tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+        let mut secrets = self.database_secrets(tx, &step.database_id).await?;
+        let next = secrets.next.take().context("no passwords to commit")?;
+        secrets.superuser_password = next.superuser_password;
+        secrets.replication_password = next.replication_password;
+        secrets.auth_password = next.auth_password;
+        secrets.api_key = next.api_key;
+        self.store_secrets(tx, &step.database_id, &secrets).await?;
+        new_generation(tx, step).await?;
+        Ok(Outcome::Done)
+    }
+
+    /// Choose hosts, allocate ports, generate each instance's secrets and publish
+    /// them to the hosts. A three-node database takes one host per failure domain.
     async fn place(&self, tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
         let (name, spec): (String, sqlx::types::Json<DatabaseSpec>) =
             sqlx::query_as("SELECT name, spec FROM databases WHERE id = $1")
@@ -192,8 +380,8 @@ impl Reconciler {
                 .fetch_one(&mut **tx)
                 .await?;
 
-        let host: Option<(String, String)> = sqlx::query_as(
-            "SELECT h.id, h.address FROM hosts h \
+        let candidates: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT h.id, h.address, h.failure_domain FROM hosts h \
              WHERE h.last_seen_at > now() - make_interval(secs => $1) \
                AND h.address IS NOT NULL \
                AND (cardinality($2::text[]) = 0 OR h.id = ANY($2) OR h.name = ANY($2)) \
@@ -201,34 +389,32 @@ impl Reconciler {
                  SELECT sum((d.spec->'resources'->>'memory_gb')::float8) \
                  FROM nodes n JOIN databases d ON d.id = n.database_id \
                  WHERE n.host_id = h.id), 0) DESC, h.id \
-             LIMIT 1 \
              FOR UPDATE OF h",
         )
         .bind(ONLINE_WINDOW_SECONDS as f64)
         .bind(&spec.hosts)
-        .fetch_optional(&mut **tx)
+        .fetch_all(&mut **tx)
         .await?;
-        let Some((host_id, address)) = host else {
-            return Ok(Outcome::Wait("waiting for an online host".into()));
+        let count = if spec.ha { HA_NODES } else { 1 };
+        let chosen = choose_hosts(candidates, count, |(id, _, domain)| {
+            domain.clone().unwrap_or_else(|| id.clone())
+        });
+        let Some(chosen) = chosen else {
+            return Ok(Outcome::Wait(if spec.ha {
+                "waiting for three online hosts in separate failure domains".into()
+            } else {
+                "waiting for an online host".into()
+            }));
         };
 
-        let port_base: Option<i32> = sqlx::query_scalar(
-            "SELECT p FROM generate_series($1::int, $2::int, $3::int) AS p \
-             WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.host_id = $4 AND n.port_base = p) \
-             ORDER BY p LIMIT 1",
-        )
-        .bind(PORT_BASE_START)
-        .bind(PORT_BASE_END)
-        .bind(PORT_BLOCK)
-        .bind(&host_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        let Some(port_base) = port_base else {
-            return Ok(Outcome::Fail(format!("host {host_id} has no free ports")));
+        let ca = Ca::generate(&format!("pgcluster-{name}"))?;
+        let source_backup_key = match &spec.restore {
+            Some(source) => {
+                let source_secrets = self.database_secrets(tx, &source.database_id).await?;
+                Some(source_secrets.backup_key)
+            }
+            None => None,
         };
-
-        let ca = crate::ca::Ca::generate(&format!("pgcluster-{name}"))?;
-        let issued = ca.issue_node(&node_names(&address))?;
         let database_secrets = DatabaseSecrets {
             ca_cert_pem: ca.cert_pem().to_string(),
             ca_key_pem: ca.key_pem(),
@@ -236,12 +422,10 @@ impl Reconciler {
             replication_password: random_token(),
             auth_password: random_token(),
             api_key: random_token(),
-        };
-        let node = "n1";
-        let cert_not_after = issued.not_after;
-        let node_secrets = NodeSecrets {
-            cert_pem: issued.cert_pem,
-            key_pem: issued.key_pem,
+            backup_key: random_backup_key(),
+            source_backup_key,
+            previous_ca_cert_pem: None,
+            next: None,
         };
 
         sqlx::query("UPDATE databases SET ca_cert_pem = $2, secrets = $3 WHERE id = $1")
@@ -254,30 +438,36 @@ impl Reconciler {
             )
             .execute(&mut **tx)
             .await?;
-        sqlx::query(
-            "INSERT INTO nodes (database_id, node, host_id, port_base, secrets, cert_not_after) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(&step.database_id)
-        .bind(node)
-        .bind(&host_id)
-        .bind(port_base)
-        .bind(
-            self.state
-                .secrets
-                .seal(&format!("{}/{node}", step.database_id), &node_secrets)?,
-        )
-        .bind(cert_not_after)
-        .execute(&mut **tx)
-        .await?;
-        bump_host(tx, &host_id).await?;
-        operations::log(
-            tx,
-            &step.operation_id,
-            "reconciler",
-            &format!("placed {node} on host {host_id} at port {port_base}"),
-        )
-        .await?;
+        let first = if spec.restore.is_some() {
+            "restore"
+        } else {
+            "initdb"
+        };
+        for (index, (host_id, address, _)) in chosen.iter().enumerate() {
+            let node = format!("n{}", index + 1);
+            let bootstrap = if index == 0 { first } else { "seed" };
+            let added = add_node(
+                &self.state,
+                tx,
+                &step.database_id,
+                &node,
+                host_id,
+                address,
+                bootstrap,
+                &ca,
+            )
+            .await?;
+            let Some(port_base) = added else {
+                return Ok(Outcome::Fail(format!("host {host_id} has no free ports")));
+            };
+            operations::log(
+                tx,
+                &step.operation_id,
+                "reconciler",
+                &format!("placed {node} on host {host_id} at port {port_base}"),
+            )
+            .await?;
+        }
         Ok(Outcome::Done)
     }
 
@@ -343,27 +533,9 @@ impl Reconciler {
         .await?;
 
         let secrets: DatabaseSecrets = self.state.secrets.open(database_id, &sealed)?;
-        let ca = crate::ca::Ca::from_pem(&secrets.ca_cert_pem, &secrets.ca_key_pem)?;
-        let issued = ca.issue_node(&node_names(&address))?;
-        let not_after = issued.not_after;
-        let node_secrets = NodeSecrets {
-            cert_pem: issued.cert_pem,
-            key_pem: issued.key_pem,
-        };
-        sqlx::query(
-            "UPDATE nodes SET secrets = $3, cert_not_after = $4 \
-             WHERE database_id = $1 AND node = $2",
-        )
-        .bind(database_id)
-        .bind(node)
-        .bind(
-            self.state
-                .secrets
-                .seal(&format!("{database_id}/{node}"), &node_secrets)?,
-        )
-        .bind(not_after)
-        .execute(&mut *tx)
-        .await?;
+        let ca = Ca::from_pem(&secrets.ca_cert_pem, &secrets.ca_key_pem)?;
+        self.reissue(&mut tx, database_id, node, &address, &ca)
+            .await?;
         let generation: i64 = sqlx::query_scalar(
             "UPDATE databases SET generation = generation + 1, updated_at = now() \
              WHERE id = $1 RETURNING generation",
@@ -385,9 +557,77 @@ impl Reconciler {
         Ok(())
     }
 
+    /// Tell tooling about nodes that went away, came back or need replacing.
+    async fn track_nodes(&self) -> Result<()> {
+        const OFFLINE: &str = "(h.last_seen_at IS NULL \
+             OR h.last_seen_at < now() - make_interval(secs => $1))";
+        let mut tx = self.state.pool.begin().await?;
+        let left: Vec<(String, String)> = sqlx::query_as(&format!(
+            "UPDATE nodes n SET offline_since = now() FROM hosts h \
+             WHERE h.id = n.host_id AND n.offline_since IS NULL AND NOT n.retracted \
+               AND {OFFLINE} \
+             RETURNING n.database_id, n.node"
+        ))
+        .bind(ONLINE_WINDOW_SECONDS as f64)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (database_id, node) in left {
+            event(
+                &mut tx,
+                "node_offline",
+                Some(&database_id),
+                Some(&node),
+                json!({}),
+            )
+            .await?;
+        }
+        let back: Vec<(String, String)> = sqlx::query_as(&format!(
+            "UPDATE nodes n SET offline_since = NULL, replacement_flagged = false FROM hosts h \
+             WHERE h.id = n.host_id AND n.offline_since IS NOT NULL AND NOT n.retracted \
+               AND NOT {OFFLINE} \
+             RETURNING n.database_id, n.node"
+        ))
+        .bind(ONLINE_WINDOW_SECONDS as f64)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (database_id, node) in back {
+            event(
+                &mut tx,
+                "node_online",
+                Some(&database_id),
+                Some(&node),
+                json!({}),
+            )
+            .await?;
+        }
+        let lost: Vec<(String, String)> = sqlx::query_as(
+            "UPDATE nodes n SET replacement_flagged = true FROM databases d \
+             WHERE d.id = n.database_id AND (d.spec->>'ha')::boolean \
+               AND n.offline_since < now() - make_interval(secs => $1) \
+               AND NOT n.replacement_flagged AND NOT n.retracted \
+             RETURNING n.database_id, n.node",
+        )
+        .bind(REPLACEMENT_AFTER_SECONDS)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (database_id, node) in lost {
+            event(
+                &mut tx,
+                "replacement_needed",
+                Some(&database_id),
+                Some(&node),
+                json!({}),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Reflect node and host health in each database's status.
     pub async fn sweep(&self) -> Result<()> {
-        const PROBLEM: &str = "(SELECT CASE \
+        self.track_nodes().await?;
+        const PROBLEM: &str = "coalesce((SELECT CASE \
                 WHEN n.state = 'failed' THEN 'node ' || n.node || ' failed: ' || coalesce(n.error, '') \
                 ELSE 'node ' || n.node || ' is on an offline host' END \
              FROM nodes n JOIN hosts h ON h.id = n.host_id \
@@ -395,7 +635,10 @@ impl Reconciler {
                AND (n.state = 'failed' \
                     OR h.last_seen_at IS NULL \
                     OR h.last_seen_at < now() - make_interval(secs => $1)) \
-             ORDER BY n.node LIMIT 1)";
+             ORDER BY n.node LIMIT 1), \
+             CASE WHEN (d.observed->>'sync_degraded')::boolean \
+                  THEN 'sync has fallen back to async' END, \
+             'backups are failing: ' || (d.observed->>'backup_error'))";
         sqlx::query(&format!(
             "UPDATE databases d SET status = 'degraded', status_reason = {PROBLEM}, \
                                     updated_at = now() \
@@ -415,6 +658,61 @@ impl Reconciler {
         .context("mark recovered databases")?;
         Ok(())
     }
+}
+
+/// Record a node on a host, with ports and a certificate, and publish it.
+/// Returns its first port, or nothing if the host has none left.
+#[allow(clippy::too_many_arguments)]
+pub async fn add_node(
+    state: &AdminState,
+    tx: &mut Tx<'_>,
+    database_id: &str,
+    node: &str,
+    host_id: &str,
+    address: &str,
+    bootstrap: &str,
+    ca: &Ca,
+) -> Result<Option<i32>> {
+    let port_base: Option<i32> = sqlx::query_scalar(
+        "SELECT p FROM generate_series($1::int, $2::int, $3::int) AS p \
+         WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.host_id = $4 AND n.port_base = p) \
+         ORDER BY p LIMIT 1",
+    )
+    .bind(PORT_BASE_START)
+    .bind(PORT_BASE_END)
+    .bind(PORT_BLOCK)
+    .bind(host_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(port_base) = port_base else {
+        return Ok(None);
+    };
+    let issued = ca.issue_node(&node_names(address))?;
+    let cert_not_after = issued.not_after;
+    let node_secrets = NodeSecrets {
+        cert_pem: issued.cert_pem,
+        key_pem: issued.key_pem,
+    };
+    sqlx::query(
+        "INSERT INTO nodes (database_id, node, host_id, port_base, secrets, cert_not_after, \
+                            bootstrap) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(database_id)
+    .bind(node)
+    .bind(host_id)
+    .bind(port_base)
+    .bind(
+        state
+            .secrets
+            .seal(&format!("{database_id}/{node}"), &node_secrets)?,
+    )
+    .bind(cert_not_after)
+    .bind(bootstrap)
+    .execute(&mut **tx)
+    .await?;
+    bump_host(tx, host_id).await?;
+    Ok(Some(port_base))
 }
 
 /// The names on a node's certificate. Local processes connect over loopback.
@@ -491,19 +789,116 @@ async fn fail(tx: &mut Tx<'_>, step: &Claimed, message: &str) -> Result<()> {
     operations::log(tx, &step.operation_id, "reconciler", message).await?;
     // A failed update leaves a database serving on its old settings.
     let status = match Kind::parse(&step.kind) {
-        Some(Kind::Update) => "degraded",
-        _ => "error",
+        Some(Kind::Create | Kind::Delete) => "error",
+        _ => "degraded",
     };
     set_status(tx, &step.database_id, status, Some(message)).await?;
+    sqlx::query(
+        "UPDATE tasks SET status = 'failed', error = 'the operation ended', finished_at = now() \
+         WHERE operation_id = $1 AND status = 'pending'",
+    )
+    .bind(&step.operation_id)
+    .execute(&mut **tx)
+    .await?;
+    let detail = json!({ "operation_id": step.operation_id, "kind": step.kind, "error": message });
+    event(
+        tx,
+        "operation_failed",
+        Some(&step.database_id),
+        None,
+        detail,
+    )
+    .await?;
     Ok(())
 }
 
-async fn wait_applied(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
-    let nodes: Vec<(String, i64, String, Option<String>)> = sqlx::query_as(
-        "SELECT node, observed_generation, state, error FROM nodes \
-         WHERE database_id = $1 AND NOT retracted",
+/// Publish the database's state again, for a step to wait on.
+async fn new_generation(tx: &mut Tx<'_>, step: &Claimed) -> Result<i64> {
+    let generation: i64 = sqlx::query_scalar(
+        "UPDATE databases SET generation = generation + 1, updated_at = now() \
+         WHERE id = $1 RETURNING generation",
     )
     .bind(&step.database_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    sqlx::query("UPDATE operations SET target_generation = $2 WHERE id = $1")
+        .bind(&step.operation_id)
+        .bind(generation)
+        .execute(&mut **tx)
+        .await?;
+    bump_hosts(tx, &step.database_id).await?;
+    Ok(generation)
+}
+
+/// Every host with a live node of this database has something new to read.
+pub async fn bump_hosts(tx: &mut Tx<'_>, database_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE hosts SET generation = generation + 1 WHERE id IN \
+         (SELECT host_id FROM nodes WHERE database_id = $1 AND NOT retracted)",
+    )
+    .bind(database_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Hand a host work and wait for it. The step's first attempt records the task,
+/// and later attempts look at how it went.
+async fn run_task(
+    tx: &mut Tx<'_>,
+    step: &Claimed,
+    kind: &str,
+    run_on: &str,
+    params: Value,
+) -> Result<Outcome> {
+    let task: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT status, error FROM tasks WHERE operation_id = $1 AND kind = $2")
+            .bind(&step.operation_id)
+            .bind(kind)
+            .fetch_optional(&mut **tx)
+            .await?;
+    match task {
+        None => {
+            sqlx::query(
+                "INSERT INTO tasks (id, operation_id, database_id, kind, run_on, params) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&step.operation_id)
+            .bind(&step.database_id)
+            .bind(kind)
+            .bind(run_on)
+            .bind(sqlx::types::Json(&params))
+            .execute(&mut **tx)
+            .await?;
+            bump_hosts(tx, &step.database_id).await?;
+            Ok(Outcome::Wait(format!("waiting for {kind}")))
+        }
+        Some((status, _)) if status == "succeeded" => Ok(Outcome::Done),
+        Some((status, error)) if status == "failed" => Ok(Outcome::Fail(format!(
+            "{kind} failed: {}",
+            error.unwrap_or_default()
+        ))),
+        Some(_) => Ok(Outcome::Wait(format!("waiting for {kind}"))),
+    }
+}
+
+/// A host that has gone away holds up nothing on a three-node database: it reads
+/// its state when it returns, and the database is serving without it.
+async fn wait_applied(tx: &mut Tx<'_>, step: &Claimed, except: Option<&str>) -> Result<Outcome> {
+    let nodes: Vec<(String, i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT n.node, n.observed_generation, n.state, n.error \
+         FROM nodes n \
+         JOIN hosts h ON h.id = n.host_id \
+         JOIN databases d ON d.id = n.database_id \
+         WHERE n.database_id = $1 AND NOT n.retracted \
+           AND (n.node <> $2 OR $2 IS NULL) \
+           AND NOT ((d.spec->>'ha')::boolean AND n.offline_since IS NOT NULL \
+                    AND h.last_seen_at < now() - make_interval(secs => $3))",
+    )
+    .bind(&step.database_id)
+    .bind(except)
+    .bind(ONLINE_WINDOW_SECONDS as f64)
     .fetch_all(&mut **tx)
     .await?;
     for (node, observed, state, error) in nodes {
@@ -515,6 +910,57 @@ async fn wait_applied(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
             )));
         }
     }
+    Ok(Outcome::Done)
+}
+
+fn old_node(step: &Claimed) -> Result<&str> {
+    step.params["old_node"]
+        .as_str()
+        .context("the operation names no old node")
+}
+
+/// The cluster has let go of the old node, so its host can too, and its peers
+/// stop accepting it.
+async fn retract_old(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+    let host: String = sqlx::query_scalar(
+        "UPDATE nodes SET retracted = true WHERE database_id = $1 AND node = $2 \
+         RETURNING host_id",
+    )
+    .bind(&step.database_id)
+    .bind(old_node(step)?)
+    .fetch_one(&mut **tx)
+    .await?;
+    bump_host(tx, &host).await?;
+    new_generation(tx, step).await?;
+    Ok(Outcome::Done)
+}
+
+/// A host that is gone cannot answer. It removes the instance if it returns,
+/// since the instance is no longer in its desired state.
+async fn wait_old_removed(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM nodes n JOIN hosts h ON h.id = n.host_id \
+         WHERE n.database_id = $1 AND n.node = $2 AND n.present \
+           AND h.last_seen_at > now() - make_interval(secs => $3)",
+    )
+    .bind(&step.database_id)
+    .bind(old_node(step)?)
+    .bind(ONLINE_WINDOW_SECONDS as f64)
+    .fetch_one(&mut **tx)
+    .await?;
+    if remaining == 0 {
+        Ok(Outcome::Done)
+    } else {
+        Ok(Outcome::Wait("waiting for the old node to go".into()))
+    }
+}
+
+async fn drop_old(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+    sqlx::query("DELETE FROM nodes WHERE database_id = $1 AND node = $2")
+        .bind(&step.database_id)
+        .bind(old_node(step)?)
+        .execute(&mut **tx)
+        .await?;
     Ok(Outcome::Done)
 }
 

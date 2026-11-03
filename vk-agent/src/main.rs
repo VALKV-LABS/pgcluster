@@ -12,6 +12,31 @@ use vk_agent::{
     server::{serve, AgentServiceImpl},
 };
 
+/// Read the Postgres password again on SIGHUP. Open connections carry on, and
+/// new ones use it, so a rotation disturbs nothing.
+fn spawn_password_reload(
+    config_path: String,
+    pg: Arc<LocalPostgres>,
+    walg: Arc<vk_agent::walg::WalG>,
+) -> Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut hangup = signal(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        while hangup.recv().await.is_some() {
+            let reloaded = AgentConfig::from_file(&config_path).and_then(|config| {
+                pg.set_url(&config.postgres_url())?;
+                walg.set_password(config.postgres_password);
+                Ok(())
+            });
+            if let Err(e) = reloaded {
+                tracing::error!(err = format!("{e:#}"), "kept the old password");
+            }
+        }
+    });
+    Ok(())
+}
+
 /// Read the certificate files again on SIGHUP. Files that do not load leave the
 /// old ones in use, which still work: they are renewed well before they expire.
 fn spawn_certificate_reload(
@@ -72,7 +97,7 @@ async fn main() -> Result<()> {
     info!(listen = %config.listen_addr, "vk-agent starting");
 
     // Connect on first use: a node waiting to be seeded has no Postgres yet.
-    let pg = LocalPostgres::connect_lazy(&config.postgres_url())?;
+    let pg = Arc::new(LocalPostgres::connect_lazy(&config.postgres_url())?);
 
     let heartbeat = HeartbeatTracker::new(Duration::from_secs(config.heartbeat_timeout_seconds));
     heartbeat.clone().spawn_watchdog();
@@ -83,7 +108,10 @@ async fn main() -> Result<()> {
         heartbeat.detach();
     }
 
-    let pg_ctl = Arc::new(PgCtl::new(&config.pg_ctl_path, &config.data_dir));
+    let pg_ctl = Arc::new(
+        PgCtl::new(&config.pg_ctl_path, &config.data_dir)
+            .with_config_file(config.postgres_config_file.clone()),
+    );
 
     // Self-fencing watchdog: if pgcluster heartbeats are absent for fence_timeout seconds
     // after entering safe mode, stop postgres immediately to prevent split-brain writes.
@@ -129,7 +157,8 @@ async fn main() -> Result<()> {
         });
     }
 
-    let svc = AgentServiceImpl::new(Arc::new(config.clone()), heartbeat, Arc::new(pg), pg_ctl);
+    let svc = AgentServiceImpl::new(Arc::new(config.clone()), heartbeat, pg.clone(), pg_ctl);
+    spawn_password_reload(config_path, pg, svc.walg())?;
 
     let addr: SocketAddr = config.listen_addr.parse()?;
 

@@ -41,7 +41,8 @@ pub fn settings(config: &BackupConfig) -> HashMap<String, String> {
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
         ] {
-            if let Ok(value) = std::env::var(name) {
+            let value = crate::credentials::get(name);
+            if !value.is_empty() {
                 settings.insert(name.to_string(), value);
             }
         }
@@ -51,7 +52,8 @@ pub fn settings(config: &BackupConfig) -> HashMap<String, String> {
     }
 
     if let Some(env) = &config.encryption_key_env {
-        if let Ok(key) = std::env::var(env) {
+        let key = crate::credentials::get(env);
+        if !key.is_empty() {
             settings.insert("WALG_LIBSODIUM_KEY".to_string(), key);
             settings.insert(
                 "WALG_LIBSODIUM_KEY_TRANSFORM".to_string(),

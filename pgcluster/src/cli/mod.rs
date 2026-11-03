@@ -45,6 +45,12 @@ pub enum Commands {
     Host(admin::HostArgs),
     /// Manage databases through pgcluster-admin
     Database(admin::DatabaseArgs),
+    /// Manage backup repositories through pgcluster-admin
+    Repository(admin::RepositoryArgs),
+    /// Read the event feed of pgcluster-admin
+    Events(admin::EventArgs),
+    /// Show or rotate the CA of pgcluster-admin
+    AdminCa(admin::AdminCaArgs),
     /// Run a local web page for trying every operation
     Console(console::ConsoleArgs),
 }
@@ -63,6 +69,9 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Certs(args) => certs::run(args).await,
         Commands::Host(args) => admin::run_host(args).await,
         Commands::Database(args) => admin::run_database(args).await,
+        Commands::Repository(args) => admin::run_repository(args).await,
+        Commands::Events(args) => admin::run_events(args).await,
+        Commands::AdminCa(args) => admin::run_admin_ca(args).await,
         Commands::Console(args) => console::run(args).await,
     }
 }

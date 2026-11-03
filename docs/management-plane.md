@@ -1,6 +1,6 @@
 # Management Plane Specification
 
-**Status:** Stage 1 is built, and its AWS path awaits its first run. Later stages are proposed. [`todo.md`](../todo.md) tracks each step.
+**Status:** Stages 1 to 3 are built, and the AWS path awaits its first run. Later stages are proposed. [`todo.md`](../todo.md) tracks each step.
 **Audience:** contributors, and operators who run their own Postgres fleet.
 
 ## 1. Summary
@@ -168,6 +168,8 @@ POST   /v1/databases/{id}/switchover
 POST   /v1/databases/{id}/backup
 POST   /v1/databases/{id}/restore               { name, target_time } → a new database
 POST   /v1/databases/{id}/owner-password        { scram_verifier }
+POST   /v1/databases/{id}/rotate-ca
+POST   /v1/databases/{id}/rotate-passwords
 
 GET|PUT /v1/databases/{id}/allowlist
 GET|PUT /v1/databases/{id}/extensions
@@ -210,6 +212,8 @@ POST     /v1/databases/{id}/replicas/{replica_id}/promote
 GET /v1/databases/{id}/operations
 GET /v1/databases/{id}/operations/{op_id}       steps and logs
 GET /v1/events?after={cursor}
+GET /v1/admin-ca                                what to trust, and how far a rotation has got
+POST /v1/admin-ca/rotate
 ```
 
 The event feed reports state changes such as `node_offline`, `failover_completed`, `backup_failed` and `replacement_needed`. It lets tooling react without polling every database. For example, a provisioning tool can respond to `replacement_needed` by bringing up a new host.
@@ -225,6 +229,9 @@ POST /agent/v1/certificate             a new key pair → a new client certifica
 GET  /agent/v1/desired-state           ?generation=N, long-polled
 POST /agent/v1/report                  observed_generation, capacity, instance health
 POST /agent/v1/operations/{id}/log     step output
+POST /agent/v1/tasks/{id}/result       how a task went
+POST /agent/v1/repository-checks/{id}  whether this host could write to a repository
+POST /agent/v1/cluster                 what a cluster's Raft leader knows
 ```
 
 - Enrolment tokens are single-use and expire after 15 minutes. A token ends in the hash of the CA certificate, so a new host can verify the server with nothing else copied to it.
@@ -255,6 +262,8 @@ POST /agent/v1/operations/{id}/log     step output
 }
 ```
 
+`tasks` carries one-off work, such as a switchover or a backup. `pgcluster-admin` cannot call a host, and each instance's REST API is local, so a task goes to every node of a database, and runs on the node that is the Raft leader or the Postgres primary, which only that host can tell. Results and what the leader knows come back through the agent API.
+
 `secrets` carries the instance's certificate and internal passwords, which all of a database's nodes must share. `pgcluster-admin` encrypts them at rest, sends them only to the host that runs the instance, and a host keeps them readable by its owner alone.
 
 The agent API is a public contract. Anything that serves it can drive `vk-agent host`.
@@ -277,13 +286,13 @@ Each database has a `spec` and a `generation`. `vk-agent host` long-polls for de
 6. Take the first full backup.
 7. Apply the allowlist and mark the database `active`.
 
-Clients get no access until step 7, so a reachable database always has a restorable backup.
+Clients get no access until step 7, so a reachable database always has a restorable backup. A `backup` policy is therefore required on every create.
 
 **Other operations**
 
 | Operation | How |
 |---|---|
-| Replace a node | Add the new node as a Raft learner, seed it from backup, promote it to voter, remove the old member |
+| Replace a node | Add the new node as a Raft learner, seed it from the primary, promote it to voter, remove the old member |
 | Grow storage | Grow the volume and filesystem online on each node |
 | Change resources | One standby at a time, then switch over, then the old primary |
 | Add HA to one node | Add two nodes the same way as a replacement |
@@ -328,14 +337,14 @@ Every database has point-in-time restore.
 
 The coordinator talks to `vk-agent` through backup RPCs that name no tool, and the API and topology carry nothing specific to WAL-G, so another engine can replace it.
 
-Restore always creates a new database, so the source stays up and a failed restore harms nothing. `restore-window` returns the earliest and latest restorable times.
+Restore always creates a new database, so the source stays up and a failed restore harms nothing. `restore-window` returns the earliest and latest restorable times: from the end of the oldest backup to the last moment every commit is known to be in the archive. Deleting a database discards the key that decrypts its backups.
 
 Scheduling stays on each cluster's Raft leader, so backups continue during a management-plane outage.
 
 ### Network
 
 - Clients reach the proxy only. Postgres, Raft and agent ports accept the database's own nodes.
-- The allowlist is a whole-list `PUT`, applied at the proxy and reloaded without dropping connected clients. The proxy is the only process that sees a client's address: Postgres sees the proxy, so `pg_hba.conf` cannot filter clients. Stage 2 also applies it to the host firewall. Empty means no access. Public access is the explicit entry `0.0.0.0/0`.
+- The allowlist is a whole-list `PUT`, applied at the proxy and reloaded without dropping connected clients. The proxy is the only process that sees a client's address: Postgres sees the proxy, so `pg_hba.conf` cannot filter clients. It also applies to the host firewall. Empty means no access. Public access is the explicit entry `0.0.0.0/0`.
 - TLS is required at the proxy. `pgcluster-admin` issues a certificate by default, and `PUT .../certificate` replaces it.
 - The owner role gets `CREATEDB` and `CREATEROLE`, not superuser.
 

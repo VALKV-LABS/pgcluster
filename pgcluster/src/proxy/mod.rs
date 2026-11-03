@@ -24,7 +24,7 @@ use tracing::{error, info};
 use crate::{
     config::ProxyConfig,
     metrics_registry::Metrics,
-    tls::{SharedAcceptor, TlsManager},
+    tls::{SharedAcceptor, SharedConnector},
 };
 
 use allowlist::SharedAllowlist;
@@ -55,13 +55,12 @@ impl ProxyServer {
     pub fn new(
         config: ProxyConfig,
         router: Arc<Router>,
-        tls: Option<Arc<TlsManager>>,
         acceptor: Option<SharedAcceptor>,
+        backend_tls: Option<SharedConnector>,
         metrics: Arc<Metrics>,
         auth: Arc<AuthQuery>,
         allowlist: SharedAllowlist,
     ) -> Self {
-        let backend_tls = tls.as_ref().map(|t| t.client_tls_connector());
         let pool = Arc::new(ConnectionPool::new(config.pool.clone(), backend_tls));
 
         Self {

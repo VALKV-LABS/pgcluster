@@ -224,7 +224,23 @@ function sqlBox(target, examples) {
 
 // ── Databases ─────────────────────────────────────────────────────────────────
 
-function createDatabaseForm(hosts) {
+function repositoryForm() {
+  const form = el("form", { onsubmit: event => {
+    event.preventDefault();
+    const values = formValues(form);
+    act(`Register ${values.name}`, async () => {
+      const created = await call("POST", "/admin/v1/backup-repositories", { name: values.name, type: "posix", path: values.path });
+      await draw();
+      return created;
+    });
+  } },
+    field("Name", el("input", { name: "name", required: true, value: "main" })),
+    field("Directory every host can reach", el("input", { name: "path", required: true, value: "/backups", size: 24 })),
+    el("button", { class: "primary" }, "Register repository"));
+  return form;
+}
+
+function createDatabaseForm(hosts, repositories) {
   const form = el("form", { onsubmit: async event => {
     event.preventDefault();
     const values = formValues(form);
@@ -239,6 +255,9 @@ function createDatabaseForm(hosts) {
         owner: { username: values.owner, scram_verifier: secret.scram_verifier },
         allowed_cidrs: words(values.cidrs),
         extensions: checked(form, "extension"),
+        ha: values.ha === "on",
+        replication_mode: values.mode,
+        backup: { repository_id: values.repository, retention_days: Number(values.retention) },
       };
       if (values.host) body.hosts = [values.host];
       const operation = await call("POST", "/admin/v1/databases", body);
@@ -260,6 +279,11 @@ function createDatabaseForm(hosts) {
     field("Host", el("select", { name: "host" }, el("option", { value: "" }, "Most free"),
       hosts.filter(h => h.status === "online").map(h => el("option", { value: h.id }, h.name)))),
     field("Allowed CIDRs", el("input", { name: "cidrs", value: "0.0.0.0/0", size: 20 })),
+    field("Backup repository", el("select", { name: "repository", required: true },
+      repositories.map(r => el("option", { value: r.id }, r.name)))),
+    field("Retention days", el("input", { name: "retention", type: "number", min: "1", value: "7", style: "width:70px" })),
+    field("Three nodes", el("input", { name: "ha", type: "checkbox" })),
+    field("Replication", el("select", { name: "mode" }, ["async", "sync", "sync_strict"].map(m => el("option", {}, m)))),
     checks("extension", ["vector"]),
     el("button", { class: "primary" }, "Create database"));
   return form;
@@ -282,6 +306,23 @@ async function databaseDetail(id) {
   });
 
   const allow = el("input", { value: database.allowed_cidrs.join(" "), size: 30, "aria-label": "Allowed CIDRs" });
+  const mode = el("select", { "aria-label": "Replication mode" }, ["async", "sync", "sync_strict"].map(m =>
+    el("option", m === database.replication_mode ? { selected: true } : {}, m)));
+  const backups = await call("GET", `/admin/v1/databases/${id}/backups`);
+  const restoreWindow = await call("GET", `/admin/v1/databases/${id}/restore-window`).catch(() => null);
+  const restoreForm = el("form", { onsubmit: event => {
+    event.preventDefault();
+    const values = formValues(restoreForm);
+    act(`Restore ${values.name}`, async () => {
+      const operation = await call("POST", `/admin/v1/databases/${id}/restore`, { name: values.name, target_time: values.target_time });
+      state.selected = operation.database_id;
+      await waitFor(operation);
+      return { database: operation.database_id, status: "active" };
+    });
+  } },
+    field("New database", el("input", { name: "name", required: true, pattern: "[a-z_][a-z0-9_]*" })),
+    field("Time, within the window", el("input", { name: "target_time", required: true, size: 28, value: restoreWindow ? restoreWindow.latest : "" })),
+    el("button", { class: "plain" }, "Restore to a new database"));
   const extensionForm = el("form", { onsubmit: event => {
     event.preventDefault();
     change("Change extensions", "extensions", "PUT", { extensions: checked(extensionForm, "installed") });
@@ -312,6 +353,26 @@ async function databaseDetail(id) {
         change("Change allowlist", "allowlist", "PUT", { allowed_cidrs: words(allow.value) }) }, "Apply allowlist")),
     el("h3", {}, "Extensions"),
     extensionForm,
+    el("h3", {}, "Operations"),
+    el("div", { class: "row" },
+      database.ha ? el("button", { class: "plain", onclick: () => change("Switch over", "switchover", "POST", {}) }, "Switch over") : null,
+      database.ha ? mode : null,
+      database.ha ? el("button", { class: "plain", onclick: () => act("Change replication mode", async () => {
+        await waitFor(await call("PATCH", `/admin/v1/databases/${id}`, { replication_mode: mode.value }));
+        return "applied";
+      }) }, "Apply mode") : null,
+      el("button", { class: "plain", onclick: () => change("Rolling restart", "restart", "POST") }, "Rolling restart"),
+      el("button", { class: "plain", onclick: () => change("Take a backup", "backup", "POST") }, "Take a backup"),
+      el("button", { class: "plain", onclick: () => change("Rotate the CA", "rotate-ca", "POST") }, "Rotate the CA"),
+      el("button", { class: "plain", onclick: () => change("Rotate internal passwords", "rotate-passwords", "POST") }, "Rotate internal passwords")),
+    el("h3", {}, "Backups"),
+    table([
+      { label: "Label", cell: b => b.label },
+      { label: "Finished", cell: b => b.finished_at },
+      { label: "Size", cell: b => String(b.size_bytes) },
+    ], backups.items, { empty: "No backups yet." }),
+    restoreWindow ? el("p", { class: "hint" }, `Restorable from ${restoreWindow.earliest} to ${restoreWindow.latest}.`) : null,
+    restoreForm,
     el("h3", {}, "Owner password"),
     el("div", { class: "row" },
       el("button", { class: "plain", onclick: () => act("Rotate password", async () => {
@@ -353,11 +414,24 @@ async function databaseDetail(id) {
 }
 
 async function drawDatabases() {
-  const [databases, hosts] = await Promise.all([call("GET", "/admin/v1/databases"), call("GET", "/admin/v1/hosts")]);
+  const [databases, hosts, repositories] = await Promise.all([
+    call("GET", "/admin/v1/databases"),
+    call("GET", "/admin/v1/hosts"),
+    call("GET", "/admin/v1/backup-repositories"),
+  ]);
   const parts = [
+    el("section", {}, el("h2", {}, "Backup repositories"),
+      el("p", { class: "hint" }, "A database opens only once it has a restorable backup, so register one first. A host proves it can write there."),
+      table([
+        { label: "Name", cell: r => r.name },
+        { label: "Type", cell: r => r.type },
+        { label: "Where", cell: r => r.config.path || r.config.bucket || "" },
+        { label: "Status", cell: r => statusCell(r.status) },
+      ], repositories.items, { empty: "No repositories yet." }),
+      repositoryForm()),
     el("section", {}, el("h2", {}, "Create a database"),
       el("p", { class: "hint" }, "The password is generated by this console, and only its verifier goes to pgcluster-admin."),
-      createDatabaseForm(hosts.items),
+      createDatabaseForm(hosts.items, repositories.items),
       state.once ? el("div", { class: "once" }, el("div", {}, state.once.label), el("code", {}, state.once.value)) : null),
     el("section", {}, el("h2", {}, "Databases"),
       table([

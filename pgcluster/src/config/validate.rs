@@ -258,6 +258,7 @@ mod tests {
             cluster: ClusterConfig {
                 name: "test".into(),
                 data_dir: "/tmp".into(),
+                secrets_file: None,
                 mode: ClusterMode::Cluster,
             },
             raft: RaftConfig {

@@ -16,7 +16,9 @@ pub async fn require_auth(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if is_authorized(&s.config.api, request.method(), request.headers()) {
+    let mut api = s.config.api.clone();
+    api.api_keys = s.runtime.api_keys();
+    if is_authorized(&api, request.method(), request.headers()) {
         Ok(next.run(request).await)
     } else {
         Err(StatusCode::UNAUTHORIZED)

@@ -18,6 +18,7 @@ use anyhow::{anyhow, bail, Result};
 use tracing::{error, info, warn};
 
 use crate::agent_clients::AgentClientPool;
+use crate::config::runtime::Runtime;
 use crate::config::BackupConfig;
 use crate::raft::commands::TopologyCommand;
 use crate::raft::topology::{BackupManifest, BackupStatus, ClusterTopology, NodeRole};
@@ -36,6 +37,7 @@ pub struct BackupScheduler {
     topology_rx: TopologyWatch,
     config: BackupConfig,
     pool: Arc<AgentClientPool>,
+    runtime: Arc<Runtime>,
 }
 
 impl BackupScheduler {
@@ -44,12 +46,14 @@ impl BackupScheduler {
         topology_rx: TopologyWatch,
         config: BackupConfig,
         pool: Arc<AgentClientPool>,
+        runtime: Arc<Runtime>,
     ) -> Self {
         Self {
             raft,
             topology_rx,
             config,
             pool,
+            runtime,
         }
     }
 
@@ -78,20 +82,27 @@ impl BackupScheduler {
             }
 
             let topology = self.topology_rx.current();
-            if !is_due(
-                self.config.interval_seconds,
-                last_backup_ts(&topology),
-                unix_now(),
-            ) {
+            // A failure, such as one while there was no primary, is retried
+            // until a backup succeeds, rather than waiting for the next one due.
+            let failing = self.runtime.last_backup_failure().is_some();
+            if !failing
+                && !is_due(
+                    self.config.interval_seconds,
+                    last_backup_ts(&topology),
+                    unix_now(),
+                )
+            {
                 continue;
             }
 
             let label = format!("scheduled-{}", chrono::Utc::now().format("%Y-%m-%d"));
+            let mut config = self.config.clone();
+            config.retain_full = self.runtime.retain_full(config.retain_full);
             match run_backup(
                 &self.raft,
                 &topology,
                 &self.pool,
-                &self.config,
+                &config,
                 "scheduled",
                 &label,
             )
@@ -99,6 +110,7 @@ impl BackupScheduler {
             {
                 Ok(manifest) => {
                     last_failure = None;
+                    self.runtime.record_backup(None);
                     info!(
                         backup_id = manifest.backup_id,
                         source_node = manifest.source_node,
@@ -107,6 +119,7 @@ impl BackupScheduler {
                 }
                 Err(e) => {
                     last_failure = Some(Instant::now());
+                    self.runtime.record_backup(Some((label, format!("{e:#}"))));
                     error!(err = %e, "scheduled backup failed");
                 }
             }

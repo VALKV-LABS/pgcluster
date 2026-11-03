@@ -153,15 +153,7 @@ pub async fn trigger_failover(
         .collect();
 
     if !replicas.is_empty() {
-        let new_host = candidate_cfg
-            .postgres_addr
-            .split(':')
-            .next()
-            .unwrap_or(&candidate_cfg.postgres_addr);
-        let conninfo = format!(
-            "host={} port=5432 user={} password={}",
-            new_host, repl_user, repl_password
-        );
+        let conninfo = candidate_cfg.conninfo(repl_user, repl_password);
 
         // Ensure the new primary has a WAL slot for every replica that will
         // connect to it.  Stale slots from the old primary are unreachable;

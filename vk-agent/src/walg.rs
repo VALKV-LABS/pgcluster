@@ -2,7 +2,7 @@
 //! is the only place in vk-agent that knows WAL-G's commands and output.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -10,6 +10,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 
 use crate::config::AgentConfig;
+use crate::host::model::BackupTarget;
 use crate::postgres::LocalPostgres;
 use crate::process::PgCtl;
 use crate::seed::{clear_contents, has_data, set_owner_only};
@@ -32,7 +33,7 @@ pub struct WalG {
     postgres_host: String,
     postgres_port: u16,
     postgres_user: String,
-    postgres_password: Option<String>,
+    postgres_password: std::sync::RwLock<Option<String>>,
 }
 
 impl WalG {
@@ -43,7 +44,7 @@ impl WalG {
             postgres_host: config.postgres_host.clone(),
             postgres_port: config.postgres_port,
             postgres_user: config.postgres_user.clone(),
-            postgres_password: config.postgres_password.clone(),
+            postgres_password: std::sync::RwLock::new(config.postgres_password.clone()),
         }
     }
 
@@ -55,10 +56,20 @@ impl WalG {
             .env("PGHOST", &self.postgres_host)
             .env("PGPORT", self.postgres_port.to_string())
             .env("PGUSER", &self.postgres_user);
-        if let Some(password) = &self.postgres_password {
+        if let Some(password) = self
+            .postgres_password
+            .read()
+            .expect("password lock")
+            .as_ref()
+        {
             command.env("PGPASSWORD", password);
         }
         command
+    }
+
+    /// Connect with `password` from now on.
+    pub fn set_password(&self, password: Option<String>) {
+        *self.postgres_password.write().expect("password lock") = password;
     }
 
     async fn run(&self, mut command: Command, what: &str) -> Result<String> {
@@ -268,6 +279,137 @@ fn parse_list(output: &str) -> Result<Vec<ListedBackup>> {
         return Ok(Vec::new());
     }
     serde_json::from_str(trimmed).context("parse wal-g backup-list")
+}
+
+/// The settings for `target`, which is what an agent is given for a repository
+/// it has no instance on, as a restore has for the database it came from.
+pub fn repository_settings(target: &BackupTarget) -> HashMap<String, String> {
+    let mut settings = HashMap::from([("WALG_COMPRESSION_METHOD".into(), "zstd".to_string())]);
+    if let Some(path) = &target.path {
+        settings.insert("WALG_FILE_PREFIX".into(), path.clone());
+    }
+    if let Some(bucket) = &target.bucket {
+        let prefix = target.prefix.as_deref().unwrap_or("").trim_matches('/');
+        settings.insert("WALG_S3_PREFIX".into(), format!("s3://{bucket}/{prefix}"));
+    }
+    let optional = [
+        ("AWS_REGION", &target.region),
+        ("AWS_ENDPOINT", &target.endpoint),
+        ("AWS_ACCESS_KEY_ID", &target.access_key_id),
+        ("AWS_SECRET_ACCESS_KEY", &target.secret_access_key),
+    ];
+    for (name, value) in optional {
+        if let Some(value) = value {
+            settings.insert(name.into(), value.clone());
+        }
+    }
+    if target.path_style {
+        settings.insert("AWS_S3_FORCE_PATH_STYLE".into(), "true".into());
+    }
+    if let Some(key) = &target.encryption_key {
+        settings.insert("WALG_LIBSODIUM_KEY".into(), key.clone());
+        settings.insert("WALG_LIBSODIUM_KEY_TRANSFORM".into(), "base64".into());
+    }
+    settings
+}
+
+/// A repository reached from outside any instance, by `vk-agent host`.
+pub struct Repository {
+    pub binary: String,
+    pub config_path: PathBuf,
+    /// The user to run as, as `(uid, gid)`.
+    pub user: Option<(u32, u32)>,
+}
+
+impl Repository {
+    /// Write the config for `target`, readable only by the user running WAL-G.
+    pub async fn create(
+        binary: &str,
+        config_path: PathBuf,
+        target: &BackupTarget,
+        user: Option<(u32, u32)>,
+    ) -> Result<Self> {
+        let json = serde_json::to_vec_pretty(&repository_settings(target))?;
+        write_owner_only(&config_path, &json).await?;
+        if let Some((uid, gid)) = user {
+            std::os::unix::fs::chown(&config_path, Some(uid), Some(gid))
+                .context("hand over the wal-g config")?;
+        }
+        Ok(Self {
+            binary: binary.to_string(),
+            config_path,
+            user,
+        })
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.binary);
+        command.arg("--config").arg(&self.config_path);
+        if let Some((uid, gid)) = self.user {
+            command.uid(uid).gid(gid);
+            if let Ok(Some(user)) = nix::unistd::User::from_uid(uid.into()) {
+                command.env("HOME", user.dir);
+            }
+        }
+        command
+    }
+
+    async fn run(&self, mut command: Command, what: &str) -> Result<String> {
+        let output = command
+            .output()
+            .await
+            .with_context(|| format!("spawn wal-g for {what}"))?;
+        if !output.status.success() {
+            bail!(
+                "wal-g {what} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Prove the repository can be written to, read from and cleaned up.
+    pub async fn check(&self, probe: &Path) -> Result<()> {
+        let name = format!(
+            "pgcluster-check/{}",
+            probe.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let mut put = self.command();
+        put.args(["st", "put", "--no-compress", "--no-encrypt"])
+            .arg(probe)
+            .arg(&name);
+        self.run(put, "write check").await?;
+        let mut remove = self.command();
+        remove.args(["st", "rm"]).arg(&name);
+        self.run(remove, "cleanup check").await?;
+        Ok(())
+    }
+
+    /// Fill `data_dir` from the backup that suits `target_time`.
+    pub async fn fetch(&self, data_dir: &Path, target_time: Option<&str>) -> Result<()> {
+        let name = match target_time {
+            Some(text) => {
+                let mut list = self.command();
+                list.args(["backup-list", "--json", "--detail"]);
+                let backups = parse_list(&self.run(list, "backup-list").await?)?;
+                newest_before(&backups, parse_target_time(text)?)?
+            }
+            None => "LATEST".to_string(),
+        };
+        let mut fetch = self.command();
+        fetch.arg("backup-fetch").arg(data_dir).arg(&name);
+        self.run(fetch, "backup-fetch").await?;
+        Ok(())
+    }
+
+    /// The command Postgres runs to fetch a WAL segment during recovery.
+    pub fn restore_command(&self) -> String {
+        format!(
+            "{} --config {} wal-fetch %f %p",
+            self.binary,
+            self.config_path.display()
+        )
+    }
 }
 
 async fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {

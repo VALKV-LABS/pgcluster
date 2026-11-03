@@ -25,6 +25,8 @@ const CA_DAYS: i64 = 3650;
 /// Tolerates clocks that are a little behind.
 const CLOCK_SKEW: Duration = Duration::from_secs(300);
 
+pub const ADMIN_CA_NAME: &str = "pgcluster-admin-ca";
+
 pub struct Ca {
     cert: Certificate,
     key: KeyPair,
@@ -89,7 +91,7 @@ impl Ca {
             return Self::from_pem(&cert, &key);
         }
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        let ca = Self::generate("pgcluster-admin-ca")?;
+        let ca = Self::generate(ADMIN_CA_NAME)?;
         let mut key_file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -109,6 +111,25 @@ impl Ca {
 
     pub fn key_pem(&self) -> String {
         self.key.serialize_pem()
+    }
+
+    /// Replace `ca.crt` and `ca.key` in `dir`, the key first, each in one step.
+    pub fn store(&self, dir: &Path) -> Result<()> {
+        let write = |name: &str, text: &str, mode: u32| -> Result<()> {
+            let tmp = dir.join(format!("{name}.tmp"));
+            let _ = std::fs::remove_file(&tmp);
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(&tmp)
+                .with_context(|| format!("create {}", tmp.display()))?;
+            file.write_all(text.as_bytes())
+                .with_context(|| format!("write {}", tmp.display()))?;
+            std::fs::rename(&tmp, dir.join(name)).with_context(|| format!("replace {name}"))
+        };
+        write("ca.key", &self.key.serialize_pem(), 0o600)?;
+        write("ca.crt", &self.cert_pem, 0o644)
     }
 
     /// The SHA-256 of the certificate's PEM text, carried in enrolment tokens.
@@ -205,6 +226,16 @@ mod tests {
         let first = Ca::load_or_create(dir.path()).unwrap();
         let second = Ca::load_or_create(dir.path()).unwrap();
         assert_eq!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
+    fn a_stored_ca_is_the_one_a_restart_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        Ca::load_or_create(dir.path()).unwrap();
+        let replacement = Ca::generate("another").unwrap();
+        replacement.store(dir.path()).unwrap();
+        let loaded = Ca::load_or_create(dir.path()).unwrap();
+        assert_eq!(loaded.fingerprint(), replacement.fingerprint());
     }
 
     #[test]

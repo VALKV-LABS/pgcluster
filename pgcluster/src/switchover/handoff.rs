@@ -74,15 +74,7 @@ pub async fn execute_switchover(
         tokio::time::sleep(drain_timeout).await;
     }
 
-    let new_host = new_cfg
-        .postgres_addr
-        .split(':')
-        .next()
-        .unwrap_or(&new_cfg.postgres_addr);
-    let conninfo_to_new = format!(
-        "host={} port=5432 user={} password={}",
-        new_host, replication_user, replication_password
-    );
+    let conninfo_to_new = new_cfg.conninfo(replication_user, replication_password);
 
     // ── Step 1: Demote current primary ───────────────────────────────────────
     // Writes standby.signal + primary_conninfo to PGDATA.  The running postgres

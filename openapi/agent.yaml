@@ -136,6 +136,71 @@ paths:
           $ref: "#/components/responses/Error"
         "401":
           $ref: "#/components/responses/Error"
+  /agent/v1/tasks/{id}/result:
+    post:
+      operationId: reportTaskResult
+      summary: Say how a task went. The first answer stands
+      tags: [state]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskResult"
+      responses:
+        "204":
+          description: Recorded.
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /agent/v1/repository-checks/{id}:
+    post:
+      operationId: reportRepositoryCheck
+      summary: Say whether this host could write to a backup repository
+      tags: [state]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RepositoryCheckResult"
+      responses:
+        "204":
+          description: Recorded.
+        "401":
+          $ref: "#/components/responses/Error"
+  /agent/v1/cluster:
+    post:
+      operationId: reportCluster
+      summary: Report what a cluster's Raft leader knows
+      description: Sent by the host of the leader. This is a record, and decides nothing.
+      tags: [state]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClusterReport"
+      responses:
+        "204":
+          description: Recorded.
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
   /agent/v1/operations/{id}/log:
     post:
       operationId: appendOperationLog
@@ -276,6 +341,165 @@ components:
           type: string
         api_key:
           type: string
+        next:
+          description: Passwords about to replace these, during a rotation.
+          oneOf:
+            - $ref: "#/components/schemas/NextPasswords"
+            - type: "null"
+    NextPasswords:
+      type: object
+      required: [superuser_password, replication_password, auth_password, api_key]
+      properties:
+        superuser_password:
+          type: string
+        replication_password:
+          type: string
+        auth_password:
+          type: string
+        api_key:
+          type: string
+    BackupTarget:
+      type: object
+      description: Where a database's backups live. Names no backup tool.
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [s3, posix]
+        path:
+          type: [string, "null"]
+        bucket:
+          type: [string, "null"]
+        prefix:
+          type: [string, "null"]
+        region:
+          type: [string, "null"]
+        endpoint:
+          type: [string, "null"]
+        path_style:
+          type: boolean
+        access_key_id:
+          type: [string, "null"]
+        secret_access_key:
+          type: [string, "null"]
+        encryption_key:
+          type: [string, "null"]
+          description: Base64, 32 bytes. Data is encrypted with it before it leaves the node.
+    BackupPolicy:
+      type: object
+      required: [target, retain_full]
+      properties:
+        target:
+          $ref: "#/components/schemas/BackupTarget"
+        retain_full:
+          type: integer
+          description: Full backups to keep, with what depends on them.
+    Restore:
+      type: object
+      required: [source, source_database]
+      properties:
+        source:
+          $ref: "#/components/schemas/BackupTarget"
+        target_time:
+          type: [string, "null"]
+          format: date-time
+        source_database:
+          type: string
+          description: The name the database has inside the backup.
+    Task:
+      type: object
+      description: |
+        One-off work. Every node of the database gets it, and only the node that
+        is the Raft leader or the Postgres primary runs it, since either can move.
+      required: [id, kind, "on", params]
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum:
+            - switchover
+            - rolling_restart
+            - replication_mode
+            - backup
+            - replace_member
+            - alter_passwords
+        "on":
+          type: string
+          enum: [leader, primary]
+        params:
+          type: object
+    TaskResult:
+      type: object
+      required: [success]
+      properties:
+        success:
+          type: boolean
+        error:
+          type: [string, "null"]
+        output: {}
+    RepositoryCheck:
+      type: object
+      required: [id, target]
+      properties:
+        id:
+          type: string
+        target:
+          $ref: "#/components/schemas/BackupTarget"
+    RepositoryCheckResult:
+      type: object
+      properties:
+        error:
+          type: [string, "null"]
+    AdminCa:
+      type: object
+      required: [bundle_pem, renew_client_certificate]
+      properties:
+        bundle_pem:
+          type: string
+          description: Trust exactly these for the agent API.
+        renew_client_certificate:
+          type: boolean
+          description: Ask for a client certificate from the CA now in use.
+    ClusterReport:
+      type: object
+      required: [database_id]
+      properties:
+        database_id:
+          type: string
+        primary:
+          type: [string, "null"]
+        sync_degraded:
+          type: boolean
+        needs_reseed:
+          type: array
+          items:
+            type: string
+        failovers:
+          type: array
+          items:
+            type: object
+        backups:
+          type: array
+          items:
+            $ref: "#/components/schemas/BackupReport"
+        backup_error:
+          type: [string, "null"]
+    BackupReport:
+      type: object
+      required: [id, label, completed_at, size_bytes]
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        completed_at:
+          type: integer
+          format: int64
+          description: Unix seconds.
+        size_bytes:
+          type: integer
+          format: int64
     Instance:
       type: object
       required:
@@ -286,8 +510,11 @@ components:
         - postgres_version
         - resources
         - port_base
+        - address
         - peers
         - bootstrap
+        - backup
+        - tasks
         - replication_mode
         - allowed_cidrs
         - extensions
@@ -315,13 +542,31 @@ components:
         port_base:
           type: integer
           description: First of ten consecutive ports.
+        address:
+          type: string
+          description: The address peers reach this node at.
         peers:
           type: array
+          description: The database's other nodes. Empty on a one-node database.
           items:
             $ref: "#/components/schemas/Peer"
         bootstrap:
           type: string
-          enum: [initdb]
+          enum: [initdb, seed, restore]
+          description: |
+            Where the node's first data comes from. A seeded node waits for the
+            Raft leader to fill it from the primary.
+        restore:
+          description: With `bootstrap` of `restore`.
+          oneOf:
+            - $ref: "#/components/schemas/Restore"
+            - type: "null"
+        backup:
+          $ref: "#/components/schemas/BackupPolicy"
+        tasks:
+          type: array
+          items:
+            $ref: "#/components/schemas/Task"
         replication_mode:
           $ref: "#/components/schemas/ReplicationMode"
         allowed_cidrs:
@@ -349,6 +594,16 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Instance"
+        repository_checks:
+          type: array
+          description: Repositories this host should prove it can write to.
+          items:
+            $ref: "#/components/schemas/RepositoryCheck"
+        admin_ca:
+          description: Set during a rotation of the admin CA.
+          oneOf:
+            - $ref: "#/components/schemas/AdminCa"
+            - type: "null"
     InstanceReport:
       type: object
       required: [database_id, node, observed_generation, state]
@@ -362,9 +617,13 @@ components:
           format: int64
         state:
           type: string
-          enum: [starting, running, failed]
+          enum: [starting, seeding, running, failed]
         error:
           type: [string, "null"]
+        archived_until:
+          type: [string, "null"]
+          format: date-time
+          description: Every commit before this is in the WAL archive. Only the primary reports it.
     Report:
       type: object
       required: [observed_generation, version, address, capacity, instances]
@@ -384,6 +643,9 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/InstanceReport"
+        ca_fingerprint:
+          type: string
+          description: The SHA-256 of the CA bundle this host trusts.
     LogEntry:
       type: object
       required: [message]

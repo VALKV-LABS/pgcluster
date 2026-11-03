@@ -72,20 +72,20 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 
 ## Part 7: Management plane, high availability (Stage 2)
 
-- [ ] **7.1 Create three-node databases.** The host firewall applies the allowlist, and peer ports accept only the database's own nodes. *Done when:* nodes land on separate hosts and failure domains, and a machine outside the database cannot reach its peer ports, by test.
-- [ ] **7.2 Expose replication modes through the API.** *Done when:* `PATCH` changes the mode online.
-- [ ] **7.3 Add node replacement.** Replace a node through the API, using 5.1 and 5.2. *Done when:* replacement completes under client load.
-- [ ] **7.4 Add the event feed.** `GET /v1/events`, including `replacement_needed`. *Done when:* tooling can react without polling every database.
-- [ ] **7.5 Add switchover and restart.** *Done when:* both run as operations with logs.
-- [ ] **7.6 Add the HA test suite.** *Done when:* primary loss, a network partition and node replacement pass in all three modes.
-- [ ] **7.7 Add secret rotation.** Covers the key that encrypts instance secrets, the admin CA, each database's CA, and instance internal passwords. *Done when:* each rotates under client load with no failed commits, and an old value stops working afterwards, by test.
+- [x] **7.1 Create three-node databases.** The host firewall applies the allowlist, and peer ports accept only the database's own nodes. *Done when:* nodes land on separate hosts and failure domains, and a machine outside the database cannot reach its peer ports, by test.
+- [x] **7.2 Expose replication modes through the API.** *Done when:* `PATCH` changes the mode online.
+- [x] **7.3 Add node replacement.** Replace a node through the API, using 5.1 and 5.2. *Done when:* replacement completes under client load.
+- [x] **7.4 Add the event feed.** `GET /v1/events`, including `replacement_needed`. *Done when:* tooling can react without polling every database.
+- [x] **7.5 Add switchover and restart.** *Done when:* both run as operations with logs.
+- [x] **7.6 Add the HA test suite.** *Done when:* primary loss, a network partition and node replacement pass in all three modes.
+- [x] **7.7 Add secret rotation.** Covers the key that encrypts instance secrets, the admin CA, each database's CA, and instance internal passwords. *Done when:* each rotates under client load with no failed commits, and an old value stops working afterwards, by test.
 
 ## Part 8: Management plane, backups (Stage 3)
 
-- [ ] **8.1 Add backup repositories.** S3-compatible and POSIX, with per-database libsodium encryption on the node before upload. *Done when:* a repository is verified when registered.
-- [ ] **8.2 Add the backup API.** Retention, on-demand backups, listing and the restore window. *Done when:* the window matches what can actually be restored.
-- [ ] **8.3 Add restore as a new database.** *Done when:* a restore to a chosen time is verified by automated test and the source stays up.
-- [ ] **8.4 Require a first backup before access.** *Done when:* no database becomes `active` without a restorable backup.
+- [x] **8.1 Add backup repositories.** S3-compatible and POSIX, with per-database libsodium encryption on the node before upload. *Done when:* a repository is verified when registered.
+- [x] **8.2 Add the backup API.** Retention, on-demand backups, listing and the restore window. *Done when:* the window matches what can actually be restored.
+- [x] **8.3 Add restore as a new database.** *Done when:* a restore to a chosen time is verified by automated test and the source stays up.
+- [x] **8.4 Require a first backup before access.** *Done when:* no database becomes `active` without a restorable backup.
 
 ## Part 9: Management plane, shared hosts (Stage 4)
 

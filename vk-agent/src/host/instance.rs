@@ -1,20 +1,25 @@
 //! Makes one instance match desired state. Every step checks before it acts, so
 //! a failure part way through is safe to retry.
 
+use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::{ConnectOptions, Connection, PgConnection};
 
 use super::client::AdminClient;
 use super::config::HostConfig;
+use super::firewall;
 use super::fsutil::{give_to, write_private_if_changed};
 use super::model::Instance;
 use super::render::{self, Layout, REPLICATION_USER, SUPERUSER};
+use super::restore::Restorer;
 use super::runner::{command_as, Processes, RunAs, Runner};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -22,12 +27,71 @@ const READY_POLL: Duration = Duration::from_millis(500);
 
 /// Marks a directory as an instance of this host, and records what has been
 /// applied to it. It holds no secrets beyond a verifier, which is not one.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Applied {
     pub host_id: String,
     pub generation: i64,
     pub verifier: String,
     pub extensions: Vec<String>,
+    /// The bootstrap ran to its end, so a restart must not repeat it.
+    #[serde(default)]
+    pub bootstrapped: bool,
+}
+
+/// How far an instance got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// It matches desired state.
+    Running,
+    /// It waits for the Raft leader to seed it, which can take hours, so the
+    /// host moves on and checks again.
+    Seeding,
+}
+
+/// The time, the WAL position, the last file archived, the segment size, and
+/// whether this is a standby.
+type WalPosition = (DateTime<Utc>, String, Option<String>, i64, bool);
+
+/// What a page header takes at the start of a WAL segment, which is where the
+/// position rests once an idle server has switched segments.
+const SEGMENT_HEADER: u64 = 40;
+/// Enough to span an archiver a few minutes behind.
+const MAX_SAMPLES: usize = 64;
+
+/// Recent pairs of a time and the WAL position then. Every commit before that
+/// time lies before that position, which is what ties a position to a time.
+#[derive(Debug, Default)]
+pub struct WalSamples {
+    samples: std::collections::VecDeque<(DateTime<Utc>, u64)>,
+}
+
+impl WalSamples {
+    fn record(&mut self, time: DateTime<Utc>, lsn: u64) {
+        self.samples.push_back((time, lsn));
+        if self.samples.len() > MAX_SAMPLES {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The newest time whose position the archive has reached.
+    fn covered_by(&self, archived_end: u64) -> Option<DateTime<Utc>> {
+        self.samples
+            .iter()
+            .rev()
+            .find(|(_, lsn)| lsn.saturating_sub(SEGMENT_HEADER) <= archived_end)
+            .map(|(time, _)| *time)
+    }
+}
+
+/// The position where `segment` ends, from a WAL file name. Other files the
+/// archiver handles, such as timeline histories, say nothing about position.
+fn archived_end(segment: &str, segment_size: u64) -> Option<u64> {
+    if segment.len() != 24 || !segment.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let high = u64::from_str_radix(&segment[8..16], 16).ok()?;
+    let low = u64::from_str_radix(&segment[16..24], 16).ok()?;
+    Some((high << 32) + (low + 1) * segment_size)
 }
 
 pub fn read_applied(layout: &Layout) -> Option<Applied> {
@@ -41,11 +105,11 @@ fn write_applied(layout: &Layout, applied: &Applied, run_as: Option<RunAs>) -> R
     Ok(())
 }
 
-fn quote_literal(text: &str) -> String {
+pub(super) fn quote_literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
-fn quote_ident(text: &str) -> String {
+pub(super) fn quote_ident(text: &str) -> String {
     format!("\"{}\"", text.replace('"', "\"\""))
 }
 
@@ -76,7 +140,28 @@ impl InstanceManager<'_> {
         })
     }
 
-    pub async fn apply(&self, instance: &Instance) -> Result<()> {
+    /// Every address that may reach this instance's peer ports. Peers can be
+    /// named, but `pg_hba.conf` and nftables want addresses.
+    async fn node_addresses(&self, instance: &Instance) -> Result<Vec<IpAddr>> {
+        if !instance.ha() {
+            return Ok(vec![]);
+        }
+        let mut addresses = BTreeSet::new();
+        let names = instance
+            .peers
+            .iter()
+            .map(|peer| peer.address.as_str())
+            .chain([instance.address.as_str()]);
+        for name in names {
+            let found = tokio::net::lookup_host((name, 0))
+                .await
+                .with_context(|| format!("resolve {name}"))?;
+            addresses.extend(found.map(|socket| socket.ip()));
+        }
+        Ok(addresses.into_iter().collect())
+    }
+
+    pub async fn apply(&self, instance: &Instance) -> Result<Progress> {
         instance.validate()?;
         let processes = self.processes(&instance.id(), &instance.postgres_version)?;
         let layout = &processes.layout;
@@ -100,45 +185,73 @@ impl InstanceManager<'_> {
             write_applied(layout, &marker, self.run_as)?;
         }
 
-        let files = self.write_files(instance, layout, &pg_bin)?;
-        let first_start = self.initialize(instance, layout, &pg_bin).await?;
+        let nodes = self.node_addresses(instance).await?;
+        self.apply_firewall(instance, &nodes).await?;
+        self.prepare_repository(instance)?;
+        let files = self.write_files(instance, layout, &pg_bin, &nodes)?;
+        let applied = previous.unwrap_or_default();
+        let first_start = self.initialize(instance, layout, &pg_bin, &applied).await?;
         let conf_changed = write_private_if_changed(
-            &layout.data().join("pgcluster-managed.conf"),
+            &layout.postgres_conf(),
             &render::managed_conf(instance, layout),
-            self.run_as,
-        )?;
-        write_private_if_changed(
-            &layout.data().join("pg_hba.conf"),
-            &render::pg_hba(),
             self.run_as,
         )?;
 
         self.runner.install(&processes).await?;
+        // A reload that failed is owed, though the files no longer change.
+        let owed = layout.reload_owed();
+        let files = FilesChanged {
+            reload: files.reload || owed.exists(),
+            proxy_config: files.proxy_config,
+        };
+        if files.reload || files.proxy_config {
+            write_private_if_changed(&owed, "", self.run_as)?;
+        }
         if !self.runner.is_running(&processes).await? {
             self.runner.start(&processes).await?;
-        } else if conf_changed || files.restart {
+        } else if conf_changed && !instance.ha() {
             self.client
                 .log(instance.operation_id.as_deref(), "restarting the instance")
                 .await;
             self.runner.restart(&processes).await?;
-        } else if files.certificate {
+        } else if files.reload {
             // Reloads the allowlist too, so a change to both needs only this.
-            self.reload_certificates(instance, &processes).await?;
+            self.reload_all(instance, &processes).await?;
         } else if files.proxy_config {
             self.runner.reload_proxy(&processes).await?;
         }
+        // With peers, the restart is a rolling one, which the Raft leader runs
+        // when `pgcluster-admin` asks: restarting here would stop every node.
+        std::fs::remove_file(&owed).ok();
+
+        if !layout.data().join("PG_VERSION").exists() {
+            return Ok(Progress::Seeding);
+        }
+        self.write_pgpass(instance, layout)?;
 
         let mut postgres = self.connect_ready(instance, "postgres").await?;
-        let applied = previous.unwrap_or_default();
-        self.apply_roles(&mut postgres, instance, &applied).await?;
-        postgres.close().await.ok();
-
-        let mut database = self
-            .connect_ready(instance, &instance.database_name)
-            .await?;
-        self.apply_extensions(&mut database, instance, &applied)
-            .await?;
-        database.close().await.ok();
+        let in_recovery: bool = sqlx::query_scalar("SELECT pg_is_in_recovery()")
+            .fetch_one(&mut postgres)
+            .await
+            .context("ask whether this is a standby")?;
+        // Replication carries everything below to standbys, which cannot write.
+        // A standby keeps the old record, so that if it is promoted before the
+        // primary finished, the health check notices and it finishes the job.
+        let mut record = applied.clone();
+        if !in_recovery {
+            self.apply_roles(&mut postgres, instance, &applied).await?;
+            postgres.close().await.ok();
+            let mut database = self
+                .connect_ready(instance, &instance.database_name)
+                .await?;
+            self.apply_extensions(&mut database, instance, &applied)
+                .await?;
+            database.close().await.ok();
+            record.verifier = instance.owner.scram_verifier.clone();
+            record.extensions = instance.extensions.clone();
+        } else {
+            postgres.close().await.ok();
+        }
 
         self.wait_for_proxy(instance).await?;
         if first_start {
@@ -146,20 +259,122 @@ impl InstanceManager<'_> {
                 .log(instance.operation_id.as_deref(), "instance is ready")
                 .await;
         }
-        write_applied(
-            layout,
-            &Applied {
-                host_id: self.client.host_id.clone(),
-                generation: instance.generation,
-                verifier: instance.owner.scram_verifier.clone(),
-                extensions: instance.extensions.clone(),
-            },
-            self.run_as,
+        record.host_id = self.client.host_id.clone();
+        record.generation = instance.generation;
+        record.bootstrapped = true;
+        write_applied(layout, &record, self.run_as)?;
+        Ok(Progress::Running)
+    }
+
+    /// Whether this node's Postgres is the primary.
+    pub async fn is_primary(&self, instance: &Instance) -> bool {
+        for password in self.passwords(instance) {
+            let options = self.connect_options(instance, "postgres", password);
+            let Ok(mut postgres) = PgConnection::connect_with(&options).await else {
+                continue;
+            };
+            let in_recovery: Result<bool, _> = sqlx::query_scalar("SELECT pg_is_in_recovery()")
+                .fetch_one(&mut postgres)
+                .await;
+            postgres.close().await.ok();
+            return matches!(in_recovery, Ok(false));
+        }
+        false
+    }
+
+    /// The time every commit before it had reached the WAL archive, by comparing
+    /// `samples` of the WAL position with what the archiver has finished.
+    pub async fn archived_until(
+        &self,
+        instance: &Instance,
+        samples: &mut WalSamples,
+    ) -> Option<DateTime<Utc>> {
+        let password = self.passwords(instance)[0];
+        let options = self.connect_options(instance, "postgres", password);
+        let mut postgres = PgConnection::connect_with(&options).await.ok()?;
+        let row: Result<WalPosition, _> = sqlx::query_as(
+            "SELECT now(), pg_current_wal_insert_lsn()::text, a.last_archived_wal, \
+                    pg_size_bytes(current_setting('wal_segment_size')), pg_is_in_recovery() \
+             FROM pg_stat_archiver a",
         )
+        .fetch_one(&mut postgres)
+        .await;
+        postgres.close().await.ok();
+        let (now, lsn, archived, segment_size, in_recovery) = row.ok()?;
+        if in_recovery {
+            return None;
+        }
+        samples.record(now, crate::postgres::parse_lsn(&lsn).ok()?);
+        samples.covered_by(archived_end(archived.as_deref()?, segment_size as u64)?)
+    }
+
+    /// Whether this node has become the primary with changes left to apply.
+    pub async fn has_work_left(&self, instance: &Instance, layout: &Layout) -> bool {
+        let Some(applied) = read_applied(layout) else {
+            return false;
+        };
+        let current = applied.verifier == instance.owner.scram_verifier
+            && applied.extensions == instance.extensions;
+        if current || !layout.data().join("PG_VERSION").exists() {
+            return false;
+        }
+        self.is_primary(instance).await
+    }
+
+    /// WAL-G needs a directory repository's root to exist before it writes.
+    fn prepare_repository(&self, instance: &Instance) -> Result<()> {
+        if let Some(path) = &instance.backup.target.path {
+            std::fs::create_dir_all(path).with_context(|| format!("create {path}"))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("secure {path}"))?;
+            give_to(Path::new(path), self.run_as)?;
+        }
+        Ok(())
+    }
+
+    async fn apply_firewall(&self, instance: &Instance, nodes: &[IpAddr]) -> Result<()> {
+        let allowed_cidrs = instance
+            .allowed_cidrs
+            .iter()
+            .map(|cidr| cidr.parse().context("parse a CIDR block"))
+            .collect::<Result<Vec<ipnet::IpNet>>>()?;
+        firewall::apply(
+            self.config.firewall,
+            &firewall::Rules {
+                instance_id: &instance.id(),
+                proxy_port: render::proxy_port(instance),
+                peer_ports: render::peer_ports(instance),
+                peers: nodes,
+                allowed_cidrs: &allowed_cidrs,
+            },
+        )
+        .await
+    }
+
+    /// A standby reads this file when it reconnects, so a new replication
+    /// password has to reach it.
+    fn write_pgpass(&self, instance: &Instance, layout: &Layout) -> Result<()> {
+        let path = layout.data().join(".pgpass");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let Some((entry, _)) = text.trim_end().rsplit_once(':') else {
+            return Ok(());
+        };
+        let password = &instance.secrets.replication_password;
+        let updated = format!("{entry}:{password}\n");
+        write_private_if_changed(&path, &updated, self.run_as)?;
+        Ok(())
     }
 
     fn prepare_directories(&self, layout: &Layout) -> Result<()> {
-        for dir in [&layout.dir, &layout.raft(), &layout.tls(), &layout.logs()] {
+        for dir in [
+            &layout.dir,
+            &layout.raft(),
+            &layout.tls(),
+            &layout.logs(),
+            &layout.socket_dir(),
+        ] {
             std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
                 .with_context(|| format!("secure {}", dir.display()))?;
@@ -173,65 +388,105 @@ impl InstanceManager<'_> {
         instance: &Instance,
         layout: &Layout,
         pg_bin: &str,
+        nodes: &[IpAddr],
     ) -> Result<FilesChanged> {
         let secrets = &instance.secrets;
         let tls = layout.tls();
-        let mut restart =
+        // Each of these reloads. Written first, and certificates before what
+        // reads them, so nothing is told to load a file that is not there yet.
+        let mut reload =
             write_private_if_changed(&tls.join("ca.crt"), &secrets.ca_cert_pem, self.run_as)?;
-        // Both are in place before anything is told to read them.
-        let mut certificate =
-            write_private_if_changed(&tls.join("node.key"), &secrets.key_pem, self.run_as)?;
-        certificate |=
-            write_private_if_changed(&tls.join("node.crt"), &secrets.cert_pem, self.run_as)?;
-        restart |= write_private_if_changed(
+        reload |= write_private_if_changed(&tls.join("node.key"), &secrets.key_pem, self.run_as)?;
+        reload |= write_private_if_changed(&tls.join("node.crt"), &secrets.cert_pem, self.run_as)?;
+        reload |= write_private_if_changed(
             &layout.agent_config(),
             &render::agent_toml(instance, layout, pg_bin),
             self.run_as,
         )?;
-        restart |=
+        reload |=
             write_private_if_changed(&layout.env_file(), &render::env_file(instance), self.run_as)?;
+        reload |= write_private_if_changed(&layout.pg_hba(), &render::pg_hba(nodes), self.run_as)?;
         let proxy_config = write_private_if_changed(
             &layout.pgcluster_config(),
             &render::pgcluster_toml(instance, layout),
             self.run_as,
         )?;
         Ok(FilesChanged {
-            restart,
-            certificate,
+            reload,
             proxy_config,
         })
     }
 
-    /// Move every process to a renewed certificate. Nothing restarts, so clients
-    /// stay connected.
-    async fn reload_certificates(&self, instance: &Instance, processes: &Processes) -> Result<()> {
+    /// Move every process to new certificates, passwords and peers. Nothing
+    /// restarts, so clients stay connected.
+    async fn reload_all(&self, instance: &Instance, processes: &Processes) -> Result<()> {
         self.runner.reload_certificates(processes).await?;
-        let output = command_as(&processes.pg_ctl, self.run_as)
-            .arg("reload")
-            .arg("-D")
-            .arg(processes.layout.data())
-            .output()
-            .await
-            .context("run pg_ctl")?;
-        if !output.status.success() {
-            bail!(
-                "pg_ctl reload failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        if processes.layout.data().join("postmaster.pid").exists() {
+            let output = command_as(&processes.pg_ctl, self.run_as)
+                .arg("reload")
+                .arg("-D")
+                .arg(processes.layout.data())
+                .output()
+                .await
+                .context("run pg_ctl")?;
+            if !output.status.success() {
+                bail!(
+                    "pg_ctl reload failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
         }
         self.client
             .log(
                 instance.operation_id.as_deref(),
-                "loaded the new certificate",
+                "loaded new settings with no restart",
             )
             .await;
         Ok(())
     }
 
-    /// Create the data directory once. Returns whether this call did.
-    async fn initialize(&self, instance: &Instance, layout: &Layout, pg_bin: &str) -> Result<bool> {
+    /// Create the data directory once. Returns whether this call did. A seeded
+    /// node waits for the Raft leader, which fills it through `vk-agent`.
+    async fn initialize(
+        &self,
+        instance: &Instance,
+        layout: &Layout,
+        pg_bin: &str,
+        applied: &Applied,
+    ) -> Result<bool> {
         let data = layout.data();
-        if data.join("PG_VERSION").exists() {
+        if let ("restore", Some(restore), false) = (
+            instance.bootstrap.as_str(),
+            &instance.restore,
+            applied.bootstrapped,
+        ) {
+            self.client
+                .log(instance.operation_id.as_deref(), "restoring from backup")
+                .await;
+            Restorer {
+                instance,
+                restore,
+                layout,
+                pg_bin,
+                walg_path: &self.config.walg_path,
+                run_as: self.run_as,
+            }
+            .run()
+            .await?;
+            write_applied(
+                layout,
+                &Applied {
+                    host_id: self.client.host_id.clone(),
+                    verifier: instance.owner.scram_verifier.clone(),
+                    extensions: applied.extensions.clone(),
+                    bootstrapped: true,
+                    ..Default::default()
+                },
+                self.run_as,
+            )?;
+            return Ok(true);
+        }
+        if instance.bootstrap != "initdb" || data.join("PG_VERSION").exists() {
             return Ok(false);
         }
         // A crash during initdb leaves a partial directory, which initdb refuses.
@@ -266,12 +521,6 @@ impl InstanceManager<'_> {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        use std::io::Write;
-        let mut conf = std::fs::OpenOptions::new()
-            .append(true)
-            .open(data.join("postgresql.conf"))
-            .context("open postgresql.conf")?;
-        writeln!(conf, "include = 'pgcluster-managed.conf'").context("extend postgresql.conf")?;
         self.client
             .log(
                 instance.operation_id.as_deref(),
@@ -281,12 +530,17 @@ impl InstanceManager<'_> {
         Ok(true)
     }
 
-    fn connect_options(&self, instance: &Instance, database: &str) -> PgConnectOptions {
+    fn connect_options(
+        &self,
+        instance: &Instance,
+        database: &str,
+        password: &str,
+    ) -> PgConnectOptions {
         PgConnectOptions::new()
             .host("127.0.0.1")
             .port(render::postgres_port(instance))
             .username(SUPERUSER)
-            .password(&instance.secrets.superuser_password)
+            .password(password)
             .database(database)
             .ssl_mode(PgSslMode::VerifyFull)
             .ssl_root_cert_from_pem(instance.secrets.ca_cert_pem.clone().into_bytes())
@@ -295,18 +549,31 @@ impl InstanceManager<'_> {
 
     /// Connect as the superuser, waiting for Postgres to come up. The database
     /// does not exist on the first pass, so that case fails fast.
-    async fn connect_ready(&self, instance: &Instance, database: &str) -> Result<PgConnection> {
-        let options = self.connect_options(instance, database);
+    pub async fn connect_ready(&self, instance: &Instance, database: &str) -> Result<PgConnection> {
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
-            match PgConnection::connect_with(&options).await {
-                Ok(connection) => return Ok(connection),
-                Err(e) if Instant::now() >= deadline => {
-                    return Err(e).with_context(|| format!("connect to {database}"))
+            // During a rotation the role may already have moved to the next one.
+            let mut last = None;
+            for password in self.passwords(instance) {
+                let options = self.connect_options(instance, database, password);
+                match PgConnection::connect_with(&options).await {
+                    Ok(connection) => return Ok(connection),
+                    Err(e) => last = Some(e),
                 }
-                Err(_) => tokio::time::sleep(READY_POLL).await,
             }
+            if Instant::now() >= deadline {
+                return Err(last.expect("at least one password"))
+                    .with_context(|| format!("connect to {database}"));
+            }
+            tokio::time::sleep(READY_POLL).await;
         }
+    }
+
+    fn passwords<'i>(&self, instance: &'i Instance) -> Vec<&'i str> {
+        let secrets = &instance.secrets;
+        let mut passwords = vec![secrets.superuser_password.as_str()];
+        passwords.extend(secrets.next.iter().map(|n| n.superuser_password.as_str()));
+        passwords
     }
 
     async fn apply_roles(
@@ -329,6 +596,20 @@ impl InstanceManager<'_> {
             .execute(&mut *postgres)
             .await
             .context("create the replication role")?;
+            // What pg_rewind reads from the primary.
+            for function in [
+                "pg_ls_dir(text, boolean, boolean)",
+                "pg_stat_file(text, boolean)",
+                "pg_read_binary_file(text)",
+                "pg_read_binary_file(text, bigint, bigint, boolean)",
+            ] {
+                sqlx::query(&format!(
+                    "GRANT EXECUTE ON FUNCTION {function} TO {REPLICATION_USER}"
+                ))
+                .execute(&mut *postgres)
+                .await
+                .context("grant rewind access")?;
+            }
         }
 
         let owner = &instance.owner;
@@ -393,7 +674,18 @@ impl InstanceManager<'_> {
             }
         }
         let owner = quote_ident(&instance.owner.username);
+        let loaded: String =
+            sqlx::query_scalar("SELECT current_setting('shared_preload_libraries')")
+                .fetch_one(&mut *database)
+                .await
+                .context("read the preloaded libraries")?;
         for extension in &instance.extensions {
+            // On a three-node database, the rolling restart comes first, and
+            // the operation applies a new generation after it.
+            if render::needs_preload(extension) && !loaded.split(',').any(|l| l.trim() == extension)
+            {
+                continue;
+            }
             sqlx::query(&format!(
                 "CREATE EXTENSION IF NOT EXISTS {}",
                 quote_ident(extension)
@@ -478,6 +770,7 @@ impl InstanceManager<'_> {
             .unwrap_or_else(|_| "18".into());
         let processes = self.processes(id, &version)?;
         self.runner.remove(&processes).await?;
+        firewall::remove(self.config.firewall, id).await?;
         tokio::fs::remove_dir_all(&layout.dir)
             .await
             .with_context(|| format!("remove {}", layout.dir.display()))?;
@@ -487,10 +780,8 @@ impl InstanceManager<'_> {
 }
 
 struct FilesChanged {
-    /// Something a running process read at startup.
-    restart: bool,
-    /// The node's own certificate, which running processes can reload.
-    certificate: bool,
+    /// Certificates, passwords or peers, which running processes can reload.
+    reload: bool,
     /// `pgcluster.toml`, which holds the allowlist.
     proxy_config: bool,
 }
@@ -498,6 +789,46 @@ struct FilesChanged {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SEGMENT: u64 = 16 * 1024 * 1024;
+
+    #[test]
+    fn a_segment_name_gives_the_position_it_ends_at() {
+        let end = archived_end("000000010000000000000002", SEGMENT);
+        assert_eq!(end, Some(3 * SEGMENT));
+        let end = archived_end("000000020000000100000000", SEGMENT);
+        assert_eq!(end, Some((1 << 32) + SEGMENT));
+    }
+
+    #[test]
+    fn files_that_are_not_segments_say_nothing() {
+        assert_eq!(archived_end("00000002.history", SEGMENT), None);
+        let backup = "000000010000000000000002.00000028.backup";
+        assert_eq!(archived_end(backup, SEGMENT), None);
+    }
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(seconds, 0).unwrap()
+    }
+
+    #[test]
+    fn a_time_counts_only_once_the_archive_reaches_its_position() {
+        let mut samples = WalSamples::default();
+        samples.record(at(1), SEGMENT);
+        samples.record(at(2), SEGMENT + 500);
+        samples.record(at(3), 2 * SEGMENT + 500);
+        assert_eq!(samples.covered_by(SEGMENT), Some(at(1)));
+        assert_eq!(samples.covered_by(2 * SEGMENT), Some(at(2)));
+        assert_eq!(samples.covered_by(3 * SEGMENT), Some(at(3)));
+        assert_eq!(samples.covered_by(SEGMENT / 2), None);
+    }
+
+    #[test]
+    fn an_idle_server_keeps_its_window_current() {
+        let mut samples = WalSamples::default();
+        samples.record(at(9), SEGMENT + SEGMENT_HEADER);
+        assert_eq!(samples.covered_by(SEGMENT), Some(at(9)));
+    }
 
     #[test]
     fn quoting_escapes() {
@@ -517,6 +848,7 @@ mod tests {
             generation: 3,
             verifier: "v".into(),
             extensions: vec!["vector".into()],
+            bootstrapped: true,
         };
         write_applied(&layout, &applied, None).unwrap();
         let back = read_applied(&layout).unwrap();

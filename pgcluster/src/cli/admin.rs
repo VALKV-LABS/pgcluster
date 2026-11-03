@@ -11,7 +11,8 @@ use crate::proxy::scram::make_verifier;
 
 const SCRAM_ITERATIONS: u32 = 4096;
 const WAIT_POLL: Duration = Duration::from_secs(2);
-const WAIT_TIMEOUT: Duration = Duration::from_secs(660);
+/// Seeding and backing up take as long as the data does.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(6 * 3600 + 60);
 
 #[derive(Args, Clone)]
 pub struct AdminConnection {
@@ -63,6 +64,68 @@ pub struct DatabaseArgs {
     command: DatabaseCommand,
 }
 
+#[derive(Args)]
+pub struct RepositoryArgs {
+    #[command(flatten)]
+    connection: AdminConnection,
+    #[command(subcommand)]
+    command: RepositoryCommand,
+}
+
+#[derive(Subcommand)]
+enum RepositoryCommand {
+    /// Register a repository in a directory every host can reach
+    AddPosix { name: String, path: String },
+    /// Register an S3-compatible repository
+    AddS3 {
+        name: String,
+        bucket: String,
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long)]
+        region: Option<String>,
+        /// For stores other than AWS
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long)]
+        path_style: bool,
+        /// Left out, hosts use their instance role
+        #[arg(long, env = "AWS_ACCESS_KEY_ID", hide_env_values = true)]
+        access_key_id: Option<String>,
+        #[arg(long, env = "AWS_SECRET_ACCESS_KEY", hide_env_values = true)]
+        secret_access_key: Option<String>,
+    },
+    /// List repositories
+    List,
+    /// Remove a repository no database uses
+    Delete { id: String },
+}
+
+#[derive(Args)]
+pub struct EventArgs {
+    #[command(flatten)]
+    connection: AdminConnection,
+    /// Show only what came after this cursor
+    #[arg(long)]
+    after: Option<String>,
+}
+
+#[derive(Args)]
+pub struct AdminCaArgs {
+    #[command(flatten)]
+    connection: AdminConnection,
+    #[command(subcommand)]
+    command: AdminCaCommand,
+}
+
+#[derive(Subcommand)]
+enum AdminCaCommand {
+    /// Show what to trust, and how far a rotation has got
+    Show,
+    /// Start replacing the admin CA
+    Rotate,
+}
+
 #[derive(Subcommand)]
 enum DatabaseCommand {
     /// Create a database, generating the owner's password on this machine
@@ -98,6 +161,80 @@ enum DatabaseCommand {
         #[arg(long)]
         wait: bool,
     },
+    /// Change the replication mode online: async, sync or sync_strict
+    Mode {
+        id: String,
+        mode: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Change how many days of restore window to keep
+    Retention {
+        id: String,
+        days: u32,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Hand the primary role to a standby
+    Switchover {
+        id: String,
+        /// The node to hand over to. Left out, the most current standby
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Restart Postgres one node at a time
+    Restart {
+        id: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Replace a node, bringing up the new one first
+    Replace {
+        id: String,
+        node: String,
+        /// Host to move to, by ID or name
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// List a database's nodes
+    Nodes { id: String },
+    /// Take a backup now
+    Backup {
+        id: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// List backups
+    Backups { id: String },
+    /// Show the earliest and latest times a restore can reach
+    RestoreWindow { id: String },
+    /// Restore to a point in time, as a new database
+    Restore {
+        id: String,
+        /// Name of the new database
+        name: String,
+        /// RFC 3339 time, within the restore window
+        #[arg(long)]
+        time: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Replace the database's CA and node certificates
+    RotateCa {
+        id: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Replace the database's internal passwords
+    RotatePasswords {
+        id: String,
+        #[arg(long)]
+        wait: bool,
+    },
 }
 
 #[derive(Args)]
@@ -121,9 +258,21 @@ struct CreateArgs {
     /// Extension to install. Repeat for more
     #[arg(long = "extension")]
     extensions: Vec<String>,
-    /// Host to place the database on, by ID or name
+    /// Three nodes with automatic failover
     #[arg(long)]
-    host: Option<String>,
+    ha: bool,
+    /// Replication mode, with --ha: async, sync or sync_strict
+    #[arg(long)]
+    mode: Option<String>,
+    /// Host to place a node on, by ID or name. Repeat for each node
+    #[arg(long = "host")]
+    hosts: Vec<String>,
+    /// Backup repository. With only one registered, that one
+    #[arg(long)]
+    repository: Option<String>,
+    /// Days of restore window to keep
+    #[arg(long, default_value_t = 7)]
+    retention_days: u32,
     /// Opaque label for grouping databases
     #[arg(long)]
     workspace: Option<String>,
@@ -207,6 +356,17 @@ impl AdminClient {
         }
     }
 
+    async fn show(&self, path: &str) -> Result<()> {
+        pretty(&self.send("GET", path, None).await?)
+    }
+
+    /// Start an operation that takes no arguments.
+    async fn act(&self, id: &str, action: &str, wait: bool) -> Result<()> {
+        let path = format!("/v1/databases/{id}/{action}");
+        let operation = self.send("POST", &path, None).await?;
+        self.finish(&operation, wait).await
+    }
+
     async fn finish(&self, operation: &Value, wait: bool) -> Result<()> {
         if wait {
             self.wait(operation).await?;
@@ -272,7 +432,21 @@ pub async fn run_host(args: HostArgs) -> Result<()> {
     }
 }
 
+/// The repository a command names, or the only one there is.
+async fn choose_repository(client: &AdminClient, named: Option<String>) -> Result<String> {
+    if let Some(id) = named {
+        return Ok(id);
+    }
+    let list = client.send("GET", "/v1/backup-repositories", None).await?;
+    match list["items"].as_array().map(Vec::as_slice) {
+        Some([only]) => Ok(text(only, "id").to_string()),
+        Some([]) => bail!("register a repository first, with pgcluster repository add-posix"),
+        _ => bail!("several repositories exist, so name one with --repository"),
+    }
+}
+
 async fn create_database(client: &AdminClient, args: CreateArgs) -> Result<()> {
+    let repository = choose_repository(client, args.repository).await?;
     let (password, verifier) = generate_password();
     let mut body = json!({
         "name": args.name,
@@ -285,9 +459,14 @@ async fn create_database(client: &AdminClient, args: CreateArgs) -> Result<()> {
         "owner": { "username": args.owner, "scram_verifier": verifier },
         "allowed_cidrs": args.allowed_cidrs,
         "extensions": args.extensions,
+        "ha": args.ha,
+        "backup": { "repository_id": repository, "retention_days": args.retention_days },
     });
-    if let Some(host) = args.host {
-        body["hosts"] = json!([host]);
+    if !args.hosts.is_empty() {
+        body["hosts"] = json!(args.hosts);
+    }
+    if let Some(mode) = args.mode {
+        body["replication_mode"] = json!(mode);
     }
     if let Some(workspace) = args.workspace {
         body["workspace"] = json!(workspace);
@@ -374,6 +553,118 @@ pub async fn run_database(args: DatabaseArgs) -> Result<()> {
                 .await?;
             client.finish(&operation, wait).await
         }
+        DatabaseCommand::Mode { id, mode, wait } => {
+            let body = json!({ "replication_mode": mode });
+            let path = format!("/v1/databases/{id}");
+            let operation = client.send("PATCH", &path, Some(body)).await?;
+            client.finish(&operation, wait).await
+        }
+        DatabaseCommand::Retention { id, days, wait } => {
+            let body = json!({ "retention_days": days });
+            let path = format!("/v1/databases/{id}");
+            let operation = client.send("PATCH", &path, Some(body)).await?;
+            client.finish(&operation, wait).await
+        }
+        DatabaseCommand::Switchover { id, target, wait } => {
+            let path = format!("/v1/databases/{id}/switchover");
+            let body = json!({ "target": target });
+            let operation = client.send("POST", &path, Some(body)).await?;
+            client.finish(&operation, wait).await
+        }
+        DatabaseCommand::Replace {
+            id,
+            node,
+            host,
+            wait,
+        } => {
+            let path = format!("/v1/databases/{id}/nodes/{node}/replace");
+            let body = json!({ "host_id": host });
+            let operation = client.send("POST", &path, Some(body)).await?;
+            client.finish(&operation, wait).await
+        }
+        DatabaseCommand::Restore {
+            id,
+            name,
+            time,
+            wait,
+        } => {
+            let path = format!("/v1/databases/{id}/restore");
+            let body = json!({ "name": name, "target_time": time });
+            let operation = client.send("POST", &path, Some(body)).await?;
+            println!("database {}", text(&operation, "database_id"));
+            client.finish(&operation, wait).await
+        }
+        DatabaseCommand::Restart { id, wait } => client.act(&id, "restart", wait).await,
+        DatabaseCommand::Backup { id, wait } => client.act(&id, "backup", wait).await,
+        DatabaseCommand::RotateCa { id, wait } => client.act(&id, "rotate-ca", wait).await,
+        DatabaseCommand::RotatePasswords { id, wait } => {
+            client.act(&id, "rotate-passwords", wait).await
+        }
+        DatabaseCommand::Nodes { id } => client.show(&format!("/v1/databases/{id}/nodes")).await,
+        DatabaseCommand::Backups { id } => {
+            client.show(&format!("/v1/databases/{id}/backups")).await
+        }
+        DatabaseCommand::RestoreWindow { id } => {
+            client
+                .show(&format!("/v1/databases/{id}/restore-window"))
+                .await
+        }
+    }
+}
+
+pub async fn run_repository(args: RepositoryArgs) -> Result<()> {
+    let client = AdminClient::new(&args.connection)?;
+    let path = "/v1/backup-repositories";
+    match args.command {
+        RepositoryCommand::AddPosix { name, path: dir } => {
+            let body = json!({ "name": name, "type": "posix", "path": dir });
+            pretty(&client.send("POST", path, Some(body)).await?)
+        }
+        RepositoryCommand::AddS3 {
+            name,
+            bucket,
+            prefix,
+            region,
+            endpoint,
+            path_style,
+            access_key_id,
+            secret_access_key,
+        } => {
+            let body = json!({
+                "name": name,
+                "type": "s3",
+                "bucket": bucket,
+                "prefix": prefix,
+                "region": region,
+                "endpoint": endpoint,
+                "path_style": path_style,
+                "access_key_id": access_key_id,
+                "secret_access_key": secret_access_key,
+            });
+            pretty(&client.send("POST", path, Some(body)).await?)
+        }
+        RepositoryCommand::List => client.show(path).await,
+        RepositoryCommand::Delete { id } => {
+            client.send("DELETE", &format!("{path}/{id}"), None).await?;
+            println!("deleted");
+            Ok(())
+        }
+    }
+}
+
+pub async fn run_events(args: EventArgs) -> Result<()> {
+    let client = AdminClient::new(&args.connection)?;
+    match args.after {
+        Some(after) => client.show(&format!("/v1/events?after={after}")).await,
+        None => client.show("/v1/events").await,
+    }
+}
+
+pub async fn run_admin_ca(args: AdminCaArgs) -> Result<()> {
+    let client = AdminClient::new(&args.connection)?;
+    match args.command {
+        AdminCaCommand::Show => client.show("/v1/admin-ca").await,
+        AdminCaCommand::Rotate => pretty(&client.send("POST", "/v1/admin-ca/rotate", None).await?),
     }
 }
 

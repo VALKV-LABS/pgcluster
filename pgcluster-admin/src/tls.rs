@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::http::Request;
 use axum::Router;
@@ -18,9 +19,17 @@ use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 use x509_parser::prelude::*;
 
-use crate::ca::{Ca, Issued};
+use crate::ca::Issued;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A listener's TLS settings. A rotation of the admin CA swaps them, and open
+/// connections keep theirs.
+pub type SharedAcceptor = Arc<ArcSwap<TlsAcceptor>>;
+
+pub fn shared(acceptor: TlsAcceptor) -> SharedAcceptor {
+    Arc::new(ArcSwap::from_pointee(acceptor))
+}
 
 /// The host ID on the caller's client certificate, if it presented one.
 #[derive(Clone, Debug)]
@@ -48,13 +57,16 @@ pub fn server_tls(issued: &Issued) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-/// TLS for the agent API. A client certificate is optional here because a host
-/// has none until it enrols; `agent::Host` requires one on every later route.
-pub fn agent_tls(ca: &Ca, issued: &Issued) -> Result<TlsAcceptor> {
+/// TLS for the agent API, trusting client certificates from `cas`. One is
+/// optional here because a host has none until it enrols; `agent::Host` requires
+/// one on every later route.
+pub fn agent_tls(cas: &[&str], issued: &Issued) -> Result<TlsAcceptor> {
     let (certs, key) = parse_identity(issued)?;
     let mut roots = RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
-        roots.add(cert.context("parse CA")?).context("add CA")?;
+    for mut pem in cas.iter().map(|pem| pem.as_bytes()) {
+        for cert in rustls_pemfile::certs(&mut pem) {
+            roots.add(cert.context("parse CA")?).context("add CA")?;
+        }
     }
     let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
         .allow_unauthenticated()
@@ -74,7 +86,7 @@ fn host_from_cert(cert: &CertificateDer<'_>) -> Option<String> {
 }
 
 /// Accept connections until the task is dropped.
-pub async fn serve(listener: TcpListener, acceptor: TlsAcceptor, app: Router) {
+pub async fn serve(listener: TcpListener, acceptor: SharedAcceptor, app: Router) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -84,7 +96,7 @@ pub async fn serve(listener: TcpListener, acceptor: TlsAcceptor, app: Router) {
                 continue;
             }
         };
-        let acceptor = acceptor.clone();
+        let acceptor = acceptor.load_full();
         let app = app.clone();
         tokio::spawn(async move {
             if let Err(e) = serve_connection(stream, peer, acceptor, app).await {
@@ -97,7 +109,7 @@ pub async fn serve(listener: TcpListener, acceptor: TlsAcceptor, app: Router) {
 async fn serve_connection(
     stream: tokio::net::TcpStream,
     _peer: SocketAddr,
-    acceptor: TlsAcceptor,
+    acceptor: Arc<TlsAcceptor>,
     app: Router,
 ) -> Result<()> {
     let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))

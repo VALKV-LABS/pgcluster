@@ -162,7 +162,7 @@ paths:
   /v1/backup-repositories:
     post:
       operationId: createBackupRepository
-      summary: "Register a backup repository"
+      summary: "Register a backup repository, once a host has proved it can write to it"
       tags: [backups]
       x-stage: 3
       requestBody:
@@ -366,6 +366,61 @@ paths:
     post:
       operationId: switchoverDatabase
       summary: "Hand the primary role to a standby"
+      tags: [databases]
+      x-stage: 2
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Switchover"
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/rotate-ca:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: rotateDatabaseCa
+      summary: "Replace the CA and every node certificate, under load"
+      tags: [databases]
+      x-stage: 2
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/rotate-passwords:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: rotateDatabasePasswords
+      summary: "Replace the internal passwords and the API key, under load"
       tags: [databases]
       x-stage: 2
       responses:
@@ -882,6 +937,43 @@ paths:
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
+  /v1/admin-ca:
+    get:
+      operationId: getAdminCa
+      summary: "Read what to trust, and how far a rotation has got"
+      tags: [operations]
+      x-stage: 2
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminCa"
+        "401":
+          $ref: "#/components/responses/Error"
+  /v1/admin-ca/rotate:
+    post:
+      operationId: rotateAdminCa
+      summary: "Start replacing the admin CA"
+      description: |
+        Moves through three phases, each once every enrolled host has caught up,
+        so a host that stays away holds the rotation open. API clients must trust
+        `bundle_pem` before the second phase, which changes this service's
+        certificate.
+      tags: [operations]
+      x-stage: 2
+      responses:
+        "202":
+          description: Accepted. `GET /v1/admin-ca` tracks it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminCa"
+        "401":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
   /v1/events:
     get:
       operationId: listEvents
@@ -1039,7 +1131,7 @@ components:
           minimum: 1
     CreateDatabase:
       type: object
-      required: [name, version, resources, owner]
+      required: [name, version, resources, owner, backup]
       properties:
         name:
           type: string
@@ -1053,12 +1145,12 @@ components:
         ha:
           type: boolean
           default: false
-          description: Three nodes with automatic failover. Stage 2.
+          description: Three nodes with automatic failover, one per failure domain.
         hosts:
           type: array
           items:
             type: string
-          description: Host IDs or names. When left out, the most free host is chosen.
+          description: Host IDs or names, one per node. When left out, the most free hosts are chosen.
         resources:
           $ref: "#/components/schemas/Resources"
         replication_mode:
@@ -1079,12 +1171,14 @@ components:
         backup:
           allOf:
             - $ref: "#/components/schemas/BackupPolicy"
-          description: Stage 3.
+          description: A database goes active only once it has a restorable backup.
     UpdateDatabase:
       type: object
       properties:
         resources:
-          $ref: "#/components/schemas/Resources"
+          allOf:
+            - $ref: "#/components/schemas/Resources"
+          description: Answers `not_supported` until stage 5.
         replication_mode:
           $ref: "#/components/schemas/ReplicationMode"
         retention_days:
@@ -1159,12 +1253,55 @@ components:
           nullable: true
           allOf:
             - $ref: "#/components/schemas/Endpoint"
+          description: One node's proxy, on a host that is online.
+        endpoints:
+          type: array
+          description: Every node's proxy. Each routes writes to the primary.
+          items:
+            $ref: "#/components/schemas/NodeAddress"
+        backup:
+          $ref: "#/components/schemas/BackupPolicy"
+        primary:
+          type: string
+          nullable: true
+          description: The node the cluster last reported as primary. The cluster decides this.
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+    NodeAddress:
+      type: object
+      required: [host, port]
+      properties:
+        host:
+          type: string
+        port:
+          type: integer
+    Switchover:
+      type: object
+      properties:
+        target:
+          type: string
+          description: The node to hand over to. When left out, the most current standby.
+    AdminCa:
+      type: object
+      required: [bundle_pem, waiting_for]
+      properties:
+        phase:
+          type: string
+          nullable: true
+          enum: [trust, issue, trim, null]
+          description: Nothing when no rotation is running.
+        bundle_pem:
+          type: string
+          description: Every CA to trust at the moment.
+        waiting_for:
+          type: array
+          description: Hosts the current phase is waiting for.
+          items:
+            type: string
     OwnerPassword:
       type: object
       required: [scram_verifier]
@@ -1224,7 +1361,7 @@ components:
           format: int64
         state:
           type: string
-          enum: [pending, starting, running, failed]
+          enum: [pending, starting, seeding, running, failed]
         error:
           type: string
           nullable: true
@@ -1244,7 +1381,18 @@ components:
           type: string
         kind:
           type: string
-          enum: [create, delete, update]
+          enum:
+            - create
+            - update
+            - rolling_update
+            - replication_mode
+            - delete
+            - restart
+            - switchover
+            - backup
+            - replace
+            - rotate_ca
+            - rotate_passwords
         status:
           type: string
           enum: [pending, running, succeeded, failed]
@@ -1312,10 +1460,29 @@ components:
         type:
           type: string
           enum: [s3, posix]
-      additionalProperties: true
+        path:
+          type: string
+          description: For `posix`, an absolute path every host can reach.
+        bucket:
+          type: string
+          description: For `s3`.
+        prefix:
+          type: string
+        region:
+          type: string
+        endpoint:
+          type: string
+          description: For stores other than AWS.
+        path_style:
+          type: boolean
+        access_key_id:
+          type: string
+          description: With `secret_access_key`. Left out, hosts use their instance role.
+        secret_access_key:
+          type: string
     BackupRepository:
       type: object
-      required: [id, name, type]
+      required: [id, name, type, config, status, created_at]
       properties:
         id:
           type: string
@@ -1324,15 +1491,29 @@ components:
         type:
           type: string
           enum: [s3, posix]
+        config:
+          type: object
+          description: Where it is. Credentials are never returned.
+        status:
+          type: string
+          enum: [verifying, verified, failed]
+        created_at:
+          type: string
+          format: date-time
     Backup:
       type: object
-      required: [id, finished_at]
+      required: [id, label, finished_at, size_bytes]
       properties:
         id:
+          type: string
+        label:
           type: string
         finished_at:
           type: string
           format: date-time
+        size_bytes:
+          type: integer
+          format: int64
     RestoreDatabase:
       type: object
       required: [name, target_time]
@@ -1342,6 +1523,11 @@ components:
         target_time:
           type: string
           format: date-time
+          description: Within the restore window.
+        hosts:
+          type: array
+          items:
+            type: string
     RestoreWindow:
       type: object
       required: [earliest, latest]
@@ -1380,6 +1566,11 @@ components:
         database_id:
           type: string
           nullable: true
+        node:
+          type: string
+          nullable: true
+        detail:
+          type: object
         at:
           type: string
           format: date-time

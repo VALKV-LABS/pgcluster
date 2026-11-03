@@ -155,7 +155,7 @@ pub async fn create(
             host: fetch(&state, &id).await?,
             // The token carries the CA's hash, so a new host can trust the
             // server with nothing else copied to it.
-            enrollment_token: format!("{secret}.{}", state.ca.fingerprint()),
+            enrollment_token: format!("{secret}.{}", state.ca().fingerprint()),
             expires_at,
         }),
     ))

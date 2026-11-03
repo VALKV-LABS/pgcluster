@@ -39,6 +39,22 @@ pub struct HostConfig {
     pub systemd_unit_dir: String,
     #[serde(default = "default_report_interval")]
     pub report_interval_seconds: u64,
+    /// How this host enforces which machines reach an instance's ports.
+    #[serde(default)]
+    pub firewall: FirewallKind,
+    /// Path to the WAL-G binary.
+    #[serde(default = "default_walg_path")]
+    pub walg_path: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FirewallKind {
+    /// One nftables table per instance. Needs `nft` and root.
+    #[default]
+    Nftables,
+    /// Leave ports open, for development on one machine.
+    None,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +84,9 @@ fn default_unit_dir() -> String {
 }
 fn default_report_interval() -> u64 {
     15
+}
+fn default_walg_path() -> String {
+    "wal-g".into()
 }
 
 impl HostConfig {

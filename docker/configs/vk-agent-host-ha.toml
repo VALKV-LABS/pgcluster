@@ -1,0 +1,8 @@
+admin_url             = "https://pgcluster-admin:8444"
+state_dir             = "/var/lib/vk-agent-host"
+instances_dir         = "/var/lib/pgcluster/instances"
+enrollment_token_file = "/run/enrollment-token"
+# With no advertise_address, each host reports the address it reaches admin from.
+runner                = "plain"
+run_as                = "postgres"
+report_interval_seconds = 5

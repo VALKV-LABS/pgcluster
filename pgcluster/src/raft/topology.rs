@@ -59,6 +59,29 @@ impl NodeConfig {
     /// It never votes, never takes part in synchronous commit, is never promoted
     /// by a failover, and takes no backups. `POST /api/nodes/:id/detach` turns it
     /// into an independent database.
+    /// A libpq conninfo that reaches this node's Postgres as `user`.
+    pub fn conninfo(&self, user: &str, password: &str) -> String {
+        let (host, port) = self.postgres_host_port();
+        format!("host={host} port={port} user={user} password={password}")
+    }
+
+    /// Whether a `primary_conninfo` already points at this node's Postgres.
+    pub fn is_target_of(&self, conninfo: &str) -> bool {
+        let (host, port) = self.postgres_host_port();
+        let has = |key: &str, value: &str| {
+            conninfo
+                .split_whitespace()
+                .any(|token| token.strip_prefix(key) == Some(value))
+        };
+        has("host=", host) && has("port=", port)
+    }
+
+    fn postgres_host_port(&self) -> (&str, &str) {
+        self.postgres_addr
+            .rsplit_once(':')
+            .unwrap_or((&self.postgres_addr, "5432"))
+    }
+
     pub fn is_external(&self) -> bool {
         self.tags.get("role").is_some_and(|r| r == EXTERNAL_ROLE)
     }
@@ -276,6 +299,34 @@ pub fn format_lsn(lsn: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(postgres_addr: &str) -> NodeConfig {
+        NodeConfig {
+            node_id: "n2".into(),
+            agent_addr: "10.0.0.2:20004".into(),
+            postgres_addr: postgres_addr.into(),
+            priority: 90,
+            tags: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_conninfo_carries_the_nodes_own_port() {
+        let conninfo = at("10.0.0.2:20012").conninfo("replicator", "pw");
+        assert_eq!(
+            conninfo,
+            "host=10.0.0.2 port=20012 user=replicator password=pw"
+        );
+    }
+
+    #[test]
+    fn only_an_exact_host_and_port_is_the_same_target() {
+        let node = at("10.0.0.2:20012");
+        assert!(node.is_target_of("user=r host=10.0.0.2 port=20012 sslmode=prefer"));
+        assert!(!node.is_target_of("host=10.0.0.2 port=20022"));
+        assert!(!node.is_target_of("host=10.0.0.21 port=20012"));
+        assert!(!node.is_target_of(""));
+    }
 
     fn nodes(ids: &[&str], primary: &str) -> ClusterTopology {
         let mut t = ClusterTopology {

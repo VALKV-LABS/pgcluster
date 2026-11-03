@@ -27,7 +27,21 @@ COPY vk-agent ./vk-agent
 RUN touch pgcluster/src/main.rs pgcluster/src/lib.rs vk-agent/src/main.rs vk-agent/src/lib.rs && \
     cargo build --release --bin vk-agent --bin pgcluster
 
-# Stage 2: Postgres, the extensions PGDG packages, and pg_tle, which it does not.
+# Stage 2: WAL-G, pinned and checked, as in vk-agent.Dockerfile.
+FROM debian:bookworm-slim AS walg
+ARG WALG_VERSION=v3.0.9
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
+    case "${TARGETARCH}" in \
+      amd64) asset=amd64; sum=d6795c663894d836ba20840bffe8970aed81bbe25d3151bd4951f6f9c362def9 ;; \
+      arm64) asset=aarch64; sum=072eb4a4a119f817e1fa888c64a776b01e3453b2e0d967a67d149adb18fde652 ;; \
+      *) echo "unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL -o /wal-g "https://github.com/wal-g/wal-g/releases/download/${WALG_VERSION}/wal-g-pg-22.04-${asset}" && \
+    echo "${sum}  /wal-g" | sha256sum -c - && \
+    chmod 755 /wal-g
+
+# Stage 3: Postgres, the extensions PGDG packages, and pg_tle, which it does not.
 FROM postgres:18-bookworm AS postgres
 ARG PG_TLE_VERSION=v1.5.3
 ARG PG_TLE_SHA256=90cd505bd2b427911f16c738bafeb3b8029d7b30194df9518270d94e06fc791e
@@ -52,12 +66,13 @@ RUN apt-get update && \
     for v in 16 17 18; do apt-get purge -y postgresql-server-dev-$v; done && \
     apt-get purge -y build-essential libkrb5-dev libssl-dev flex bison && \
     apt-get autoremove -y --purge && \
-    apt-get install -y --no-install-recommends ca-certificates iproute2 systemd systemd-sysv && \
+    apt-get install -y --no-install-recommends ca-certificates iproute2 nftables systemd systemd-sysv && \
     rm -rf /var/lib/apt/lists/*
 
-# Stage 3: runtime
+# Stage 4: runtime
 FROM postgres AS runtime
 COPY --from=builder /build/target/release/vk-agent /usr/local/bin/vk-agent
 COPY --from=builder /build/target/release/pgcluster /usr/local/bin/pgcluster
+COPY --from=walg /wal-g /usr/local/bin/wal-g
 ENTRYPOINT ["/usr/local/bin/vk-agent"]
 CMD ["host", "/etc/vk-agent/host.toml"]
