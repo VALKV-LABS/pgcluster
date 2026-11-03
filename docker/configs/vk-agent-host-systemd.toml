@@ -6,3 +6,5 @@ advertise_address     = "localhost"
 runner                = "systemd"
 run_as                = "postgres"
 report_interval_seconds = 5
+# One machine, so there is nobody to keep out, and no privilege to do it with.
+firewall              = "none"

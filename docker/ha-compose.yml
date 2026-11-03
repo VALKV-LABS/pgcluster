@@ -1,0 +1,102 @@
+# Hosts for three-node databases, on top of admin-compose.yml: five machines in
+# four failure domains, each running its own firewall. Only the HA tests start
+# them, through the `ha` profile.
+#
+# Hosts have fixed addresses, so that a test can cut one off from the others.
+# host-ha-5 shares rack-a with host-ha-1, to show placement keeps them apart.
+
+x-ha-host: &ha-host
+  build:
+    context: ..
+    dockerfile: docker/host.Dockerfile
+  profiles: [ha]
+  depends_on:
+    pgcluster-admin:
+      condition: service_healthy
+  init: true
+  entrypoint: ["/bin/sh", "/usr/local/bin/host-entry.sh"]
+  command: ["vk-agent", "host", "/etc/vk-agent/host.toml"]
+  cap_add:
+    - NET_ADMIN
+  healthcheck:
+    test: ["CMD-SHELL", "test -f /var/lib/vk-agent-host/host_id"]
+    interval: 2s
+    timeout: 5s
+    retries: 30
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.31.77.0/24
+
+services:
+  pgcluster-admin:
+    volumes:
+      - ./configs/pgcluster-admin-ha.toml:/etc/pgcluster-admin/config.toml:ro
+      - admin-ca:/ca
+
+  host-ha-1:
+    <<: *ha-host
+    environment:
+      HOST_TOKEN_SECRET: dev-host-token-ha-1
+    volumes:
+      - ./host-entry.sh:/usr/local/bin/host-entry.sh:ro
+      - ./configs/vk-agent-host-ha.toml:/etc/vk-agent/host.toml:ro
+      - admin-ca:/ca:ro
+      - admin-backups:/backups
+    networks:
+      default:
+        ipv4_address: 172.31.77.11
+
+  host-ha-2:
+    <<: *ha-host
+    environment:
+      HOST_TOKEN_SECRET: dev-host-token-ha-2
+    volumes:
+      - ./host-entry.sh:/usr/local/bin/host-entry.sh:ro
+      - ./configs/vk-agent-host-ha.toml:/etc/vk-agent/host.toml:ro
+      - admin-ca:/ca:ro
+      - admin-backups:/backups
+    networks:
+      default:
+        ipv4_address: 172.31.77.12
+
+  host-ha-3:
+    <<: *ha-host
+    environment:
+      HOST_TOKEN_SECRET: dev-host-token-ha-3
+    volumes:
+      - ./host-entry.sh:/usr/local/bin/host-entry.sh:ro
+      - ./configs/vk-agent-host-ha.toml:/etc/vk-agent/host.toml:ro
+      - admin-ca:/ca:ro
+      - admin-backups:/backups
+    networks:
+      default:
+        ipv4_address: 172.31.77.13
+
+  host-ha-4:
+    <<: *ha-host
+    environment:
+      HOST_TOKEN_SECRET: dev-host-token-ha-4
+    volumes:
+      - ./host-entry.sh:/usr/local/bin/host-entry.sh:ro
+      - ./configs/vk-agent-host-ha.toml:/etc/vk-agent/host.toml:ro
+      - admin-ca:/ca:ro
+      - admin-backups:/backups
+    networks:
+      default:
+        ipv4_address: 172.31.77.14
+
+  host-ha-5:
+    <<: *ha-host
+    environment:
+      HOST_TOKEN_SECRET: dev-host-token-ha-5
+    volumes:
+      - ./host-entry.sh:/usr/local/bin/host-entry.sh:ro
+      - ./configs/vk-agent-host-ha.toml:/etc/vk-agent/host.toml:ro
+      - admin-ca:/ca:ro
+      - admin-backups:/backups
+    networks:
+      default:
+        ipv4_address: 172.31.77.15

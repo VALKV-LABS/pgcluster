@@ -7,6 +7,7 @@ use tokio::process::Command;
 pub struct PgCtl {
     pg_ctl_path: String,
     data_dir: String,
+    config_file: Option<String>,
 }
 
 impl PgCtl {
@@ -14,7 +15,18 @@ impl PgCtl {
         Self {
             pg_ctl_path: pg_ctl_path.to_owned(),
             data_dir: data_dir.to_owned(),
+            config_file: None,
         }
+    }
+
+    /// Start Postgres from `path`, in place of the data directory's config.
+    pub fn with_config_file(mut self, path: Option<String>) -> Self {
+        self.config_file = path;
+        self
+    }
+
+    pub fn config_file(&self) -> Option<&str> {
+        self.config_file.as_deref()
     }
 
     /// pg_ctl stop -D data_dir -m fast
@@ -32,12 +44,17 @@ impl PgCtl {
     }
 
     /// pg_ctl start -D data_dir, waiting until Postgres accepts connections.
-    /// Runs the data directory's own configuration.
     pub async fn start(&self) -> Result<()> {
         let log = format!("{}/startup.log", self.data_dir);
-        self.run_pg_ctl(&["start", "-D", &self.data_dir, "-l", &log, "-w", "-t", "600"])
-            .await
-            .context("pg_ctl start failed")
+        let mut args = vec!["start", "-D", &self.data_dir, "-l", &log, "-w", "-t", "600"];
+        let options = self
+            .config_file
+            .as_ref()
+            .map(|path| format!("--config-file='{path}'"));
+        if let Some(options) = &options {
+            args.extend(["-o", options]);
+        }
+        self.run_pg_ctl(&args).await.context("pg_ctl start failed")
     }
 
     /// The path of another Postgres program, from the same directory as pg_ctl.

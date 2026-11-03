@@ -2,8 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashSet;
+
 use crate::error::ApiError;
-use crate::secrets::{DatabaseSecrets, NodeSecrets};
+use crate::secrets::{DatabaseSecrets, NextPasswords, NodeSecrets, RepositoryCredentials};
 
 /// The extensions on the node image, by `CREATE EXTENSION` name.
 pub const EXTENSIONS: &[&str] = &[
@@ -18,7 +20,15 @@ pub const EXTENSIONS: &[&str] = &[
     "pg_cron",
 ];
 
+/// Those that must be in `shared_preload_libraries` to install.
+pub const NEEDS_PRELOAD: &[&str] = &["pg_tle", "pg_cron"];
+
 const POSTGRES_VERSIONS: &[&str] = &["16", "17", "18"];
+
+/// Three, because pgcluster needs three Raft voters for quorum.
+pub const HA_NODES: usize = 3;
+
+pub const REPLICATION_MODES: &[&str] = &["async", "sync", "sync_strict"];
 
 /// Names `pgcluster` and Postgres keep for themselves.
 const RESERVED_ROLES: &[&str] = &["postgres", "replicator", "pgcluster_auth", "public", "none"];
@@ -48,6 +58,32 @@ pub struct DatabaseSpec {
     pub allowed_cidrs: Vec<String>,
     pub extensions: Vec<String>,
     pub owner: Owner,
+    pub backup: BackupSettings,
+    /// Set when this database begins as a copy of another's backups.
+    #[serde(default)]
+    pub restore: Option<RestoreSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupSettings {
+    pub repository_id: String,
+    pub retention_days: u32,
+}
+
+impl BackupSettings {
+    /// Weekly full backups, with one to spare so that a window of this many
+    /// days survives the deletion of the oldest.
+    pub fn retain_full(&self) -> u32 {
+        self.retention_days.div_ceil(7) + 1
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestoreSource {
+    pub database_id: String,
+    pub database_name: String,
+    pub target_time: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,41 +105,36 @@ pub struct CreateDatabase {
     pub allowed_cidrs: Vec<String>,
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// A database becomes active only once it has a restorable backup, so this
+    /// is required.
+    pub backup: BackupSettings,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateDatabase {
     #[serde(default)]
-    pub backup: Option<serde_json::Value>,
+    pub resources: Option<Resources>,
+    #[serde(default)]
+    pub replication_mode: Option<String>,
+    #[serde(default)]
+    pub retention_days: Option<u32>,
 }
 
 impl CreateDatabase {
     /// Check the request, and turn it into the stored spec.
     pub fn into_spec(self) -> Result<(String, Option<String>, DatabaseSpec), ApiError> {
-        check_identifier("name", &self.name)?;
-        if RESERVED_DATABASES.contains(&self.name.as_str()) {
-            return Err(ApiError::invalid(format!(
-                "name {:?} is reserved",
-                self.name
-            )));
-        }
+        check_database_name(&self.name)?;
         if !POSTGRES_VERSIONS.contains(&self.version.as_str()) {
             return Err(ApiError::invalid(format!(
                 "version must be one of {}",
                 POSTGRES_VERSIONS.join(", ")
             )));
         }
-        if self.ha {
-            return Err(ApiError::not_supported(
-                "three-node databases are not available yet",
-            ));
-        }
-        if self.backup.is_some() {
-            return Err(ApiError::not_supported("backups are not available yet"));
-        }
         let mode = self.replication_mode.as_deref().unwrap_or("async");
-        if mode != "async" {
-            return Err(ApiError::invalid("replication_mode needs ha: true"));
-        }
-        if self.hosts.len() > 1 {
-            return Err(ApiError::invalid("a one-node database takes one host"));
-        }
+        check_replication_mode(mode, self.ha)?;
+        check_hosts(&self.hosts, self.ha)?;
+        check_retention(self.backup.retention_days)?;
         let r = &self.resources;
         if !(r.vcpu > 0.0 && r.memory_gb > 0.0 && r.storage_gb > 0.0) {
             return Err(ApiError::invalid("resources must all be above zero"));
@@ -120,8 +151,171 @@ impl CreateDatabase {
             allowed_cidrs: self.allowed_cidrs,
             extensions: self.extensions,
             owner: self.owner,
+            backup: self.backup,
+            restore: None,
         };
         Ok((self.name, self.workspace, spec))
+    }
+}
+
+pub fn check_database_name(name: &str) -> Result<(), ApiError> {
+    check_identifier("name", name)?;
+    if RESERVED_DATABASES.contains(&name) {
+        return Err(ApiError::invalid(format!("name {name:?} is reserved")));
+    }
+    Ok(())
+}
+
+pub fn check_replication_mode(mode: &str, ha: bool) -> Result<(), ApiError> {
+    if !REPLICATION_MODES.contains(&mode) {
+        return Err(ApiError::invalid(format!(
+            "replication_mode must be one of {}",
+            REPLICATION_MODES.join(", ")
+        )));
+    }
+    if mode != "async" && !ha {
+        return Err(ApiError::invalid("replication_mode needs ha: true"));
+    }
+    Ok(())
+}
+
+pub fn check_retention(days: u32) -> Result<(), ApiError> {
+    if days == 0 {
+        return Err(ApiError::invalid("retention_days must be at least 1"));
+    }
+    Ok(())
+}
+
+pub fn check_hosts(hosts: &[String], ha: bool) -> Result<(), ApiError> {
+    let wanted = if ha { HA_NODES } else { 1 };
+    if !hosts.is_empty() && ((ha && hosts.len() != wanted) || hosts.len() > wanted) {
+        return Err(ApiError::invalid(if ha {
+            "a three-node database takes three hosts, or none to choose for you"
+        } else {
+            "a one-node database takes one host"
+        }));
+    }
+    if hosts.iter().collect::<HashSet<_>>().len() != hosts.len() {
+        return Err(ApiError::invalid("each node needs a host of its own"));
+    }
+    Ok(())
+}
+
+/// Choose hosts for `count` nodes from `candidates`, best first: one for each
+/// failure domain. A host with no domain is a domain of its own.
+pub fn choose_hosts<T>(
+    candidates: Vec<T>,
+    count: usize,
+    domain: impl Fn(&T) -> String,
+) -> Option<Vec<T>> {
+    let mut used = HashSet::new();
+    let chosen: Vec<T> = candidates
+        .into_iter()
+        .filter(|host| used.insert(domain(host)))
+        .take(count)
+        .collect();
+    (chosen.len() == count).then_some(chosen)
+}
+
+/// The number of a node's name, which is also its Raft ID.
+pub fn node_number(node: &str) -> i32 {
+    node.strip_prefix('n')
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateRepository {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub bucket: Option<String>,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub path_style: bool,
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
+}
+
+/// A repository's location. Its credentials are held apart, encrypted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepositoryConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub path_style: bool,
+}
+
+impl CreateRepository {
+    pub fn into_parts(
+        self,
+    ) -> Result<(String, String, RepositoryConfig, RepositoryCredentials), ApiError> {
+        check_host_name(&self.name)?;
+        let plain = |value: &Option<String>| {
+            value
+                .as_deref()
+                .is_none_or(|v| !v.contains(['\'', '\\', '\n', '\r']))
+        };
+        if !plain(&self.path) || !plain(&self.bucket) || !plain(&self.prefix) {
+            return Err(ApiError::invalid(
+                "path, bucket and prefix cannot hold quotes",
+            ));
+        }
+        match self.kind.as_str() {
+            "posix" => {
+                if !self.path.as_deref().is_some_and(|p| p.starts_with('/')) {
+                    return Err(ApiError::invalid(
+                        "a posix repository needs an absolute path",
+                    ));
+                }
+            }
+            "s3" => {
+                if self.bucket.as_deref().is_none_or(str::is_empty) {
+                    return Err(ApiError::invalid("an s3 repository needs a bucket"));
+                }
+            }
+            _ => return Err(ApiError::invalid("type must be s3 or posix")),
+        }
+        if self.access_key_id.is_some() != self.secret_access_key.is_some() {
+            return Err(ApiError::invalid(
+                "set both access_key_id and secret_access_key, or neither to use an instance role",
+            ));
+        }
+        Ok((
+            self.name,
+            self.kind,
+            RepositoryConfig {
+                path: self.path,
+                bucket: self.bucket,
+                prefix: self.prefix,
+                region: self.region,
+                endpoint: self.endpoint,
+                path_style: self.path_style,
+            },
+            RepositoryCredentials {
+                access_key_id: self.access_key_id,
+                secret_access_key: self.secret_access_key,
+            },
+        ))
     }
 }
 
@@ -220,6 +414,87 @@ pub fn check_host_name(name: &str) -> Result<(), ApiError> {
 pub struct DesiredState {
     pub generation: i64,
     pub instances: Vec<Instance>,
+    pub repository_checks: Vec<RepositoryCheck>,
+    pub admin_ca: Option<AdminCa>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminCa {
+    pub bundle_pem: String,
+    pub renew_client_certificate: bool,
+}
+
+/// A repository as a node reaches it.
+#[derive(Clone, Serialize)]
+pub struct BackupTarget {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(flatten)]
+    pub config: RepositoryConfig,
+    #[serde(flatten)]
+    pub credentials: RepositoryCredentials,
+    pub encryption_key: Option<String>,
+}
+
+impl BackupTarget {
+    /// Each database keeps its backups under its own ID.
+    pub fn for_database(
+        kind: &str,
+        mut config: RepositoryConfig,
+        credentials: RepositoryCredentials,
+        database_id: &str,
+        encryption_key: String,
+    ) -> Self {
+        let under = |base: Option<String>| {
+            let base = base.unwrap_or_default();
+            format!("{}/{database_id}", base.trim_end_matches('/'))
+        };
+        if kind == "posix" {
+            config.path = Some(under(config.path));
+        } else {
+            config.prefix = Some(under(config.prefix).trim_start_matches('/').to_string());
+        }
+        Self {
+            kind: kind.to_string(),
+            config,
+            credentials,
+            encryption_key: Some(encryption_key),
+        }
+    }
+}
+
+impl std::fmt::Debug for BackupTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BackupTarget({})", self.kind)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RepositoryCheck {
+    pub id: String,
+    pub target: BackupTarget,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InstanceBackup {
+    pub target: BackupTarget,
+    pub retain_full: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InstanceRestore {
+    pub source: BackupTarget,
+    pub target_time: Option<String>,
+    pub source_database: String,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct Task {
+    pub id: String,
+    pub kind: String,
+    #[sqlx(rename = "run_on")]
+    pub on: String,
+    pub params: sqlx::types::Json<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -232,8 +507,12 @@ pub struct Instance {
     pub postgres_version: String,
     pub resources: Resources,
     pub port_base: i32,
+    pub address: String,
     pub peers: Vec<Peer>,
     pub bootstrap: String,
+    pub restore: Option<InstanceRestore>,
+    pub backup: InstanceBackup,
+    pub tasks: Vec<Task>,
     pub replication_mode: String,
     pub allowed_cidrs: Vec<String>,
     pub extensions: Vec<String>,
@@ -257,18 +536,20 @@ pub struct InstanceSecrets {
     pub replication_password: String,
     pub auth_password: String,
     pub api_key: String,
+    pub next: Option<NextPasswords>,
 }
 
 impl InstanceSecrets {
     pub fn merge(database: DatabaseSecrets, node: NodeSecrets) -> Self {
         Self {
-            ca_cert_pem: database.ca_cert_pem,
+            ca_cert_pem: database.ca_bundle(),
             cert_pem: node.cert_pem,
             key_pem: node.key_pem,
             superuser_password: database.superuser_password,
             replication_password: database.replication_password,
             auth_password: database.auth_password,
             api_key: database.api_key,
+            next: database.next,
         }
     }
 }
@@ -286,6 +567,49 @@ pub struct Report {
     pub address: String,
     pub capacity: Resources,
     pub instances: Vec<InstanceReport>,
+    #[serde(default)]
+    pub ca_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaskResult {
+    pub success: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub output: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RepositoryCheckResult {
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// What a cluster's Raft leader reports.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClusterReport {
+    pub database_id: String,
+    #[serde(default)]
+    pub primary: Option<String>,
+    #[serde(default)]
+    pub sync_degraded: bool,
+    #[serde(default)]
+    pub needs_reseed: Vec<String>,
+    #[serde(default)]
+    pub failovers: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub backups: Vec<BackupReport>,
+    #[serde(default)]
+    pub backup_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackupReport {
+    pub id: String,
+    pub label: String,
+    pub completed_at: i64,
+    pub size_bytes: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -296,6 +620,8 @@ pub struct InstanceReport {
     pub state: String,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub archived_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[cfg(test)]
@@ -323,7 +649,10 @@ mod tests {
             },
             allowed_cidrs: vec!["198.51.100.0/24".into()],
             extensions: vec!["vector".into()],
-            backup: None,
+            backup: BackupSettings {
+                repository_id: "repo-1".into(),
+                retention_days: 7,
+            },
         }
     }
 
@@ -365,16 +694,138 @@ mod tests {
     }
 
     #[test]
-    fn what_later_stages_deliver_says_so() {
-        let err = rejected(|r| r.ha = true);
-        assert_eq!(err.code, "not_supported");
-        let err = rejected(|r| r.backup = Some(serde_json::json!({})));
-        assert_eq!(err.code, "not_supported");
+    fn replication_modes_need_ha() {
+        rejected(|r| r.replication_mode = Some("sync".into()));
+        let mut r = request();
+        r.ha = true;
+        r.replication_mode = Some("sync_strict".into());
+        assert_eq!(r.into_spec().unwrap().2.replication_mode, "sync_strict");
     }
 
     #[test]
-    fn replication_modes_need_ha() {
-        rejected(|r| r.replication_mode = Some("sync".into()));
+    fn an_unknown_replication_mode_is_refused() {
+        rejected(|r| {
+            r.ha = true;
+            r.replication_mode = Some("fast".into());
+        });
+    }
+
+    #[test]
+    fn hosts_must_suit_the_size_of_the_database() {
+        let hosts = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        rejected(|r| r.hosts = hosts(&["a", "b"]));
+        rejected(|r| {
+            r.ha = true;
+            r.hosts = hosts(&["a", "b"]);
+        });
+        rejected(|r| {
+            r.ha = true;
+            r.hosts = hosts(&["a", "b", "b"]);
+        });
+        let mut r = request();
+        r.ha = true;
+        r.hosts = hosts(&["a", "b", "c"]);
+        assert!(r.into_spec().is_ok());
+    }
+
+    #[test]
+    fn nodes_land_in_separate_failure_domains() {
+        let hosts = vec![("a", "r1"), ("b", "r1"), ("c", "r2"), ("d", "r3")];
+        let chosen = choose_hosts(hosts, 3, |h| h.1.to_string()).unwrap();
+        assert_eq!(chosen, vec![("a", "r1"), ("c", "r2"), ("d", "r3")]);
+    }
+
+    #[test]
+    fn two_domains_cannot_hold_three_nodes() {
+        let hosts = vec![("a", "r1"), ("b", "r1"), ("c", "r2")];
+        assert!(choose_hosts(hosts, 3, |h| h.1.to_string()).is_none());
+    }
+
+    #[test]
+    fn a_retention_period_keeps_whole_weeks_and_one_more() {
+        let retain = |retention_days| {
+            BackupSettings {
+                repository_id: String::new(),
+                retention_days,
+            }
+            .retain_full()
+        };
+        assert_eq!(retain(1), 2);
+        assert_eq!(retain(7), 2);
+        assert_eq!(retain(8), 3);
+        assert_eq!(retain(30), 6);
+    }
+
+    #[test]
+    fn a_repository_is_checked_for_what_its_type_needs() {
+        let repository = |kind: &str| CreateRepository {
+            name: "main".into(),
+            kind: kind.into(),
+            path: None,
+            bucket: None,
+            prefix: None,
+            region: None,
+            endpoint: None,
+            path_style: false,
+            access_key_id: None,
+            secret_access_key: None,
+        };
+        assert!(repository("posix").into_parts().is_err());
+        assert!(repository("s3").into_parts().is_err());
+        assert!(repository("ftp").into_parts().is_err());
+        let mut good = repository("posix");
+        good.path = Some("/backups".into());
+        assert!(good.clone().into_parts().is_ok());
+        good.path = Some("/backups' x".into());
+        assert!(good.into_parts().is_err());
+        let mut half = repository("s3");
+        half.bucket = Some("b".into());
+        half.access_key_id = Some("a".into());
+        assert!(half.into_parts().is_err());
+    }
+
+    #[test]
+    fn each_database_gets_its_own_place_in_a_repository() {
+        let config = RepositoryConfig {
+            path: Some("/backups/".into()),
+            ..Default::default()
+        };
+        let target = BackupTarget::for_database(
+            "posix",
+            config,
+            RepositoryCredentials::default(),
+            "db-1",
+            "key".into(),
+        );
+        assert_eq!(target.config.path.as_deref(), Some("/backups/db-1"));
+
+        let config = RepositoryConfig {
+            bucket: Some("b".into()),
+            ..Default::default()
+        };
+        let target = BackupTarget::for_database(
+            "s3",
+            config,
+            RepositoryCredentials::default(),
+            "db-1",
+            "key".into(),
+        );
+        assert_eq!(target.config.prefix.as_deref(), Some("db-1"));
+    }
+
+    #[test]
+    fn a_target_never_shows_credentials_in_debug_output() {
+        let target = BackupTarget::for_database(
+            "s3",
+            RepositoryConfig::default(),
+            RepositoryCredentials {
+                access_key_id: Some("private".into()),
+                secret_access_key: Some("private".into()),
+            },
+            "db-1",
+            "private".into(),
+        );
+        assert!(!format!("{target:?}").contains("private"));
     }
 
     #[test]
@@ -400,6 +851,7 @@ mod tests {
             replication_password: String::new(),
             auth_password: String::new(),
             api_key: String::new(),
+            next: None,
         };
         assert!(!format!("{secrets:?}").contains("private"));
     }

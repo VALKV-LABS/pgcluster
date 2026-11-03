@@ -4,6 +4,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+- Three-node databases through `pgcluster-admin`, one node per failure domain, with replication modes that change online, node replacement, switchover and rolling restart as operations, and `GET /v1/events`.
+- Backups through `pgcluster-admin`: verified S3 or POSIX repositories, per-database encryption, retention, on-demand backups, the restore window, and point-in-time restore into a new database.
+- Host firewalling with nftables: peer ports accept only a database's own nodes, and the proxy port accepts the allowlist. `firewall = "none"` turns it off.
+- Rotation under load of a database's CA, its internal passwords, the admin CA and the key that encrypts instance secrets.
+- `pgcluster repository`, `pgcluster events`, `pgcluster admin-ca`, and more of `pgcluster database`: `--ha`, `mode`, `retention`, `switchover`, `restart`, `replace`, `nodes`, `backup`, `backups`, `restore-window`, `restore`, `rotate-ca` and `rotate-passwords`. The console covers these too.
+- `[cluster] secrets_file` gives `pgcluster` its passwords from a file, so SIGHUP changes them. SIGHUP also reads API keys and retention, and `vk-agent` reads its Postgres password.
+- `postgres_config_file` runs Postgres from a config outside the data directory.
+
+### Changed
+- **Breaking:** `POST /v1/databases` needs `backup`, and a database stays closed until its first backup exists, so creating one takes two generations.
+- **Breaking:** the agent API's `Instance` gains `address`, `backup` and `tasks`, and `bootstrap` can be `seed` or `restore`.
+
+### Fixed
+- Failover, switchover and the repair of a stale standby used port 5432 for the primary, whatever its address said.
+- A standby counted as already following the primary if the primary's host appeared anywhere in its conninfo.
+- The proxy trusted the CA it started with, so a new CA broke its logins to Postgres until a restart.
+- Removing a node left its replication slot holding WAL.
+- A first node waits for a peer that starts late, instead of giving up its bootstrap after five seconds.
+- A failed backup is retried every minute until one succeeds. Before, a failure during a failover waited a day for the next scheduled backup, and kept the database `degraded` until then.
+- The systemd runner sends SIGHUP through `systemctl kill`, as units relied on a `/bin/kill` some images lack. A reload that fails is retried, where before a changed allowlist could go unread until the next change.
+- `vk-agent host` gives instance processes their own user's home. They kept root's, so libpq could not read its files and seeding a standby failed.
+
 ### Changed
 - **Breaking:** `[backup]` takes `interval_seconds`, `delta_steps`, `retain_full`, `encryption_key_env` and exactly one of `[backup.s3]` and `[backup.posix]`, replacing `[[backup.schedule]]`. Nodes need `archive_mode = on`.
 

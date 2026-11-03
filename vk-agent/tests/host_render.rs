@@ -1,7 +1,9 @@
 //! Rendered configs must pass the same validation the real processes run.
 
 use vk_agent::config::AgentConfig;
-use vk_agent::host::model::{Instance, InstanceSecrets, Owner, Resources};
+use vk_agent::host::model::{
+    BackupPolicy, BackupTarget, Instance, InstanceSecrets, Owner, Resources,
+};
 use vk_agent::host::render::{self, Layout};
 
 fn instance(allowed_cidrs: &[&str], extensions: &[&str]) -> Instance {
@@ -18,8 +20,20 @@ fn instance(allowed_cidrs: &[&str], extensions: &[&str]) -> Instance {
             storage_gb: 100.0,
         },
         port_base: 20010,
+        address: "10.0.0.1".into(),
         peers: vec![],
         bootstrap: "initdb".into(),
+        restore: None,
+        backup: BackupPolicy {
+            target: BackupTarget {
+                kind: "posix".into(),
+                path: Some("/backups/db".into()),
+                encryption_key: Some("a2V5".into()),
+                ..Default::default()
+            },
+            retain_full: 2,
+        },
+        tasks: vec![],
         replication_mode: "async".into(),
         allowed_cidrs: allowed_cidrs.iter().map(|c| c.to_string()).collect(),
         extensions: extensions.iter().map(|e| e.to_string()).collect(),
@@ -35,6 +49,7 @@ fn instance(allowed_cidrs: &[&str], extensions: &[&str]) -> Instance {
             replication_password: "repl".into(),
             auth_password: "auth".into(),
             api_key: "api-key".into(),
+            next: None,
         },
     }
 }

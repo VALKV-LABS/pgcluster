@@ -11,7 +11,8 @@ WALG_VERSION=v3.0.9
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release postgresql-common
+apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release nftables \
+  postgresql-common
 
 # Clusters are created per instance. The packages must not start one of their own.
 mkdir -p /etc/postgresql-common

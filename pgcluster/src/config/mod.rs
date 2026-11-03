@@ -2,6 +2,7 @@ use crate::raft::topology::ReplicationMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub mod runtime;
 pub mod validate;
 
 // ── Top-level config ──────────────────────────────────────────────────────────
@@ -34,6 +35,10 @@ pub struct ClusterConfig {
     pub data_dir: String,
     #[serde(default = "default_mode")]
     pub mode: ClusterMode,
+    /// Holds passwords as `NAME=value` lines, in place of the environment, so
+    /// that SIGHUP can change them. `vk-agent host` sets this.
+    #[serde(default)]
+    pub secrets_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

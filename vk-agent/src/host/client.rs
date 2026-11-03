@@ -12,7 +12,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::fsutil::write_private;
-use super::model::{DesiredState, Report};
+use super::model::{ClusterReport, DesiredState, Report, TaskResult};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -192,6 +192,65 @@ impl AdminClient {
         }
     }
 
+    pub async fn task_result(&self, id: &str, result: &TaskResult) -> Result<()> {
+        self.http()
+            .post(format!("{}/agent/v1/tasks/{id}/result", self.base))
+            .json(result)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .context("send a task result")?
+            .error_for_status()
+            .context("task result refused")?;
+        Ok(())
+    }
+
+    pub async fn repository_check(&self, id: &str, error: Option<&str>) -> Result<()> {
+        self.http()
+            .post(format!("{}/agent/v1/repository-checks/{id}", self.base))
+            .json(&json!({ "error": error }))
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .context("send a repository check")?
+            .error_for_status()
+            .context("repository check refused")?;
+        Ok(())
+    }
+
+    pub async fn cluster_report(&self, report: &ClusterReport) -> Result<()> {
+        self.http()
+            .post(format!("{}/agent/v1/cluster", self.base))
+            .json(report)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .context("send a cluster report")?
+            .error_for_status()
+            .context("cluster report refused")?;
+        Ok(())
+    }
+
+    /// The hash of the bundle of CAs this host trusts.
+    pub fn ca_fingerprint(&self) -> Result<String> {
+        let pem = std::fs::read_to_string(&self.files.ca).context("read CA")?;
+        Ok(fingerprint(&pem))
+    }
+
+    /// Trust `bundle` from now on, in place of what this host trusted.
+    pub fn trust(&self, bundle: &str) -> Result<()> {
+        if self.ca_fingerprint()? == fingerprint(bundle) {
+            return Ok(());
+        }
+        let cert = std::fs::read_to_string(&self.files.cert).context("read certificate")?;
+        let key = std::fs::read_to_string(&self.files.key).context("read key")?;
+        let client = build_client(bundle.as_bytes(), Some((&cert, &key)))?;
+        write_private(&self.files.ca, bundle.as_bytes())?;
+        *self.client.write().expect("client lock") = client;
+        tracing::info!("updated the trusted CAs");
+        Ok(())
+    }
+
     /// Replace the client certificate once it is old enough.
     pub async fn rotate_if_due(&self) -> Result<()> {
         let issued = std::fs::metadata(&self.files.cert)
@@ -201,6 +260,11 @@ impl AdminClient {
         if age < ROTATE_AFTER {
             return Ok(());
         }
+        self.renew_certificate().await
+    }
+
+    /// Get a new client certificate from the CA now in use.
+    pub async fn renew_certificate(&self) -> Result<()> {
         let (key, csr) = new_key_and_csr()?;
         let response: RotateResponse = self
             .http()

@@ -49,7 +49,7 @@ impl SeedPlan {
             primary_port: port.parse()?,
             primary_addr: primary_addr.to_string(),
             user: replication.replication_user.clone(),
-            password: std::env::var(&replication.replication_password_env).unwrap_or_default(),
+            password: crate::credentials::get(&replication.replication_password_env),
             slot_name: format!("{}{}", replication.slot_prefix, node_id),
         })
     }

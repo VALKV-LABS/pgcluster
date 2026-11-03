@@ -6,3 +6,5 @@ enrollment_token_file = "/run/enrollment-token"
 advertise_address     = "localhost"
 runner                = "plain"
 run_as                = "postgres"
+# One machine, so there is nobody to keep out, and no privilege to do it with.
+firewall              = "none"

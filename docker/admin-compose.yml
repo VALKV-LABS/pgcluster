@@ -13,6 +13,7 @@
 #   export PGCLUSTER_ADMIN_KEY=dev-admin-key-for-the-local-stack-only
 #   export PGCLUSTER_ADMIN_CA=admin-ca.crt
 #   pgcluster host list
+#   pgcluster repository add-posix main /backups
 #   pgcluster database create orders --allow 0.0.0.0/0 --extension vector --wait
 #
 # The keys here are throwaway values for this stack.
@@ -89,6 +90,7 @@ services:
       - admin-ca:/ca:ro
       - host-state:/var/lib/vk-agent-host
       - host-instances:/var/lib/pgcluster
+      - admin-backups:/backups
     ports:
       - "20000-20039:20000-20039"
       - "127.0.0.1:18080:8080"
@@ -148,9 +150,11 @@ services:
       - ./vk-agent-host.env:/etc/vk-agent/host.env:ro
       - ./vk-agent-host.service:/etc/systemd/system/vk-agent-host.service:ro
       - admin-ca:/ca:ro
+      - admin-backups:/backups
 
 volumes:
   admin-ca:
   admin-db:
+  admin-backups:
   host-state:
   host-instances:

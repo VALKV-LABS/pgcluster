@@ -12,6 +12,7 @@ pub mod error;
 pub mod model;
 pub mod operations;
 pub mod reconciler;
+pub mod rotation;
 pub mod secrets;
 pub mod state;
 pub mod tls;
@@ -81,7 +82,10 @@ pub async fn run(config_path: &str) -> Result<()> {
     })?;
     let secret_key = std::env::var(&config.secret_key_env)
         .with_context(|| format!("set {} to a base64 32-byte key", config.secret_key_env))?;
-    let secrets = secrets::SecretBox::from_base64(&secret_key)?;
+    let mut secrets = secrets::SecretBox::from_base64(&secret_key)?;
+    if let Ok(old_key) = std::env::var(&config.old_secret_key_env) {
+        secrets = secrets.with_previous(&old_key)?;
+    }
     let ca = Arc::new(ca::Ca::load_or_create(Path::new(&config.tls.ca_dir))?);
 
     let pool = PgPoolOptions::new()
@@ -92,21 +96,34 @@ pub async fn run(config_path: &str) -> Result<()> {
         .context("connect to the metadata database")?;
     MIGRATOR.run(&pool).await.context("run migrations")?;
     load_bootstrap_hosts(&pool, &config).await?;
+    if secrets.has_previous() {
+        let count = rotation::reseal_all(&pool, &secrets).await?;
+        tracing::info!(count, "sealed secrets with the new key. Remove the old one");
+    }
 
-    let state = AdminState::new(pool, ca.clone(), secrets, &config.api.api_key_hashes)?;
+    let mut state = AdminState::new(pool, ca.clone(), secrets, &config.api.api_key_hashes)?;
     let server_cert = ca.issue_server(&config.tls.server_names)?;
 
     let agent_listener = TcpListener::bind(&config.agent_api.listen_addr)
         .await
         .with_context(|| format!("bind {}", config.agent_api.listen_addr))?;
     tracing::info!(addr = %config.agent_api.listen_addr, "agent API listening");
-    let agent_app = agent::router(state.clone());
-    let agent_acceptor = tls::agent_tls(&ca, &server_cert)?;
-    let agent_task = tokio::spawn(tls::serve(agent_listener, agent_acceptor, agent_app));
+    let agent_acceptor = tls::shared(tls::agent_tls(&[ca.cert_pem()], &server_cert)?);
+    let agent_task_acceptor = agent_acceptor.clone();
 
     let api_listener = TcpListener::bind(&config.api.listen_addr)
         .await
         .with_context(|| format!("bind {}", config.api.listen_addr))?;
+    let api_acceptor = tls::shared(tls::server_tls(&server_cert)?);
+    state.listeners = Some(Arc::new(state::Listeners {
+        agent: agent_acceptor,
+        api: api_acceptor.clone(),
+        server_names: config.tls.server_names.clone(),
+        ca_dir: config.tls.ca_dir.clone(),
+    }));
+    rotation::resume(&state).await?;
+    let agent_app = agent::router(state.clone());
+    let agent_task = tokio::spawn(tls::serve(agent_listener, agent_task_acceptor, agent_app));
     let api_app = api::router(state.clone());
     let api_task = if config.api.insecure_plaintext {
         tracing::warn!(addr = %config.api.listen_addr,
@@ -118,8 +135,7 @@ pub async fn run(config_path: &str) -> Result<()> {
         })
     } else {
         tracing::info!(addr = %config.api.listen_addr, "admin API listening");
-        let acceptor = tls::server_tls(&server_cert)?;
-        tokio::spawn(tls::serve(api_listener, acceptor, api_app))
+        tokio::spawn(tls::serve(api_listener, api_acceptor, api_app))
     };
 
     let reconciler = reconciler::Reconciler::new(state, RECONCILE_TICK);

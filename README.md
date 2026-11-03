@@ -105,10 +105,11 @@ export PGCLUSTER_ADMIN_KEY=dev-admin-key-for-the-local-stack-only
 export PGCLUSTER_ADMIN_CA=admin-ca.crt
 
 pgcluster host list
+pgcluster repository add-posix main /backups
 pgcluster database create orders --allow 0.0.0.0/0 --extension vector --wait
 ```
 
-The design is in [`docs/management-plane.md`](docs/management-plane.md), the contracts in [`openapi/`](openapi), and [`deploy/aws/`](deploy/aws/README.md) launches a test fleet in your own AWS account. One-node databases work today, and three-node databases and backups through this API are next. See [`todo.md`](todo.md).
+The design is in [`docs/management-plane.md`](docs/management-plane.md), the contracts in [`openapi/`](openapi), and [`deploy/aws/`](deploy/aws/README.md) launches a test fleet in your own AWS account. One-node and three-node databases, backups, point-in-time restore and secret rotation all work through this API. See [`todo.md`](todo.md) for what is next.
 
 ### Quick test with psql
 

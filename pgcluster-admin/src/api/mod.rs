@@ -1,5 +1,6 @@
 //! The admin API.
 
+pub mod backups;
 pub mod databases;
 pub mod hosts;
 
@@ -11,13 +12,17 @@ use axum::http::request::Parts;
 use axum::http::{header, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::ApiError;
 use crate::state::AdminState;
+
+/// The stages of the spec that are built. The contract marks later ones.
+#[cfg(test)]
+const DELIVERED_STAGE: u64 = 3;
 
 const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 500;
@@ -31,9 +36,40 @@ pub fn router(state: AdminState) -> Router {
             post(databases::create).get(databases::list),
         )
         .route(
-            "/v1/databases/:id",
-            get(databases::get).delete(databases::delete),
+            "/v1/backup-repositories",
+            post(backups::create_repository).get(backups::list_repositories),
         )
+        .route(
+            "/v1/backup-repositories/:id",
+            delete(backups::delete_repository),
+        )
+        .route(
+            "/v1/databases/:id",
+            get(databases::get)
+                .patch(databases::update)
+                .delete(databases::delete),
+        )
+        .route("/v1/databases/:id/restart", post(databases::restart))
+        .route("/v1/databases/:id/switchover", post(databases::switchover))
+        .route("/v1/databases/:id/rotate-ca", post(databases::rotate_ca))
+        .route(
+            "/v1/databases/:id/rotate-passwords",
+            post(databases::rotate_passwords),
+        )
+        .route("/v1/databases/:id/backup", post(backups::backup_now))
+        .route("/v1/databases/:id/backups", get(backups::list_backups))
+        .route(
+            "/v1/databases/:id/restore-window",
+            get(backups::restore_window),
+        )
+        .route("/v1/databases/:id/restore", post(backups::restore))
+        .route(
+            "/v1/databases/:id/nodes/:node/replace",
+            post(databases::replace_node),
+        )
+        .route("/v1/events", get(databases::list_events))
+        .route("/v1/admin-ca", get(admin_ca))
+        .route("/v1/admin-ca/rotate", post(rotate_admin_ca))
         .route(
             "/v1/databases/:id/owner-password",
             post(databases::set_owner_password),
@@ -87,6 +123,21 @@ async fn require_api_key(
     } else {
         Err(ApiError::unauthorized("a valid API key is required"))
     }
+}
+
+async fn admin_ca(
+    State(state): State<AdminState>,
+) -> Result<Json<crate::rotation::Status>, ApiError> {
+    Ok(Json(crate::rotation::status(&state).await?))
+}
+
+async fn rotate_admin_ca(
+    State(state): State<AdminState>,
+) -> Result<(StatusCode, Json<crate::rotation::Status>), ApiError> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(crate::rotation::start(&state).await?),
+    ))
 }
 
 async fn health(State(state): State<AdminState>) -> Result<Json<serde_json::Value>, ApiError> {
@@ -247,7 +298,7 @@ mod tests {
                     }
                     request.body(Body::empty()).unwrap()
                 };
-                if stage == 1 {
+                if stage <= DELIVERED_STAGE {
                     let response = router(state()).oneshot(request(false)).await.unwrap();
                     let status = response.status();
                     assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}");

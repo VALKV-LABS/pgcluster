@@ -67,4 +67,6 @@ vk-agent/src/tls.rs   # Server TLS config for the agent
 
 ## Reloading Certificates
 
-SIGHUP makes `pgcluster` and `vk-agent` read their certificate files again, with no restart. The proxy swaps its acceptor, so connected clients are untouched. Each gRPC server starts a new generation on the same listener, so RPCs in flight finish on the old certificate and the port never stops accepting. Outbound gRPC drops its cached channels, so new ones present the new certificate. Postgres needs `pg_ctl reload`. If the files do not load, the old certificates stay in use and the error is logged.
+SIGHUP makes `pgcluster` and `vk-agent` read their certificate files again, with no restart. The proxy swaps its acceptor, so connected clients are untouched. Each gRPC server starts a new generation on the same listener, so RPCs in flight finish on the old certificate and the port never stops accepting. Outbound gRPC drops its cached channels, so new ones present the new certificate. The proxy's connections to Postgres pick up a new CA for each new connection. Postgres needs `pg_ctl reload`. If the files do not load, the old certificates stay in use and the error is logged.
+
+`ca_cert` can hold several certificates, which is how a CA rotates: nodes trust both, move to certificates from the new one, then drop the old.

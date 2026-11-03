@@ -74,7 +74,8 @@ pub async fn trigger_backup(
     State(s): State<ApiState>,
     Json(req): Json<TriggerBackupRequest>,
 ) -> Result<(StatusCode, Json<TriggerBackupResponse>), ApiError> {
-    let config = enabled(&s)?;
+    let mut config = enabled(&s)?;
+    config.retain_full = s.runtime.retain_full(config.retain_full);
     let frequency = req.frequency.unwrap_or_else(|| "manual".to_string());
     let label = req
         .label
@@ -84,12 +85,17 @@ pub async fn trigger_backup(
     let raft = s.raft.clone();
     let topology = s.topology.current();
     let pool = s.pool.clone();
+    let runtime = s.runtime.clone();
     tokio::spawn(async move {
         match run_backup(&raft, &topology, &pool, &config, &frequency, &label).await {
             Ok(manifest) => {
+                runtime.record_backup(None);
                 tracing::info!(backup_id = manifest.backup_id, "manual backup complete")
             }
-            Err(e) => tracing::error!(err = %e, "manual backup failed"),
+            Err(e) => {
+                tracing::error!(err = %e, "manual backup failed");
+                runtime.record_backup(Some((label, format!("{e:#}"))));
+            }
         }
     });
 
@@ -97,6 +103,22 @@ pub async fn trigger_backup(
         StatusCode::ACCEPTED,
         Json(TriggerBackupResponse { message }),
     ))
+}
+
+/// How the last backup this instance ran went.
+#[derive(Serialize)]
+pub struct BackupStatusResponse {
+    /// The label of the backup that failed, if the last one did.
+    pub failed_label: Option<String>,
+    pub error: Option<String>,
+}
+
+pub async fn backup_status(State(s): State<ApiState>) -> Json<BackupStatusResponse> {
+    let (failed_label, error) = s.runtime.last_backup_failure().unzip();
+    Json(BackupStatusResponse {
+        failed_label,
+        error,
+    })
 }
 
 // ── Delete ─────────────────────────────────────────────────────────────────────

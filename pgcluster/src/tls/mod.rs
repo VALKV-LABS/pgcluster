@@ -21,6 +21,13 @@ pub type SharedClientTls = Arc<ArcSwap<tonic::transport::ClientTlsConfig>>;
 /// The proxy's acceptor. A reload swaps it, and connected clients keep theirs.
 pub type SharedAcceptor = Arc<ArcSwap<TlsAcceptor>>;
 
+/// How the proxy reaches Postgres. A reload swaps it, so a new CA is trusted with
+/// no restart.
+pub type SharedConnector = Arc<ArcSwap<TlsConnector>>;
+
+/// The cluster CA, in PEM. A reload swaps it.
+pub type SharedCa = Arc<ArcSwap<Vec<u8>>>;
+
 /// Wrap a config for sharing.
 pub fn shared_client_tls(config: tonic::transport::ClientTlsConfig) -> SharedClientTls {
     Arc::new(ArcSwap::from_pointee(config))

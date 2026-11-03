@@ -29,6 +29,8 @@ run_as                = "postgres"                         # When this agent run
 | `vk_agent_path` | This executable | The `vk-agent` binary |
 | `systemd_unit_dir` | `/etc/systemd/system` | Where units go |
 | `report_interval_seconds` | `15` | Time between reports, and the length of a long poll |
+| `firewall` | `nftables` | `nftables` needs `nft` and root. `none` leaves ports open, for development on one machine |
+| `walg_path` | `wal-g` | The WAL-G binary |
 
 `VK_AGENT_ENROLLMENT_TOKEN` can carry the token in place of the file. A refused token stops the agent, because retrying cannot help. An unreachable server is retried.
 
@@ -38,6 +40,8 @@ run_as                = "postgres"                         # When this agent run
 2. **Long-polls** desired state, and saves it with mode `600`, because it holds secrets.
 3. **Applies** each instance. Every step checks before it acts, so a failed attempt is safe to repeat, and is repeated after the next poll.
 4. **Reports** capacity and instance health on a timer of its own, so a slow change does not look like a dead host.
+5. **Runs tasks** that reach it with desired state, each on its own, through the local instance's REST API. Each goes to every node, and runs on the node that is the Raft leader or the Postgres primary.
+6. **Watches** each cluster: the leader's host reports what the leader knows, and the primary's host reports how far the WAL archive reaches.
 
 Between changes it checks that instances are running, and starts any that stopped. If `pgcluster-admin` is unreachable, instances keep running, and a restarted agent applies its saved state.
 
@@ -47,15 +51,36 @@ Each instance is two processes: `vk-agent`, which owns Postgres, and `pgcluster`
 
 | Change | Effect |
 |---|---|
-| New instance | Writes its files, runs `initdb --data-checksums`, starts it, then creates the roles, the database and the extensions |
+| New first node | Writes its files, runs `initdb --data-checksums`, starts it, then creates the roles, the database and the extensions |
+| New seeded node | Writes its files and starts its processes with no data. It reports `seeding`, and the host moves on, until the Raft leader has filled it from the primary |
+| New restored node | Fills the data directory from the source's repository, finishes recovery in a private server, then starts it. See below |
 | `allowed_cidrs` | Rewrites `pgcluster.toml` and sends SIGHUP. Connected clients stay connected |
-| Renewed certificate | Replaces the files, sends SIGHUP to `vk-agent` and `pgcluster`, and runs `pg_ctl reload`. Nothing restarts, and connected clients stay connected |
+| Certificates, CAs, passwords, peers | Replaces the files, sends SIGHUP to `vk-agent` and `pgcluster`, and runs `pg_ctl reload`. Nothing restarts, and connected clients stay connected |
 | Extensions with no preload | `CREATE EXTENSION` or `DROP EXTENSION`, as the superuser, so the owner never needs to be one |
-| `pg_tle`, `pg_cron`, memory | Rewrites `pgcluster-managed.conf` and restarts the instance |
+| `pg_tle`, `pg_cron`, memory | Rewrites `postgresql.conf` and restarts a one-node instance. On three nodes, `pgcluster-admin` runs a rolling restart and then a new generation, which installs the extension |
 | Owner verifier | `ALTER ROLE`, only when the verifier in desired state changed, so a later change cannot undo a password the owner set with SQL |
 | Gone from desired state | Stops the instance and deletes its directory |
 
-A one-node instance keeps everything but the proxy on loopback. The proxy requires TLS and applies the allowlist, because it is the only process that sees a client's address.
+A one-node instance keeps everything but the proxy on loopback. A node with peers listens for them on Postgres, Raft and `vk-agent`, and the REST API and metrics stay on loopback either way. The proxy requires TLS and applies the allowlist, because it is the only process that sees a client's address.
+
+Postgres runs from `postgresql.conf` and `pg_hba.conf` in the instance directory, not the data directory, because a base backup or `pg_rewind` copies a data directory from another node. The file in the data directory holds what `initdb` chose, and nothing specific to a node.
+
+Only the primary runs `ALTER ROLE` and `CREATE EXTENSION`, and replication carries them to standbys. A standby keeps its old record of what it applied. If it is promoted before the primary finished a change, the health check notices and finishes it.
+
+## Firewall
+
+With `firewall = "nftables"`, each instance has a table of its own, replaced in one transaction, so a change opens no gap. Postgres, Raft and `vk-agent` ports accept only the database's own nodes. The proxy port accepts the allowlist, and stays closed until the first backup exists. Connections already open to the proxy survive an allowlist change. Loopback is always accepted. Deleting an instance deletes its table.
+
+## Restoring
+
+A backup holds the source's roles, its archiving settings and its name for the database. So recovery runs in a private server with no network, reached through a socket only the instance's user can open, and all of that is put right before anything else can connect:
+
+1. `backup-fetch` the newest backup that finished before the target, from the source's repository with the source's key.
+2. Recover to the target with archiving off, so nothing lands in the source's archive.
+3. Set every internal password and the owner's verifier, rename the database, drop the source's slots, and clear the settings the backup carried.
+4. Start normally. `pgcluster` then points archiving at this database's own repository.
+
+Postgres stops with an error if WAL ends before a commit later than the target. The API admits only times the archive covers, so in that case every commit in the archive came before the target, and the end of the archive is the state asked for. The agent recovers to there.
 
 An instance directory records the ID of the host that created it, and deletion acts only on a matching directory. A host that enrols again, and so receives empty desired state, leaves existing data alone and logs a warning.
 

@@ -22,6 +22,9 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 pub struct RunAs {
     pub uid: Uid,
     pub gid: Gid,
+    /// Its home directory. Tools such as libpq look there for files, and must
+    /// not look in the home of the user that started them.
+    pub home: &'static str,
 }
 
 impl RunAs {
@@ -29,9 +32,12 @@ impl RunAs {
         let user = User::from_name(name)
             .with_context(|| format!("look up user {name}"))?
             .with_context(|| format!("no user named {name}"))?;
+        let home = user.dir.to_string_lossy().into_owned();
         Ok(Self {
             uid: user.uid,
             gid: user.gid,
+            // Looked up once per process, so leaking it costs nothing.
+            home: Box::leak(home.into_boxed_str()),
         })
     }
 }
@@ -39,7 +45,10 @@ impl RunAs {
 pub fn command_as(program: &str, run_as: Option<RunAs>) -> Command {
     let mut command = Command::new(program);
     if let Some(user) = run_as {
-        command.uid(user.uid.as_raw()).gid(user.gid.as_raw());
+        command
+            .uid(user.uid.as_raw())
+            .gid(user.gid.as_raw())
+            .env("HOME", user.home);
     }
     command
 }
@@ -110,7 +119,6 @@ pub fn agent_unit(processes: &Processes) -> String {
          Type=simple\n\
          {user}\
          ExecStart={program} {config}\n\
-         ExecReload=/bin/kill -HUP $MAINPID\n\
          Restart=always\n\
          RestartSec=2\n\
          KillMode=control-group\n\
@@ -138,7 +146,6 @@ pub fn proxy_unit(processes: &Processes) -> String {
          {user}\
          EnvironmentFile={env}\n\
          ExecStart={program} server --config {config}\n\
-         ExecReload=/bin/kill -HUP $MAINPID\n\
          Restart=always\n\
          RestartSec=2\n\
          LimitNOFILE=65536\n\
@@ -222,14 +229,17 @@ impl Runner for Systemd {
         systemctl(&["restart", &proxy]).await
     }
 
+    /// SIGHUP to the main process, from systemd itself, so it needs no `kill`
+    /// on the machine.
     async fn reload_proxy(&self, processes: &Processes) -> Result<()> {
-        systemctl(&["reload", &proxy_unit_name(&processes.id)]).await
+        let proxy = proxy_unit_name(&processes.id);
+        systemctl(&["kill", "--kill-whom=main", "--signal=HUP", &proxy]).await
     }
 
     async fn reload_certificates(&self, processes: &Processes) -> Result<()> {
         let agent = agent_unit_name(&processes.id);
         let proxy = proxy_unit_name(&processes.id);
-        systemctl(&["reload", &agent, &proxy]).await
+        systemctl(&["kill", "--kill-whom=main", "--signal=HUP", &agent, &proxy]).await
     }
 
     async fn is_running(&self, processes: &Processes) -> Result<bool> {
@@ -484,10 +494,9 @@ mod tests {
     }
 
     #[test]
-    fn the_proxy_unit_reads_secrets_from_a_file_and_can_reload() {
+    fn the_proxy_unit_reads_secrets_from_a_file() {
         let unit = proxy_unit(&processes());
         assert!(unit.contains("EnvironmentFile=/instances/db-1-n1/instance.env"));
-        assert!(unit.contains("ExecReload=/bin/kill -HUP $MAINPID"));
         assert!(!unit.contains("PASSWORD"));
     }
 

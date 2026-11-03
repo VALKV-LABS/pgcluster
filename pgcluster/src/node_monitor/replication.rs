@@ -175,7 +175,12 @@ impl NodeMonitor {
     /// Give the proxy its way to read verifiers. It lives in the database, so
     /// this runs on the primary and reaches standbys through replication.
     async fn ensure_proxy_auth(&self, topology: &ClusterTopology, primary: &HealthCheckResult) {
-        if primary.proxy_auth_version == self.auth_version {
+        let password = crate::credentials::get(&self.auth_role.password_env);
+        let version = crate::backup::walg::version(&HashMap::from([(
+            self.auth_role.user.clone(),
+            password.clone(),
+        )]));
+        if primary.proxy_auth_version == version {
             return;
         }
         let Some(cfg) = topology.node_configs.get(&topology.primary_node_id) else {
@@ -188,11 +193,7 @@ impl NodeMonitor {
         {
             Ok(mut client) => {
                 client
-                    .set_proxy_auth(
-                        &self.auth_role.user,
-                        &self.auth_role.password,
-                        &self.auth_version,
-                    )
+                    .set_proxy_auth(&self.auth_role.user, &password, &version)
                     .await
             }
             Err(e) => Err(e),

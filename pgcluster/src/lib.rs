@@ -8,6 +8,7 @@ pub mod backup;
 pub mod cli;
 pub mod config;
 pub mod console;
+pub mod credentials;
 pub mod failover;
 pub mod logging;
 pub mod metrics_registry;
@@ -36,13 +37,42 @@ fn raft_bind_addr(peer_addr: &str) -> String {
     }
 }
 
+/// Read passwords, API keys and retention again on SIGHUP, none of which needs a
+/// restart. A file that does not load leaves the old values in use.
+fn spawn_settings_reload(
+    config_path: String,
+    secrets_file: Option<String>,
+    runtime: Arc<config::runtime::Runtime>,
+) -> Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut hangup = signal(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        while hangup.recv().await.is_some() {
+            if let Some(path) = &secrets_file {
+                if let Err(e) = credentials::load(path) {
+                    error!(err = format!("{e:#}"), "kept the old passwords");
+                }
+            }
+            match config::PgClusterConfig::from_file(&config_path) {
+                Ok(cfg) => runtime.apply(&cfg),
+                Err(e) => error!(err = format!("{e:#}"), "kept the old settings"),
+            }
+        }
+    });
+    Ok(())
+}
+
 /// Read the certificate files again on SIGHUP, and apply them to everything that
 /// holds one. Connections stay up. Files that do not load leave the old ones in
 /// use, which still work: they are renewed well before they expire.
+#[allow(clippy::too_many_arguments)]
 fn spawn_certificate_reload(
     cfg: Arc<config::PgClusterConfig>,
     client_tls: tls::SharedClientTls,
     acceptor: tls::SharedAcceptor,
+    backend_tls: tls::SharedConnector,
+    ca_pem: tls::SharedCa,
     server_tls: tokio::sync::watch::Sender<tonic::transport::ServerTlsConfig>,
     pool: Arc<agent_clients::AgentClientPool>,
 ) -> Result<()> {
@@ -55,6 +85,9 @@ fn spawn_certificate_reload(
                 Ok(manager) => {
                     client_tls.store(Arc::new(manager.tonic_client_tls_config()));
                     acceptor.store(Arc::new(manager.server_tls_acceptor()));
+                    backend_tls.store(Arc::new(manager.client_tls_connector()));
+                    ca_pem.store(Arc::new(manager.ca_cert_pem().to_vec()));
+                    credentials::bump();
                     server_tls.send_replace(manager.tonic_server_tls_config());
                     pool.clear();
                     info!("reloaded certificates");
@@ -78,6 +111,9 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
     logging::init();
     info!(cluster = %cfg.cluster.name, node_id = cfg.raft.node_id, "pgcluster starting");
+    if let Some(path) = &cfg.cluster.secrets_file {
+        credentials::load(path)?;
+    }
     if cfg.api.insecure_no_auth {
         warn!("REST API is running with no credentials (insecure_no_auth = true)");
     }
@@ -90,18 +126,20 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         Some(Arc::new(tls::TlsManager::new(&cfg.tls)?))
     };
 
-    let auth_password = std::env::var(&cfg.proxy.auth_password_env).unwrap_or_default();
-    if auth_password.is_empty() {
+    if credentials::get(&cfg.proxy.auth_password_env).is_empty() {
         anyhow::bail!(
             "[proxy] set {} to the password for the {} role",
             cfg.proxy.auth_password_env,
             cfg.proxy.auth_user
         );
     }
+    let ca_pem: Option<tls::SharedCa> = tls_mgr
+        .as_ref()
+        .map(|t| Arc::new(arc_swap::ArcSwap::from_pointee(t.ca_cert_pem().to_vec())));
     let auth_role = proxy::auth::AuthRole {
         user: cfg.proxy.auth_user.clone(),
-        password: auth_password,
-        ca_pem: tls_mgr.as_ref().map(|t| t.ca_cert_pem().to_vec()),
+        password_env: cfg.proxy.auth_password_env.clone(),
+        ca_pem: ca_pem.clone(),
     };
 
     // Each of these is swapped when certificates reload.
@@ -111,6 +149,9 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     let acceptor: Option<tls::SharedAcceptor> = tls_mgr
         .as_ref()
         .map(|t| Arc::new(arc_swap::ArcSwap::from_pointee(t.server_tls_acceptor())));
+    let backend_tls: Option<tls::SharedConnector> = tls_mgr
+        .as_ref()
+        .map(|t| Arc::new(arc_swap::ArcSwap::from_pointee(t.client_tls_connector())));
     let server_tls = tls_mgr
         .as_ref()
         .map(|t| tokio::sync::watch::channel(t.tonic_server_tls_config()));
@@ -128,8 +169,9 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         let seed_mode = cfg.replication.replication_mode;
         tokio::spawn(async move {
             // Wait until this instance is the Raft leader and has applied its
-            // log (fast in single-node bootstrap).
-            for _ in 0..50u32 {
+            // log. That takes a second peer, which may start well after this
+            // one on another host.
+            for _ in 0..3000u32 {
                 let m = seed_raft.raft.metrics().borrow().clone();
                 let applied = m.last_applied.map(|id| id.index) >= m.last_log_index;
                 if m.current_leader == Some(m.id) && applied {
@@ -203,6 +245,12 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         pool.clone(),
         op_in_progress.clone(),
     );
+    let runtime = api_state.runtime.clone();
+    spawn_settings_reload(
+        config_path.to_string(),
+        cfg.cluster.secrets_file.clone(),
+        runtime.clone(),
+    )?;
 
     let raft_peer_addr = cfg
         .raft
@@ -287,13 +335,12 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         let allowlist = proxy::allowlist::shared(cfg.proxy.allowed_cidrs.as_deref())?;
         proxy::allowlist::spawn_reload(config_path.to_string(), allowlist.clone())?;
         let proxy_cfg = cfg.proxy.clone();
-        let proxy_tls = tls_mgr.clone();
         let proxy_metrics = metrics.clone();
         let srv = Arc::new(proxy::ProxyServer::new(
             proxy_cfg,
             proxy_router.clone(),
-            proxy_tls,
             acceptor.clone(),
+            backend_tls.clone(),
             proxy_metrics,
             Arc::new(proxy::auth::AuthQuery::new(auth_role.clone())),
             allowlist,
@@ -327,8 +374,6 @@ pub async fn run_server(config_path: &str) -> Result<()> {
             .as_ref()
             .filter(|b| b.enabled)
             .map(backup::walg::settings);
-        let repl_password =
-            std::env::var(&cfg.replication.replication_password_env).unwrap_or_default();
         tasks.push(tokio::spawn(async move {
             let mut monitor = node_monitor::NodeMonitor::new(
                 raft,
@@ -339,7 +384,6 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                 &replication,
                 &auth_role,
                 backup_settings,
-                repl_password,
                 op_in_progress.clone(),
                 quorum,
             );
@@ -354,14 +398,23 @@ pub async fn run_server(config_path: &str) -> Result<()> {
             topology_rx.clone(),
             backup_cfg,
             pool.clone(),
+            runtime.clone(),
         );
         tasks.push(tokio::spawn(async move { scheduler.run().await }));
     }
 
-    if let (Some(client_tls), Some(acceptor), Some((server_tls, _))) =
-        (client_tls, acceptor, server_tls)
+    if let (Some(client_tls), Some(acceptor), Some(backend_tls), Some(ca_pem), Some((tx, _))) =
+        (client_tls, acceptor, backend_tls, ca_pem, server_tls)
     {
-        spawn_certificate_reload(cfg.clone(), client_tls, acceptor, server_tls, pool.clone())?;
+        spawn_certificate_reload(
+            cfg.clone(),
+            client_tls,
+            acceptor,
+            backend_tls,
+            ca_pem,
+            tx,
+            pool.clone(),
+        )?;
     }
 
     info!(raft_grpc = %raft_grpc_addr, api = %cfg.api.listen_addr,

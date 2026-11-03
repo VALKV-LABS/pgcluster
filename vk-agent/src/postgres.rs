@@ -55,6 +55,14 @@ impl LocalPostgres {
         Ok(Self { pool })
     }
 
+    /// Use `url` for connections opened from now on. Open ones stay.
+    pub fn set_url(&self, url: &str) -> Result<()> {
+        let options: sqlx::postgres::PgConnectOptions =
+            url.parse().context("parse the Postgres URL")?;
+        self.pool.set_connect_options(options);
+        Ok(())
+    }
+
     /// Return a reference to the underlying connection pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool

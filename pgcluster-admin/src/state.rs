@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
@@ -7,6 +8,7 @@ use tokio::sync::Semaphore;
 
 use crate::ca::Ca;
 use crate::secrets::SecretBox;
+use crate::tls::SharedAcceptor;
 
 /// Shorter keys could be guessed from a stolen hash, so they never authenticate.
 pub const MIN_API_KEY_LEN: usize = 32;
@@ -15,12 +17,22 @@ pub const MIN_API_KEY_LEN: usize = 32;
 /// authenticated. It leaves most of the pool to hosts and operators.
 const OPEN_ROUTE_LIMIT: usize = 6;
 
+/// What a rotation of the admin CA changes while the service runs.
+pub struct Listeners {
+    pub agent: SharedAcceptor,
+    pub api: SharedAcceptor,
+    pub server_names: Vec<String>,
+    pub ca_dir: String,
+}
+
 /// What API handlers and the reconciler share.
 #[derive(Clone)]
 pub struct AdminState {
     pub pool: PgPool,
-    pub ca: Arc<Ca>,
+    ca: Arc<ArcSwap<Ca>>,
     pub secrets: SecretBox,
+    /// `None` in tests that do not serve TLS.
+    pub listeners: Option<Arc<Listeners>>,
     /// Held for the length of each request to a route open to anyone.
     pub open_routes: Arc<Semaphore>,
     api_key_hashes: Arc<Vec<[u8; 32]>>,
@@ -43,11 +55,21 @@ impl AdminState {
             .collect::<anyhow::Result<_>>()?;
         Ok(Self {
             pool,
-            ca,
+            ca: Arc::new(ArcSwap::new(ca)),
             secrets,
+            listeners: None,
             open_routes: Arc::new(Semaphore::new(OPEN_ROUTE_LIMIT)),
             api_key_hashes: Arc::new(hashes),
         })
+    }
+
+    /// The CA that signs host and server certificates now.
+    pub fn ca(&self) -> Arc<Ca> {
+        self.ca.load_full()
+    }
+
+    pub fn set_ca(&self, ca: Arc<Ca>) {
+        self.ca.store(ca);
     }
 
     /// Hashing first gives both sides the same length, so the comparison leaks

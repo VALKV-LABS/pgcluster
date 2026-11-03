@@ -52,15 +52,17 @@ pub async fn rewind(pg_ctl: &PgCtl, data_dir: &Path, req: &SeedRequest) -> Resul
         "host={} port={} user={} dbname=postgres",
         req.primary_host, req.primary_port, req.user
     );
-    let output = Command::new(pg_ctl.tool("pg_rewind"))
+    let mut command = Command::new(pg_ctl.tool("pg_rewind"));
+    command
         .arg("--target-pgdata")
         .arg(data_dir)
         .arg("--source-server")
         .arg(&source)
-        .env("PGPASSWORD", &req.password)
-        .output()
-        .await
-        .context("spawn pg_rewind")?;
+        .env("PGPASSWORD", &req.password);
+    if let Some(path) = pg_ctl.config_file() {
+        command.arg(format!("--config-file={path}"));
+    }
+    let output = command.output().await.context("spawn pg_rewind")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {

@@ -33,6 +33,7 @@ fn postgres_url_tcp() {
         backup_config_path: "/tmp/walg.json".into(),
         tls: Default::default(),
         pg_ctl_path: "pg_ctl".into(),
+        postgres_config_file: None,
     };
     assert_eq!(
         cfg.postgres_url(),
@@ -57,6 +58,7 @@ fn postgres_url_with_password() {
         backup_config_path: "/tmp/walg.json".into(),
         tls: Default::default(),
         pg_ctl_path: "pg_ctl".into(),
+        postgres_config_file: None,
     };
     assert_eq!(
         cfg.postgres_url(),

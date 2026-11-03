@@ -7,9 +7,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::tls::SharedConnector;
 use anyhow::{bail, Result};
 use dashmap::DashMap;
-use tokio_rustls::TlsConnector;
 
 use super::backend::BackendConnection;
 use super::scram::{login_to_backend, BackendLoginError, Credentials};
@@ -89,11 +89,11 @@ pub struct ConnectionPool {
     pools: DashMap<String, Arc<PoolBucket>>,
     config: PoolConfig,
     /// Encrypts and verifies backend connections. `None` → plain TCP.
-    backend_tls: Option<TlsConnector>,
+    backend_tls: Option<SharedConnector>,
 }
 
 impl ConnectionPool {
-    pub fn new(config: PoolConfig, backend_tls: Option<TlsConnector>) -> Self {
+    pub fn new(config: PoolConfig, backend_tls: Option<SharedConnector>) -> Self {
         Self {
             pools: DashMap::new(),
             config,
@@ -109,7 +109,8 @@ impl ConnectionPool {
         addr: &str,
         session: &Login,
     ) -> Result<(BackendConnection, Vec<u8>), BackendLoginError> {
-        let conn = BackendConnection::connect(node_id, addr, self.backend_tls.as_ref()).await?;
+        let tls = self.backend_tls.as_ref().map(|t| t.load_full());
+        let conn = BackendConnection::connect(node_id, addr, tls.as_deref()).await?;
         let rest = {
             let mut stream = conn.stream.lock().await;
             login_to_backend(&mut *stream, &session.startup, &session.credentials).await?

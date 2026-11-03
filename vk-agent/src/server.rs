@@ -37,7 +37,7 @@ pub struct AgentServiceImpl {
     pg: Arc<LocalPostgres>,
     pg_ctl: Arc<PgCtl>,
     seeding: Mutex<()>,
-    walg: WalG,
+    walg: Arc<WalG>,
 }
 
 impl AgentServiceImpl {
@@ -47,7 +47,7 @@ impl AgentServiceImpl {
         pg: Arc<LocalPostgres>,
         pg_ctl: Arc<PgCtl>,
     ) -> Self {
-        let walg = WalG::new(&config);
+        let walg = Arc::new(WalG::new(&config));
         Self {
             config,
             heartbeat,
@@ -56,6 +56,11 @@ impl AgentServiceImpl {
             seeding: Mutex::new(()),
             walg,
         }
+    }
+
+    /// What a change of password has to reach.
+    pub fn walg(&self) -> Arc<WalG> {
+        self.walg.clone()
     }
 
     async fn has_data(&self) -> bool {

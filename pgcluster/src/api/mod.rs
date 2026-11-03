@@ -44,6 +44,8 @@ pub struct ApiState {
     pub restart_status: Arc<std::sync::Mutex<restart::RestartStatus>>,
     /// The most recent restore run from this instance.
     pub restore_status: Arc<std::sync::Mutex<restart::RestartStatus>>,
+    /// Settings that change with no restart.
+    pub runtime: Arc<crate::config::runtime::Runtime>,
 }
 
 impl ApiState {
@@ -60,12 +62,13 @@ impl ApiState {
             raft,
             topology,
             metrics,
-            config,
             op_in_progress,
             proxy_drain,
             pool,
             restart_status: Default::default(),
             restore_status: Default::default(),
+            runtime: Arc::new(crate::config::runtime::Runtime::new(&config)),
+            config,
         }
     }
 }
@@ -116,6 +119,7 @@ pub fn router(state: ApiState) -> Router {
                     "/backups",
                     get(backup::list_backups).post(backup::trigger_backup),
                 )
+                .route("/backups/status", get(backup::backup_status))
                 .route("/backups/verify", get(backup::verify_backups))
                 .route(
                     "/backups/restore",

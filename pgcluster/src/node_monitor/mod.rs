@@ -38,7 +38,8 @@ pub struct NodeMonitor {
     config: FailoverConfig,
     metrics: Arc<Metrics>,
     repl_user: String,
-    repl_password: String,
+    /// The name the replication password goes by, for `credentials`.
+    repl_password_env: String,
     slot_prefix: String,
     /// Shared with the API handlers: prevents concurrent automatic + manual operations.
     op_in_progress: Arc<AtomicBool>,
@@ -50,7 +51,6 @@ pub struct NodeMonitor {
     replication: ReplicationConfig,
     /// The role the proxy reads verifiers with, and a version for its settings.
     auth_role: AuthRole,
-    auth_version: String,
     /// The backup tool's settings and their version, when backups are on.
     backup_settings: Option<(HashMap<String, String>, String)>,
     /// How many health-check ticks between orphaned-slot audits on the primary.
@@ -69,7 +69,6 @@ impl NodeMonitor {
         replication: &ReplicationConfig,
         auth_role: &AuthRole,
         backup_settings: Option<HashMap<String, String>>,
-        repl_password: String,
         op_in_progress: Arc<AtomicBool>,
         quorum: Arc<QuorumLease>,
     ) -> Self {
@@ -80,7 +79,7 @@ impl NodeMonitor {
             config,
             metrics,
             repl_user: replication.replication_user.clone(),
-            repl_password,
+            repl_password_env: replication.replication_password_env.clone(),
             slot_prefix: replication.slot_prefix.clone(),
             op_in_progress,
             quorum,
@@ -88,16 +87,16 @@ impl NodeMonitor {
             max_slot_wal_keep_size_mb: replication.max_slot_wal_keep_size_mb,
             replication: replication.clone(),
             auth_role: auth_role.clone(),
-            auth_version: crate::backup::walg::version(&HashMap::from([(
-                auth_role.user.clone(),
-                auth_role.password.clone(),
-            )])),
             backup_settings: backup_settings.map(|settings| {
                 let version = crate::backup::walg::version(&settings);
                 (settings, version)
             }),
             slot_audit_ticks: 120,
         }
+    }
+
+    fn repl_password(&self) -> String {
+        crate::credentials::get(&self.repl_password_env)
     }
 
     /// Run the monitor loop.  Spawn this as a background task.
@@ -284,7 +283,9 @@ impl NodeMonitor {
         };
         let primary_url = format!(
             "postgres://{}:{}@{}/postgres",
-            self.repl_user, self.repl_password, primary_cfg.postgres_addr
+            self.repl_user,
+            self.repl_password(),
+            primary_cfg.postgres_addr
         );
         // Slots more than 1 GiB behind are considered orphaned.
         const ORPHAN_LAG_THRESHOLD: u64 = 1024 * 1024 * 1024;
@@ -426,38 +427,25 @@ impl NodeMonitor {
                     // A replica that was offline during a failover still points at the old
                     // primary; we must demote it to the current primary so it can rejoin.
                     if result.in_recovery && !topology.primary_node_id.is_empty() {
-                        let primary_id = &topology.primary_node_id;
-                        let primary_host = topology
-                            .node_configs
-                            .get(primary_id)
-                            .map(|c| {
-                                c.postgres_addr
-                                    .split(':')
-                                    .next()
-                                    .unwrap_or(&c.postgres_addr)
-                                    .to_string()
-                            })
-                            .unwrap_or_default();
+                        let primary_cfg = topology.node_configs.get(&topology.primary_node_id);
 
                         // Only repoint if the WAL receiver is not already talking to the
-                        // current primary (conninfo will contain host=<primary_host>).
-                        let already_correct = !primary_host.is_empty()
-                            && result.replication_conninfo.contains(&primary_host);
+                        // current primary.
+                        let stale =
+                            primary_cfg.filter(|p| !p.is_target_of(&result.replication_conninfo));
 
-                        if !already_correct {
+                        if let Some(primary_cfg) = stale {
                             info!(
                                 node_id,
-                                primary_host,
+                                primary = primary_cfg.postgres_addr,
                                 conninfo = %result.replication_conninfo,
                                 "recovered replica has stale primary_conninfo — repointing"
                             );
                             if let Ok(mut client) =
                                 self.pool.get_or_connect(node_id, &cfg.agent_addr).await
                             {
-                                let conninfo = format!(
-                                    "host={} port=5432 user={} password={}",
-                                    primary_host, self.repl_user, self.repl_password
-                                );
+                                let conninfo =
+                                    primary_cfg.conninfo(&self.repl_user, &self.repl_password());
                                 let slot_name = format!("{}{}", self.slot_prefix, node_id);
                                 match client.demote(&conninfo, &slot_name, node_id).await {
                                     Ok(r) if r.success => {
@@ -564,7 +552,7 @@ impl NodeMonitor {
                             &self.pool,
                             &self.metrics,
                             &self.repl_user,
-                            &self.repl_password,
+                            &self.repl_password(),
                             &self.slot_prefix,
                         )
                         .await;

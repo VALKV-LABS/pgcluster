@@ -120,13 +120,34 @@ pub async fn remove_node(
     // fresh connection.  If the node is later re-added with the same ID but
     // a different agent_addr, the pool won't return the stale channel.
     s.pool.remove(&node_id);
-    let cmd = TopologyCommand::RemoveNode { node_id };
+    let topology = s.topology.current();
+    let cmd = TopologyCommand::RemoveNode {
+        node_id: node_id.clone(),
+    };
     s.raft
         .raft
         .client_write(cmd)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    drop_slot(&s, &topology, &node_id).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A leftover slot would hold WAL on the primary, up to the slot limit.
+async fn drop_slot(s: &ApiState, topology: &ClusterTopology, node_id: &str) {
+    let Some(addr) = topology.primary_postgres_addr() else {
+        return;
+    };
+    let replication = &s.config.replication;
+    let password = crate::credentials::get(&replication.replication_password_env);
+    let url = format!(
+        "postgres://{}:{password}@{addr}/postgres",
+        replication.replication_user
+    );
+    let slot = format!("{}{node_id}", replication.slot_prefix);
+    if let Err(e) = crate::failover::slots::drop_slot(&url, &slot).await {
+        tracing::warn!(slot, err = %e, "could not drop the node's slot");
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -234,18 +255,6 @@ async fn detach(
         .map_err(|e| anyhow::anyhow!("remove node: {e}"))?;
     s.pool.remove(node_id);
 
-    // A leftover slot would hold WAL on the primary, up to the slot limit.
-    if let Some(addr) = topology.primary_postgres_addr() {
-        let replication = &s.config.replication;
-        let password = std::env::var(&replication.replication_password_env).unwrap_or_default();
-        let url = format!(
-            "postgres://{}:{password}@{addr}/postgres",
-            replication.replication_user
-        );
-        let slot = format!("{}{node_id}", replication.slot_prefix);
-        if let Err(e) = crate::failover::slots::drop_slot(&url, &slot).await {
-            tracing::warn!(slot, err = %e, "could not drop the detached node's slot");
-        }
-    }
+    drop_slot(s, topology, node_id).await;
     Ok(())
 }

@@ -1,0 +1,45 @@
+[api]
+listen_addr = "0.0.0.0:8443"
+# SHA-256 of dev-admin-key-for-the-local-stack-only, the key in admin-compose.yml.
+api_key_hashes = ["a82de29c7a49e719b1ace45c970ad5b6b3ca5edd8b4656b79f4ea13c3d6d3063"]
+
+[agent_api]
+listen_addr = "0.0.0.0:8444"
+
+[tls]
+ca_dir       = "/ca"
+server_names = ["pgcluster-admin", "localhost", "127.0.0.1"]
+
+# The stack's hosts enrol with tokens loaded here, as the AWS template's do.
+[[bootstrap_hosts]]
+name         = "host-1"
+token_sha256 = "229cb9714a25ca6c8752e65f54037c3d9b9d29142f96b2029eca0f9f47ff453c"
+
+[[bootstrap_hosts]]
+name         = "host-systemd"
+token_sha256 = "dd29b6f9de5cc35bb9a50699b94d73d4a6c0b9ba01ef66dc82683fe6f3c7061b"
+
+[[bootstrap_hosts]]
+name           = "host-ha-1"
+failure_domain = "rack-a"
+token_sha256   = "368fdaf8fd4b03f4669abf39609c5a42e775235df8d326afb9afc791bcba99b7"
+
+[[bootstrap_hosts]]
+name           = "host-ha-2"
+failure_domain = "rack-b"
+token_sha256   = "8316e41167dd5ec1f84f44db7283585efc3c0452983a0a951535a38aaee46ef8"
+
+[[bootstrap_hosts]]
+name           = "host-ha-3"
+failure_domain = "rack-c"
+token_sha256   = "5b9e08b31e18c2dbd6f5925eb14e3719f81756ae08abf7de1b8c98c8c30d5885"
+
+[[bootstrap_hosts]]
+name           = "host-ha-4"
+failure_domain = "rack-d"
+token_sha256   = "636cbab3b7e4a0f0ae9fbeed77b8044055e62f7ec2b76858e2915c73bd6f2572"
+
+[[bootstrap_hosts]]
+name           = "host-ha-5"
+failure_domain = "rack-a"
+token_sha256   = "9fe49a4cb5eaa6db1967d951a30dc803d15fbd0795a4135a7c2f11867be9e75e"

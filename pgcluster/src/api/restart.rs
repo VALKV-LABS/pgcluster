@@ -59,8 +59,7 @@ pub async fn start_restart(State(s): State<ApiState>) -> Result<StatusCode, (Sta
         max_lag_bytes: 1024 * 1024,
         sync_timeout_secs: 60,
         replication_user: replication.replication_user.clone(),
-        replication_password: std::env::var(&replication.replication_password_env)
-            .unwrap_or_default(),
+        replication_password: crate::credentials::get(&replication.replication_password_env),
         proxy_drain: s.proxy_drain.clone(),
         drain_timeout: Duration::from_secs(3),
         slot_prefix: replication.slot_prefix.clone(),

@@ -8,28 +8,35 @@
 pub mod capacity;
 pub mod client;
 pub mod config;
+pub mod firewall;
 pub mod fsutil;
 pub mod instance;
 pub mod model;
 pub mod render;
+pub mod restore;
 pub mod runner;
+pub mod tasks;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use client::{AdminClient, Poll};
 use config::HostConfig;
-use instance::{read_applied, InstanceManager};
-use model::{DesiredState, InstanceReport, Report};
+use instance::{read_applied, InstanceManager, Progress, WalSamples};
+use model::{DesiredState, Instance, InstanceReport, Report, RepositoryCheck, Task, TaskResult};
 use render::Layout;
 use runner::{RunAs, Runner};
 
 const ENROLL_RETRY: Duration = Duration::from_secs(5);
 const ERROR_RETRY: Duration = Duration::from_secs(2);
+/// How soon a task waiting for its node gets another look.
+const TASK_TICK: Duration = Duration::from_secs(2);
+/// How often to look at each cluster, while the leader's report is due.
+const WATCH_TICK: Duration = Duration::from_secs(5);
 
 /// What the next report says.
 #[derive(Debug, Default, Clone)]
@@ -39,6 +46,7 @@ pub struct Status {
 }
 
 pub type SharedStatus = Arc<Mutex<Status>>;
+pub type SharedDesired = Arc<RwLock<Option<DesiredState>>>;
 
 fn desired_path(config: &HostConfig) -> PathBuf {
     Path::new(&config.state_dir).join("desired.json")
@@ -85,10 +93,11 @@ fn instances_on_disk(config: &HostConfig) -> Result<Vec<String>> {
 
 pub struct HostAgent {
     config: HostConfig,
-    runner: Box<dyn Runner>,
+    runner: Arc<dyn Runner>,
     run_as: Option<RunAs>,
     client: AdminClient,
     status: SharedStatus,
+    desired: SharedDesired,
 }
 
 impl HostAgent {
@@ -117,6 +126,7 @@ impl HostAgent {
                 observed_generation,
                 state,
                 error,
+                archived_until: None,
             };
             self.status
                 .lock()
@@ -125,8 +135,12 @@ impl HostAgent {
                 .entry(id.clone())
                 .or_insert_with(|| report(observed, "starting", None));
             match manager.apply(instance).await {
-                Ok(()) => {
+                Ok(Progress::Running) => {
                     reports.insert(id, report(instance.generation, "running", None));
+                }
+                Ok(Progress::Seeding) => {
+                    all_ok = false;
+                    reports.insert(id, report(observed, "seeding", None));
                 }
                 Err(e) => {
                     all_ok = false;
@@ -178,8 +192,22 @@ impl HostAgent {
                 tracing::warn!(id, "instance is not running");
                 return false;
             }
+            let layout = Layout::new(&self.config.instances_dir, &id);
+            if self.manager().has_work_left(instance, &layout).await {
+                tracing::info!(id, "promoted with changes left to apply");
+                return false;
+            }
         }
         true
+    }
+
+    fn publish(&self, state: DesiredState) {
+        if let Some(ca) = &state.admin_ca {
+            if let Err(e) = self.client.trust(&ca.bundle_pem) {
+                tracing::error!(err = format!("{e:#}"), "could not update the trusted CAs");
+            }
+        }
+        *self.desired.write().expect("desired lock") = Some(state);
     }
 
     async fn run(self) -> Result<()> {
@@ -189,6 +217,7 @@ impl HostAgent {
                 generation = saved.generation,
                 "resuming saved desired state"
             );
+            self.publish(saved.clone());
             self.reconcile(saved).await;
         }
         let wait = Duration::from_secs(self.config.report_interval_seconds);
@@ -201,6 +230,7 @@ impl HostAgent {
                     if let Err(e) = save_desired(&self.config, &state) {
                         tracing::error!(err = format!("{e:#}"), "could not save desired state");
                     }
+                    self.publish(state.clone());
                     needs_retry = !self.reconcile(&state).await;
                     desired = Some(state);
                 }
@@ -217,7 +247,16 @@ impl HostAgent {
                     tokio::time::sleep(ERROR_RETRY).await;
                 }
             }
-            if let Err(e) = self.client.rotate_if_due().await {
+            let renew = desired
+                .as_ref()
+                .and_then(|d| d.admin_ca.as_ref())
+                .is_some_and(|ca| ca.renew_client_certificate);
+            let rotated = if renew {
+                self.client.renew_certificate().await
+            } else {
+                self.client.rotate_if_due().await
+            };
+            if let Err(e) = rotated {
                 tracing::warn!(err = format!("{e:#}"), "could not rotate the certificate");
             }
         }
@@ -241,7 +280,7 @@ fn spawn_reporter(config: HostConfig, client: AdminClient, status: SharedStatus)
             if last.as_ref() == Some(&current) && since_sent < config.report_interval_seconds {
                 continue;
             }
-            match build_report(&config, snapshot.observed_generation, instances) {
+            match build_report(&config, &client, snapshot.observed_generation, instances) {
                 Ok(report) => match client.report(&report).await {
                     Ok(()) => {
                         last = Some(current);
@@ -255,8 +294,183 @@ fn spawn_reporter(config: HostConfig, client: AdminClient, status: SharedStatus)
     });
 }
 
+/// What a background loop needs to act on an instance.
+#[derive(Clone)]
+struct Worker {
+    config: HostConfig,
+    runner: Arc<dyn Runner>,
+    run_as: Option<RunAs>,
+    client: AdminClient,
+}
+
+impl Worker {
+    fn manager(&self) -> InstanceManager<'_> {
+        InstanceManager {
+            config: &self.config,
+            runner: self.runner.as_ref(),
+            run_as: self.run_as,
+            client: &self.client,
+        }
+    }
+
+    async fn run_task(&self, instance: &Instance, task: &Task) -> bool {
+        let manager = self.manager();
+        if !tasks::is_ours(&manager, instance, task).await {
+            return false;
+        }
+        tracing::info!(id = task.id, kind = task.kind, "running a task");
+        self.client
+            .log(
+                instance.operation_id.as_deref(),
+                &format!("{} on {}", task.kind, instance.node),
+            )
+            .await;
+        let result = match tasks::run(&manager, instance, task).await {
+            Ok(output) => TaskResult {
+                success: true,
+                error: None,
+                output,
+            },
+            Err(e) => TaskResult {
+                success: false,
+                error: Some(format!("{e:#}")),
+                output: serde_json::Value::Null,
+            },
+        };
+        if let Err(e) = self.client.task_result(&task.id, &result).await {
+            tracing::warn!(err = format!("{e:#}"), "could not report a task");
+            return false;
+        }
+        true
+    }
+
+    async fn check_repository(&self, check: &RepositoryCheck) {
+        let dir = Path::new(&self.config.state_dir);
+        let result = async {
+            check.target.validate()?;
+            let probe = dir.join(format!("repository-check-{}", check.id));
+            std::fs::write(&probe, b"pgcluster").context("write a probe")?;
+            let user = self.run_as.map(|u| (u.uid.as_raw(), u.gid.as_raw()));
+            if let Some((uid, gid)) = user {
+                std::os::unix::fs::chown(&probe, Some(uid), Some(gid)).context("chown a probe")?;
+            }
+            let repository = crate::walg::Repository::create(
+                &self.config.walg_path,
+                dir.join(format!("repository-check-{}.json", check.id)),
+                &check.target,
+                user,
+            )
+            .await?;
+            let outcome = repository.check(&probe).await;
+            std::fs::remove_file(&probe).ok();
+            std::fs::remove_file(&repository.config_path).ok();
+            outcome
+        }
+        .await;
+        let error = result.err().map(|e| format!("{e:#}"));
+        if let Err(e) = self
+            .client
+            .repository_check(&check.id, error.as_deref())
+            .await
+        {
+            tracing::warn!(
+                err = format!("{e:#}"),
+                "could not report a repository check"
+            );
+        }
+    }
+}
+
+/// Run tasks as they appear, each on its own, so a long one holds up nothing.
+fn spawn_tasks(worker: Worker, desired: SharedDesired) {
+    tokio::spawn(async move {
+        let running: Arc<Mutex<HashSet<String>>> = Arc::default();
+        let mut ticker = tokio::time::interval(TASK_TICK);
+        loop {
+            ticker.tick().await;
+            let Some(state) = desired.read().expect("desired lock").clone() else {
+                continue;
+            };
+            let claim = |id: &str| running.lock().expect("task lock").insert(id.to_string());
+            for check in state.repository_checks {
+                if claim(&check.id) {
+                    let (worker, running) = (worker.clone(), running.clone());
+                    tokio::spawn(async move {
+                        worker.check_repository(&check).await;
+                        running.lock().expect("task lock").remove(&check.id);
+                    });
+                }
+            }
+            for instance in state.instances {
+                for task in instance.tasks.clone() {
+                    if !claim(&task.id) {
+                        continue;
+                    }
+                    let (worker, running) = (worker.clone(), running.clone());
+                    let instance = instance.clone();
+                    tokio::spawn(async move {
+                        worker.run_task(&instance, &task).await;
+                        running.lock().expect("task lock").remove(&task.id);
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// Watch each instance: the leader says how its cluster stands, and the primary
+/// says how far the WAL archive reaches.
+fn spawn_watcher(worker: Worker, desired: SharedDesired, status: SharedStatus) {
+    tokio::spawn(async move {
+        let mut samples: HashMap<String, WalSamples> = HashMap::new();
+        let mut ticker = tokio::time::interval(WATCH_TICK);
+        let mut ticks = 0u64;
+        let report_every = (worker.config.report_interval_seconds / WATCH_TICK.as_secs()).max(1);
+        loop {
+            ticker.tick().await;
+            ticks += 1;
+            let instances = match desired.read().expect("desired lock").as_ref() {
+                Some(state) => state.instances.clone(),
+                None => continue,
+            };
+            let manager = worker.manager();
+            for instance in &instances {
+                let id = instance.id();
+                let layout = Layout::new(&worker.config.instances_dir, &id);
+                if !layout.data().join("PG_VERSION").exists() {
+                    continue;
+                }
+                let until = manager
+                    .archived_until(instance, samples.entry(id.clone()).or_default())
+                    .await;
+                if let Some(report) = status.lock().expect("status lock").instances.get_mut(&id) {
+                    report.archived_until = until.map(|time| time.to_rfc3339());
+                }
+                if !ticks.is_multiple_of(report_every) {
+                    continue;
+                }
+                let Ok(api) = tasks::LocalApi::new(instance) else {
+                    continue;
+                };
+                if !api.is_leader().await {
+                    continue;
+                }
+                match api.cluster_report(&instance.database_id).await {
+                    Ok(report) => {
+                        if let Err(e) = worker.client.cluster_report(&report).await {
+                            tracing::debug!(err = format!("{e:#}"), "no cluster report");
+                        }
+                    }
+                    Err(e) => tracing::debug!(err = format!("{e:#}"), "no cluster report"),
+                }
+            }
+        }
+    });
+}
+
 fn build_report(
     config: &HostConfig,
+    client: &AdminClient,
     observed_generation: i64,
     instances: Vec<InstanceReport>,
 ) -> Result<Report> {
@@ -270,6 +484,7 @@ fn build_report(
         address,
         capacity: capacity::measure(&config.instances_dir)?,
         instances,
+        ca_fingerprint: client.ca_fingerprint()?,
     })
 }
 
@@ -309,13 +524,24 @@ pub async fn run(config_path: &str) -> Result<()> {
     tracing::info!(host_id = client.host_id, "vk-agent host running");
 
     let status: SharedStatus = Arc::default();
+    let desired: SharedDesired = Arc::default();
+    let runner: Arc<dyn Runner> = Arc::from(runner::build(&config));
+    let worker = Worker {
+        config: config.clone(),
+        runner: runner.clone(),
+        run_as,
+        client: client.clone(),
+    };
     spawn_reporter(config.clone(), client.clone(), status.clone());
+    spawn_tasks(worker.clone(), desired.clone());
+    spawn_watcher(worker, desired.clone(), status.clone());
     let agent = HostAgent {
-        runner: runner::build(&config),
+        runner,
         config,
         run_as,
         client,
         status,
+        desired,
     };
     agent.run().await
 }
