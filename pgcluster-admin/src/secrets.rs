@@ -161,7 +161,7 @@ impl SecretBox {
             )
         };
         let plain = open_with(&self.cipher)
-            .or_else(|e| self.previous.as_ref().map_or(Err(e), &open_with))
+            .or_else(|e| self.previous.as_ref().map_or(Err(e), open_with))
             .map_err(|_| anyhow::anyhow!("decrypt secrets: wrong key or altered data"))?;
         Ok(serde_json::from_slice(&plain)?)
     }
