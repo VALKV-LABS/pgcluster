@@ -67,10 +67,15 @@ impl ProxyConnection {
         pool: Arc<ConnectionPool>,
         tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
         auth: Arc<AuthQuery>,
+        require_tls: bool,
     ) -> Result<()> {
         // ── 1. SSL negotiation ────────────────────────────────────────────
         let tls_ref = tls.as_deref();
         let mut client = handle_ssl_owned(stream, tls_ref).await?;
+        if require_tls && matches!(client, MaybeTlsStream::Plain(_)) {
+            write_error_response(&mut client, "FATAL", "28000", "this server requires TLS").await?;
+            return Ok(());
+        }
 
         // ── 2. Read startup message ───────────────────────────────────────
         let startup = read_startup_message(&mut client)

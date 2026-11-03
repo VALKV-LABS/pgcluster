@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "pgcluster",
+    "pgcluster-admin",
     "vk-agent",
 ]
 

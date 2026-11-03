@@ -1,6 +1,8 @@
+pub mod admin;
 pub mod certs;
 pub mod client;
 pub mod config;
+pub mod console;
 pub mod failover;
 pub mod init;
 pub mod node;
@@ -39,6 +41,12 @@ pub enum Commands {
     Init(init::InitArgs),
     /// Generate a cluster CA and certificates
     Certs(certs::CertsArgs),
+    /// Manage hosts through pgcluster-admin
+    Host(admin::HostArgs),
+    /// Manage databases through pgcluster-admin
+    Database(admin::DatabaseArgs),
+    /// Run a local web page for trying every operation
+    Console(console::ConsoleArgs),
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -53,5 +61,8 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Config(args) => config::run(args).await,
         Commands::Init(args) => init::run(args).await,
         Commands::Certs(args) => certs::run(args).await,
+        Commands::Host(args) => admin::run_host(args).await,
+        Commands::Database(args) => admin::run_database(args).await,
+        Commands::Console(args) => console::run(args).await,
     }
 }

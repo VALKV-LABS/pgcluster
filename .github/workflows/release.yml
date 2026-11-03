@@ -1,15 +1,20 @@
 name: Release
 
-# Every push to main publishes both images as `edge`. That also keeps the build
+# Every push to main publishes every image as `edge`. That also keeps the build
 # cache warm, so a release reuses it.
 #
-# Pushing a tag vX.Y.Z publishes both images for amd64 and arm64 as X.Y.Z, X.Y
-# and latest, and creates the GitHub release. CI runs first, unless it already
+# Pushing a tag vX.Y.Z publishes every image for amd64 and arm64 as X.Y.Z, X.Y
+# and latest, publishes the node image as a public AMI, and creates the GitHub
+# release. CI runs first, unless it already
 # passed on main for the tagged commit.
 #
 # Requires two repository secrets:
 #   DOCKERHUB_USERNAME — Docker Hub username (valkvlabs)
 #   DOCKERHUB_TOKEN    — Docker Hub access token (create at hub.docker.com → Account Settings → Security)
+#
+# The AMI job runs once the repository variable AWS_AMI_ROLE_ARN names an IAM role
+# this repository can assume, and is skipped until then. AWS_AMI_REGIONS lists
+# further regions to copy it to, comma separated.
 
 on:
   push:
@@ -60,7 +65,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [pgcluster, vk-agent]
+        component: [pgcluster, vk-agent, pgcluster-admin]
         arch: [amd64, arm64]
         include:
           - arch: amd64
@@ -73,6 +78,9 @@ jobs:
           - component: vk-agent
             image: valkvlabs/vk-agent
             dockerfile: docker/vk-agent.Dockerfile
+          - component: pgcluster-admin
+            image: valkvlabs/pgcluster-admin
+            dockerfile: docker/admin.Dockerfile
     steps:
       - uses: actions/checkout@v4
 
@@ -142,7 +150,7 @@ jobs:
           else
             tags=edge
           fi
-          for component in pgcluster vk-agent; do
+          for component in pgcluster vk-agent pgcluster-admin; do
             image="valkvlabs/$component"
             sources=""
             for arch in amd64 arm64; do
@@ -153,6 +161,58 @@ jobs:
             # shellcheck disable=SC2086
             docker buildx imagetools create $args $sources
           done
+
+  # ── Node image ────────────────────────────────────────────────────────────────
+  # Takes the binaries from the images just published, so the AMI runs the same
+  # build. Packer needs AWS access, which only a release gets.
+  ami:
+    name: Publish node image ${{ matrix.arch }}
+    needs: publish
+    if: ${{ !cancelled() && needs.publish.result == 'success' && startsWith(github.ref, 'refs/tags/') && vars.AWS_AMI_ROLE_ARN != '' }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: amd64
+            runner: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_AMI_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: hashicorp/setup-packer@v3
+        with:
+          version: 1.11.2
+
+      - name: Copy the binaries out of the release images
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p images/bin
+          for component in pgcluster vk-agent pgcluster-admin; do
+            container=$(docker create "valkvlabs/$component:$version")
+            docker cp "$container:/usr/local/bin/$component" "images/bin/$component"
+            docker rm "$container"
+          done
+
+      - name: Build and publish the AMI
+        working-directory: images
+        run: |
+          packer init node.pkr.hcl
+          packer build \
+            -var "version=${GITHUB_REF_NAME#v}" \
+            -var "arch=${{ matrix.arch }}" \
+            -var "public=true" \
+            -var "copy_regions=[$(echo '${{ vars.AWS_AMI_REGIONS }}' | sed 's/[^,][^,]*/"&"/g')]" \
+            node.pkr.hcl
 
   # ── GitHub release ────────────────────────────────────────────────────────────
   github-release:
@@ -180,6 +240,7 @@ jobs:
             echo '```'
             echo "docker pull valkvlabs/pgcluster:$version"
             echo "docker pull valkvlabs/vk-agent:$version"
+            echo "docker pull valkvlabs/pgcluster-admin:$version"
             echo '```'
           } >> notes.md
 

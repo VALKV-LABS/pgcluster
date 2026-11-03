@@ -26,6 +26,24 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  openapi:
+    name: API Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate the admin and agent contracts
+        run: make lint-openapi
+
+  deploy:
+    name: Node Image and AWS Template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate the Packer recipe and the Terraform template
+        run: make lint-deploy
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

@@ -1,0 +1,60 @@
+[package]
+name    = "pgcluster-admin"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "pgcluster-admin"
+path = "src/main.rs"
+
+[lib]
+name = "pgcluster_admin"
+path = "src/lib.rs"
+
+[dependencies]
+# Workspace
+tokio.workspace      = true
+serde.workspace      = true
+serde_json.workspace = true
+toml.workspace       = true
+anyhow.workspace     = true
+thiserror.workspace  = true
+tracing.workspace    = true
+tracing-subscriber.workspace = true
+uuid.workspace       = true
+chrono.workspace     = true
+hex.workspace        = true
+
+# Metadata
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "chrono", "json", "macros", "migrate"] }
+
+# HTTP
+axum       = { version = "0.7", features = ["macros"] }
+hyper      = { version = "1", features = ["server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+tower      = { version = "0.4", features = ["util"] }
+
+# TLS and the internal CA
+rcgen            = { version = "0.13", features = ["pem", "x509-parser"] }
+x509-parser      = "0.16"
+rustls           = { version = "0.23", features = ["ring"] }
+rustls-pemfile   = "2"
+rustls-pki-types = "1"
+tokio-rustls     = "0.26"
+
+# Secrets
+base64           = "0.22"
+chacha20poly1305 = "0.10"
+rand             = "0.8"
+sha2             = "0.10"
+subtle           = "2"
+
+# Utils
+clap  = { version = "4", features = ["derive", "env"] }
+ipnet = "2"
+
+[dev-dependencies]
+rcgen      = { version = "0.13", features = ["pem"] }
+reqwest    = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+serde_yaml = "0.9"
+tempfile   = "3"

@@ -1,0 +1,17 @@
+[Unit]
+Description=vk-agent host
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/vk-agent/host.env
+ExecStartPre=/bin/sh /usr/local/bin/host-entry.sh true
+ExecStart=/usr/local/bin/vk-agent host /etc/vk-agent/host.toml
+Restart=always
+RestartSec=2
+# Instances have units of their own, and must outlive this agent.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

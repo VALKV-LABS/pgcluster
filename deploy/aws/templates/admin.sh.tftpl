@@ -1,0 +1,42 @@
+#!/bin/sh
+# Starts Postgres and pgcluster-admin on this VM.
+set -eu
+
+pg_createcluster ${postgres_major} metadata --start
+runuser -u postgres -- psql -c "CREATE ROLE pgcluster_admin LOGIN PASSWORD '${metadata_db}'"
+runuser -u postgres -- createdb -O pgcluster_admin pgcluster_admin
+
+install -d -o pgcluster-admin -g pgcluster-admin -m 700 /var/lib/pgcluster-admin/ca
+cat > /var/lib/pgcluster-admin/ca/ca.crt <<'PEM'
+${ca_cert}PEM
+umask 077
+cat > /var/lib/pgcluster-admin/ca/ca.key <<'PEM'
+${ca_key}PEM
+chown pgcluster-admin:pgcluster-admin /var/lib/pgcluster-admin/ca/ca.crt /var/lib/pgcluster-admin/ca/ca.key
+
+cat > /etc/pgcluster-admin/admin.env <<'ENV'
+PGCLUSTER_ADMIN_DATABASE_URL=postgres://pgcluster_admin:${metadata_db}@127.0.0.1:5432/pgcluster_admin
+PGCLUSTER_ADMIN_SECRET_KEY=${secret_key}
+ENV
+
+cat > /etc/pgcluster-admin/config.toml <<'TOML'
+[api]
+listen_addr = "0.0.0.0:8443"
+api_key_hashes = ["${api_key_hash}"]
+
+[agent_api]
+listen_addr = "0.0.0.0:8444"
+
+[tls]
+ca_dir       = "/var/lib/pgcluster-admin/ca"
+server_names = [%{ for i, name in server_names }%{ if i > 0 }, %{ endif }"${name}"%{ endfor }]
+%{ for i, name in host_names }
+[[bootstrap_hosts]]
+name         = "${name}"
+token_sha256 = "${token_hashes[i]}"
+%{ endfor ~}
+TOML
+chgrp pgcluster-admin /etc/pgcluster-admin/admin.env /etc/pgcluster-admin/config.toml
+chmod 640 /etc/pgcluster-admin/admin.env /etc/pgcluster-admin/config.toml
+
+systemctl enable --now pgcluster-admin

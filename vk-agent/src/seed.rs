@@ -144,8 +144,26 @@ pub(crate) async fn set_owner_only(_data_dir: &Path) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
     use tempfile::TempDir;
+
+    /// Write an executable script from a child process. Tests run in parallel,
+    /// and a write handle open here can leak into a process another test is
+    /// forking, which makes running the script fail with ETXTBSY.
+    fn write_script(path: &Path, contents: &str) {
+        let mut writer = std::process::Command::new("sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = writer.stdin.take().unwrap();
+        stdin.write_all(contents.as_bytes()).unwrap();
+        drop(stdin);
+        assert!(writer.wait().unwrap().success());
+    }
 
     /// Fake pg_ctl and pg_basebackup that log their arguments. pg_ctl reports
     /// `status_code` for `status`, and pg_basebackup exits with `backup_code`.
@@ -154,9 +172,7 @@ mod tests {
         let data = bin.path().join("data");
         let log = bin.path().join("calls.log");
         let script = |name: &str, body: String| {
-            let path = bin.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_script(&bin.path().join(name), &format!("#!/bin/sh\n{body}\n"));
         };
         script(
             "pg_ctl",
@@ -188,15 +204,13 @@ mod tests {
         std::fs::write(data.join("kept"), "x").unwrap();
         let script = bin.path().join("pg_rewind");
         let log = bin.path().join("calls.log");
-        std::fs::write(
+        write_script(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\necho \"pg_rewind $* PGPASSWORD=$PGPASSWORD\" >> {}\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         rewind(&pg_ctl, &data, &request(false)).await.unwrap();
 
@@ -214,8 +228,7 @@ mod tests {
         let (bin, pg_ctl, data) = fake_tools(3, 0);
         std::fs::create_dir_all(&data).unwrap();
         let script = bin.path().join("pg_rewind");
-        std::fs::write(&script, "#!/bin/sh\necho 'no rewind required' >&2\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&script, "#!/bin/sh\necho 'no rewind required' >&2\n");
 
         let err = rewind(&pg_ctl, &data, &request(false)).await.unwrap_err();
 
@@ -232,8 +245,7 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         std::fs::write(data.join("kept"), "x").unwrap();
         let script = bin.path().join("pg_rewind");
-        std::fs::write(&script, "#!/bin/sh\necho diverged >&2\nexit 1\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&script, "#!/bin/sh\necho diverged >&2\nexit 1\n");
 
         let err = rewind(&pg_ctl, &data, &request(false)).await.unwrap_err();
 

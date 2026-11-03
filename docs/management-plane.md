@@ -1,6 +1,6 @@
 # Management Plane Specification
 
-**Status:** proposed. Nothing in this document is built yet.
+**Status:** Stage 1 is built, and its AWS path awaits its first run. Later stages are proposed. [`todo.md`](../todo.md) tracks each step.
 **Audience:** contributors, and operators who run their own Postgres fleet.
 
 ## 1. Summary
@@ -37,7 +37,7 @@ An operator enrols their hosts, calls `POST /v1/databases`, and gets a running P
 
 **Non-goals**
 
-- Multi-tenancy, billing or a portal. An optional opaque `workspace` label lets a layer above group databases, and `pgcluster-admin` attaches no meaning to it.
+- Multi-tenancy, billing or a portal for users. An optional opaque `workspace` label lets a layer above group databases, and `pgcluster-admin` attaches no meaning to it. `pgcluster console` is a local tool for one operator to try the system.
 - Provisioning machines inside `pgcluster-admin`. The AWS template (§12) sits alongside it as a separate example.
 - Active-active or multi-master replication.
 - Automatic cross-region failover.
@@ -129,7 +129,7 @@ deploy/aws/        Terraform template for a test fleet
 
 Conventions:
 
-- Authentication is `Authorization: Bearer <key>`. `pgcluster-admin` refuses to start with no keys configured.
+- Authentication is `Authorization: Bearer <key>`. `pgcluster-admin` refuses to start with no keys configured, stores only their hashes, and accepts no key under 32 characters.
 - Errors are `{ "error": { "code": "...", "message": "..." } }`.
 - Lists are `{ "items": [...], "next_page_token": "..." }`, with `limit` and `page_token`.
 - Changes that take time return `202` and an operation.
@@ -219,15 +219,17 @@ The event feed reports state changes such as `node_offline`, `failover_completed
 `vk-agent host` calls these endpoints; `pgcluster-admin` never calls a host.
 
 ```
+GET  /agent/v1/ca                      the CA certificate, checked against the token
 POST /agent/v1/enroll                  single-use token and a key pair → client certificate
+POST /agent/v1/certificate             a new key pair → a new client certificate
 GET  /agent/v1/desired-state           ?generation=N, long-polled
 POST /agent/v1/report                  observed_generation, capacity, instance health
 POST /agent/v1/operations/{id}/log     step output
 ```
 
-- Enrolment tokens are single-use and expire after 15 minutes.
+- Enrolment tokens are single-use and expire after 15 minutes. A token ends in the hash of the CA certificate, so a new host can verify the server with nothing else copied to it.
 - Every later call uses mutual TLS, and a certificate can only read or report its own host's state.
-- `pgcluster-admin` is the certificate authority for host certificates, and rotates them.
+- `pgcluster-admin` is the certificate authority for host certificates, and rotates them. Each database has its own CA, and node certificates last 90 days and renew through desired state, with no restart.
 
 **Desired state** lists the instances a host should run:
 
@@ -245,11 +247,15 @@ POST /agent/v1/operations/{id}/log     step output
       "bootstrap": "initdb",
       "replication_mode": "sync",
       "allowed_cidrs": ["198.51.100.0/24"],
-      "extensions": ["vector", "pg_trgm"]
+      "extensions": ["vector", "pg_trgm"],
+      "owner": { "username": "app_owner", "scram_verifier": "SCRAM-SHA-256$..." },
+      "secrets": { "ca_cert_pem": "...", "cert_pem": "...", "key_pem": "...", "...": "..." }
     }
   ]
 }
 ```
+
+`secrets` carries the instance's certificate and internal passwords, which all of a database's nodes must share. `pgcluster-admin` encrypts them at rest, sends them only to the host that runs the instance, and a host keeps them readable by its owner alone.
 
 The agent API is a public contract. Anything that serves it can drive `vk-agent host`.
 
@@ -329,7 +335,7 @@ Scheduling stays on each cluster's Raft leader, so backups continue during a man
 ### Network
 
 - Clients reach the proxy only. Postgres, Raft and agent ports accept the database's own nodes.
-- The allowlist is a whole-list `PUT`, applied to `pg_hba.conf` and the host firewall. Empty means no access. Public access is the explicit entry `0.0.0.0/0`.
+- The allowlist is a whole-list `PUT`, applied at the proxy and reloaded without dropping connected clients. The proxy is the only process that sees a client's address: Postgres sees the proxy, so `pg_hba.conf` cannot filter clients. Stage 2 also applies it to the host firewall. Empty means no access. Public access is the explicit entry `0.0.0.0/0`.
 - TLS is required at the proxy. `pgcluster-admin` issues a certificate by default, and `PUT .../certificate` replaces it.
 - The owner role gets `CREATEDB` and `CREATEROLE`, not superuser.
 
@@ -402,7 +408,7 @@ The management plane depends on the data plane meeting these requirements:
 
 | Path | Needs | What you get |
 |---|---|---|
-| Local | Docker | The full stack on one machine, with `make start` |
+| Local | Docker | The full stack on one machine, with `make try` |
 | AWS | An AWS account and Terraform | A test fleet in your own account |
 
 ### AWS
@@ -424,7 +430,7 @@ Terraform prints the admin API URL and a generated API key. `terraform destroy` 
 
 - **Your credentials stay in Terraform.** They never reach `pgcluster-admin` or the hosts. Hosts use an instance role limited to the backup bucket.
 - **`allowed_cidr` has no default.** Nothing opens to the internet unless you ask, and the admin API and databases accept only that range.
-- **Enrolment needs no admin key on the hosts.** Terraform generates one single-use token per host and loads their hashes into `pgcluster-admin` at boot.
+- **Enrolment needs no admin key on the hosts.** Terraform generates one single-use token per host and loads their hashes into `pgcluster-admin` at boot, through `[[bootstrap_hosts]]`.
 - **Terraform state holds the generated API key.** Treat the state file as a secret.
 - **It is for testing, not production.** `pgcluster-admin` is a single VM, and the default size is `t4g.small`.
 - **It costs money while it runs.** Four on-demand `t4g.small` VMs in `us-east-1` cost about $0.07 per hour, plus storage.

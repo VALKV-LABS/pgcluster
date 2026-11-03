@@ -83,6 +83,36 @@ pgcluster init --config /etc/pgcluster/pgcluster.toml
 # Creates Raft data directory, validates Postgres connectivity
 ```
 
+### Management Plane
+
+These talk to `pgcluster-admin`. Set `PGCLUSTER_ADMIN_URL`, `PGCLUSTER_ADMIN_KEY` and, for a private CA, `PGCLUSTER_ADMIN_CA`, or pass `--admin-url`, `--api-key` and `--ca-cert`.
+
+```sh
+pgcluster host add host-1 --failure-domain rack-1   # Prints the enrolment token, once
+pgcluster host list
+pgcluster host show <id>
+pgcluster host delete <id>
+
+pgcluster database create orders --allow 198.51.100.0/24 --extension vector --wait
+pgcluster database list
+pgcluster database show <id>
+pgcluster database allow <id> 198.51.100.0/24 203.0.113.4/32 --wait   # Replaces the whole list
+pgcluster database extensions <id> vector pg_trgm --wait              # Replaces the whole list
+pgcluster database rotate-password <id> --wait
+pgcluster database delete <id> --wait
+```
+
+`database create` and `rotate-password` generate the password on this machine and send only its SCRAM verifier. The password is printed once. With `--wait`, `database create` also writes the database's CA to `ca.crt` and prints a `psql` command.
+
+### Console
+
+```sh
+pgcluster console --admin-url https://localhost:18443 --admin-ca admin-ca.crt \
+  --cluster-url http://localhost:8009
+```
+
+Serves a local page for trying every operation, on `127.0.0.1:8080` unless `--listen` says otherwise. It holds the API keys, so it answers only to the names `localhost` and `127.0.0.1`. `make try` runs it with the full stack.
+
 ### Coordinator Mode (M5-A)
 
 ```bash

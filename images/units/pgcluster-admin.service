@@ -1,0 +1,20 @@
+[Unit]
+Description=pgcluster-admin
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=pgcluster-admin
+EnvironmentFile=/etc/pgcluster-admin/admin.env
+ExecStart=/usr/local/bin/pgcluster-admin --config /etc/pgcluster-admin/config.toml
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/pgcluster-admin
+
+[Install]
+WantedBy=multi-user.target

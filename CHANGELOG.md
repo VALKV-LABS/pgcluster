@@ -16,6 +16,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Breaking:** `[tls] auto_generate` and `pgcluster init --gen-certs` are gone, because they gave each node its own CA. Use `pgcluster certs`.
 
 ### Fixed
+- A cluster whose Raft address is on loopback binds Raft there, not on every interface.
 - The proxy caps the idle backends it keeps per database and user. Each login added one, so short-lived clients could exhaust Postgres connections.
 - Switchover stops the old primary before promoting the target, then creates slots on the new primary. Before, standbys could not follow the new primary after a switchover.
 - Repointing a standby applies with a reload, so standbys follow a new primary after a failover without a restart.
@@ -40,6 +41,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `vk-agent` starts with no Postgres running, and skips self-fencing while there is none to fence.
 
 ### Added
+- `pgcluster-admin`: one service for a fleet, with an admin API, an agent API, Postgres for metadata, and required `api_keys`. Contracts are in `openapi/`. It creates, changes and deletes one-node databases, as stored operations that resume after a restart.
+- `vk-agent host`: a mode of `vk-agent` that enrols a machine with a single-use token, long-polls desired state, and runs instances under systemd or as plain processes. It opens no port and keeps its last state on disk. `vk-agent <config>` is unchanged.
+- `pgcluster host` and `pgcluster database` commands. `pgcluster database create` generates the password locally and sends only its verifier.
+- `pgcluster console`: a local web page for trying every operation of both planes and checking the result. `make try` starts the full stack and points at it. `make start` now includes `pgcluster-admin`, a host and the console.
+- `[proxy] allowed_cidrs`, reloaded on SIGHUP, and `[proxy] require_tls`.
+- `pgcluster` and `vk-agent` reload their certificates on SIGHUP, with no restart. Node certificates from `pgcluster-admin` last 90 days and renew by themselves.
+- A node image recipe in `images/` and a Terraform template in `deploy/aws/`.
+- Docker image `valkvlabs/pgcluster-admin`.
 - External standbys: `"external": true` on `POST /api/nodes/add` adds a node that follows the primary but stays outside failover, synchronous commit, backups and rolling restarts. `POST /api/nodes/:id/detach` promotes it into an independent database.
 - Backups use WAL-G, run by `vk-agent` from the least-lagged standby, falling back to the primary: full and delta backups, retention, WAL archiving from whichever node is primary, and encryption with libsodium.
 - `POST /api/backups/restore` restores to a point in time onto a separate agent, as an independent database. `{"from_backup": true}` on `POST /api/nodes/:id/seed` seeds a node from a backup.

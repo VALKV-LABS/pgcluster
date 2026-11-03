@@ -64,3 +64,7 @@ vk-agent/src/tls.rs   # Server TLS config for the agent
 - `raft` uses `tonic_server_tls_config()` for its listener and `tonic_client_tls_config()` for peer connections.
 - `agent_clients` uses `tonic_client_tls_config()` for connections to vk-agent.
 - `proxy` uses `server_tls_acceptor()` for clients and `client_tls_connector()` for Postgres.
+
+## Reloading Certificates
+
+SIGHUP makes `pgcluster` and `vk-agent` read their certificate files again, with no restart. The proxy swaps its acceptor, so connected clients are untouched. Each gRPC server starts a new generation on the same listener, so RPCs in flight finish on the old certificate and the port never stops accepting. Outbound gRPC drops its cached channels, so new ones present the new certificate. Postgres needs `pg_ctl reload`. If the files do not load, the old certificates stay in use and the error is logged.

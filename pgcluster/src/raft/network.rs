@@ -10,6 +10,7 @@ use openraft::{
 use tonic::transport::ClientTlsConfig;
 
 use crate::raft::types::{NodeId, RaftTypeConfig};
+use crate::tls::SharedClientTls;
 
 // ── Generated proto module ────────────────────────────────────────────────────
 
@@ -29,11 +30,11 @@ mod raft_proto {
 /// Pass a TLS config to verify peers and present this node's client certificate.
 pub struct PgClusterNetworkFactory {
     /// `None` → plaintext HTTP/2, for development.
-    pub tls: Option<ClientTlsConfig>,
+    pub tls: Option<SharedClientTls>,
 }
 
 impl PgClusterNetworkFactory {
-    pub fn new(tls: Option<ClientTlsConfig>) -> Self {
+    pub fn new(tls: Option<SharedClientTls>) -> Self {
         Self { tls }
     }
 }
@@ -58,7 +59,7 @@ pub struct RaftNetworkConnection {
     #[allow(dead_code)]
     target: NodeId,
     target_addr: String,
-    tls: Option<ClientTlsConfig>,
+    tls: Option<SharedClientTls>,
 }
 
 impl RaftNetworkConnection {
@@ -84,7 +85,7 @@ impl RaftNetworkConnection {
         let mut builder = tonic::transport::Channel::builder(uri);
         if let Some(cfg) = &self.tls {
             builder = builder
-                .tls_config(cfg.clone())
+                .tls_config(ClientTlsConfig::clone(&cfg.load()))
                 .map_err(|e| net_err(&format!("TLS config: {e}")))?;
         }
 

@@ -50,28 +50,35 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 
 ## Part 6: Management plane, one node (Stage 1)
 
-- [ ] **6.1 Define the contracts.** Write the admin and agent APIs in `openapi/`. *Done when:* both validate in CI.
-- [ ] **6.2 Scaffold `pgcluster-admin`.** Service, Postgres schema and migrations, and required API keys. *Done when:* it starts, migrates and serves health.
-- [ ] **6.3 Add hosts and enrolment.** Single-use tokens, the internal CA and client certificates. *Done when:* a host enrols, and a reused or expired token is rejected.
-- [ ] **6.4 Add `vk-agent host`.** New mode in the existing binary, with `vk-agent <config>` unchanged. It enrols, reports capacity and long-polls desired state. *Done when:* it runs as its own process, opens no port, and keeps its last state on disk.
-- [ ] **6.5 Add config rendering.** Generate each instance's `pgcluster` and `vk-agent` config from desired state. *Done when:* output passes `pgcluster` validation.
-- [ ] **6.6 Add process runners.** systemd for production, plain processes for development and tests. *Done when:* the host agent starts, stops and restarts an instance with both.
-- [ ] **6.7 Add the reconciler and operations.** Stored steps with `FOR UPDATE SKIP LOCKED`, `generation` and `observed_generation`. *Done when:* a restarted `pgcluster-admin` resumes an operation with no duplicate work.
-- [ ] **6.8 Add the database API for one node.** Create, read, delete, the owner role with a SCRAM verifier, and the allowlist. *Done when:* a database is created through the API and reachable over TLS.
-- [ ] **6.9 Add extensions.** *Done when:* each listed extension installs through the API without superuser.
-- [ ] **6.10 Add CLI commands.** *Done when:* the CLI covers enrolment and creating a database, and generates the password locally.
-- [ ] **6.11 Build the node image.** Packer recipe in `images/`, published as a public AMI with each release. *Done when:* a host from the AMI enrols.
-- [ ] **6.12 Add local quick start.** *Done when:* `make start` runs the full stack, including `pgcluster-admin` and the host agent.
-- [ ] **6.13 Add the AWS template.** Terraform in `deploy/aws/`, with a required `allowed_cidr` and per-host single-use tokens. *Done when:* one `terraform apply` produces a working database, and `terraform destroy` removes everything.
+- [x] **6.1 Define the contracts.** Write the admin and agent APIs in `openapi/`. *Done when:* both validate in CI.
+- [x] **6.2 Scaffold `pgcluster-admin`.** Service, Postgres schema and migrations, and required API keys. *Done when:* it starts, migrates and serves health.
+- [x] **6.3 Add hosts and enrolment.** Single-use tokens, the internal CA and client certificates. *Done when:* a host enrols, and a reused or expired token is rejected.
+- [x] **6.4 Add `vk-agent host`.** New mode in the existing binary, with `vk-agent <config>` unchanged. It enrols, reports capacity and long-polls desired state. *Done when:* it runs as its own process, opens no port, and keeps its last state on disk.
+- [x] **6.5 Add config rendering.** Generate each instance's `pgcluster` and `vk-agent` config from desired state. *Done when:* output passes `pgcluster` validation.
+- [x] **6.6 Add process runners.** systemd for production, plain processes for development and tests. *Done when:* the host agent starts, stops and restarts an instance with both.
+- [x] **6.7 Add the reconciler and operations.** Stored steps with `FOR UPDATE SKIP LOCKED`, `generation` and `observed_generation`. *Done when:* a restarted `pgcluster-admin` resumes an operation with no duplicate work.
+- [x] **6.8 Add the database API for one node.** Create, read, delete, the owner role with a SCRAM verifier, and the allowlist. *Done when:* a database is created through the API and reachable over TLS.
+- [x] **6.9 Add extensions.** *Done when:* each listed extension installs through the API without superuser.
+- [x] **6.10 Add CLI commands.** *Done when:* the CLI covers enrolment and creating a database, and generates the password locally.
+- [ ] **6.11 Build the node image.** Packer recipe in `images/`, published as a public AMI with each release. *Done when:* a host from the AMI enrols. **Pending verification:** the recipe validates in CI and installs the versions the tested Docker host uses, but no AMI has been built. This needs an AWS account for releases, with `AWS_AMI_ROLE_ARN` set and public AMIs allowed.
+- [x] **6.12 Add local quick start.** *Done when:* `make start` runs the full stack, including `pgcluster-admin` and the host agent.
+- [ ] **6.13 Add the AWS template.** Terraform in `deploy/aws/`, with a required `allowed_cidr` and per-host single-use tokens. User data holds no long-lived secrets: not the CA key, the key that encrypts instance secrets, or the metadata database password. *Done when:* one `terraform apply` produces a working database, `terraform destroy` removes everything, and no VM's user data holds those secrets. **Pending verification:** the template validates in CI, and its boot scripts and CA were tested without AWS, but it has never been applied. This needs 6.11, an AWS account, and the published AMI's owner as the default for `ami_owner`.
+- [x] **6.14 add web app** for locally launching and trying out all operations for pgcluster and verify results (sort of management portal for pgcluster)
+- [x] **6.15 makefilE** add to make file running fullstack and trying out web app to verify how system works (creating/database/backups/switch over etc)
+- [x] **6.16 Harden the admin and agent APIs.** `pgcluster-admin` config holds hashes of API keys, not the keys, with a minimum key length. Enrolment and other routes open before authentication have a concurrency limit. *Done when:* a short key can be neither hashed nor used, a copy of the config cannot be used to call the API, and a flood of enrolment requests cannot exhaust the metadata database's connections, by test.
+- [x] **6.17 Rotate instance certificates.** Instance certificates have a bounded lifetime, and are reissued through desired state before they expire. *Done when:* an instance moves to a new certificate with no client downtime, by test.
+- [ ] **6.18 Document the deployment security model.** `SECURITY.md` covers where keys and passwords live on disk, who can read them, and how to protect them. *Done when:* an operator can see from it what each file holds and what to back up.
+- [ ] **6.19 Keep named prepared statements working through the proxy.** Today a statement prepared on one client connection can fail with `prepared statement does not exist` once another client has connected and gone, because the proxy pools backends by transaction. *Done when:* a client that repeats a named prepared statement keeps working while other clients connect and disconnect, by test, or the limit and the driver settings that avoid it are documented.
 
 ## Part 7: Management plane, high availability (Stage 2)
 
-- [ ] **7.1 Create three-node databases.** *Done when:* nodes land on separate hosts and failure domains.
+- [ ] **7.1 Create three-node databases.** The host firewall applies the allowlist, and peer ports accept only the database's own nodes. *Done when:* nodes land on separate hosts and failure domains, and a machine outside the database cannot reach its peer ports, by test.
 - [ ] **7.2 Expose replication modes through the API.** *Done when:* `PATCH` changes the mode online.
 - [ ] **7.3 Add node replacement.** Replace a node through the API, using 5.1 and 5.2. *Done when:* replacement completes under client load.
 - [ ] **7.4 Add the event feed.** `GET /v1/events`, including `replacement_needed`. *Done when:* tooling can react without polling every database.
 - [ ] **7.5 Add switchover and restart.** *Done when:* both run as operations with logs.
 - [ ] **7.6 Add the HA test suite.** *Done when:* primary loss, a network partition and node replacement pass in all three modes.
+- [ ] **7.7 Add secret rotation.** Covers the key that encrypts instance secrets, the admin CA, each database's CA, and instance internal passwords. *Done when:* each rotates under client load with no failed commits, and an old value stops working afterwards, by test.
 
 ## Part 8: Management plane, backups (Stage 3)
 
@@ -92,7 +99,9 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 - [ ] **10.1 Add resizing.** Resources and storage. *Done when:* each passes under client load.
 - [ ] **10.2 Add minor upgrades.** *Done when:* a rolling upgrade passes under client load.
 - [ ] **10.3 Add cross-region replicas.** Uses 5.9. *Done when:* a replica promotes into an independent database through the API.
-- [ ] **10.4 Release `v1.0.0`.** *Done when:* every stage in the spec meets its completion check, and the upgrade path from `v0.2.0` is documented.
+- [ ] **10.4 Limit connections.** Cap TLS handshakes and open connections on the admin API, the agent API and the proxy. *Done when:* a connection flood cannot stop enrolled hosts or existing clients from working, by test.
+- [ ] **10.5 Add API key identities and an audit log.** Each key has a name, and every change records which key made it. *Done when:* each change through the admin API can be traced to one key, and a key can be revoked alone.
+- [ ] **10.6 Release `v1.0.0`.** *Done when:* every stage in the spec meets its completion check, and the upgrade path from `v0.2.0` is documented.
 
 ## Done
 

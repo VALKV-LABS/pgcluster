@@ -1,6 +1,7 @@
 //! Proxy layer: PostgreSQL wire protocol proxy with connection pooling
 //! and read/write routing.
 
+pub mod allowlist;
 pub mod auth;
 pub mod backend;
 pub mod connection;
@@ -20,8 +21,13 @@ use axum::{
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use crate::{config::ProxyConfig, metrics_registry::Metrics, tls::TlsManager};
+use crate::{
+    config::ProxyConfig,
+    metrics_registry::Metrics,
+    tls::{SharedAcceptor, TlsManager},
+};
 
+use allowlist::SharedAllowlist;
 use auth::AuthQuery;
 use pool::ConnectionPool;
 pub use router::Router;
@@ -33,9 +39,10 @@ pub struct ProxyServer {
     config: ProxyConfig,
     router: Arc<Router>,
     pool: Arc<ConnectionPool>,
-    tls: Option<Arc<TlsManager>>,
+    acceptor: Option<SharedAcceptor>,
     metrics: Arc<Metrics>,
     auth: Arc<AuthQuery>,
+    allowlist: SharedAllowlist,
 }
 
 impl ProxyServer {
@@ -49,8 +56,10 @@ impl ProxyServer {
         config: ProxyConfig,
         router: Arc<Router>,
         tls: Option<Arc<TlsManager>>,
+        acceptor: Option<SharedAcceptor>,
         metrics: Arc<Metrics>,
         auth: Arc<AuthQuery>,
+        allowlist: SharedAllowlist,
     ) -> Self {
         let backend_tls = tls.as_ref().map(|t| t.client_tls_connector());
         let pool = Arc::new(ConnectionPool::new(config.pool.clone(), backend_tls));
@@ -59,9 +68,10 @@ impl ProxyServer {
             config,
             router,
             pool,
-            tls,
+            acceptor,
             metrics,
             auth,
+            allowlist,
         }
     }
 
@@ -74,12 +84,6 @@ impl ProxyServer {
             .with_context(|| format!("bind proxy listener on {}", self.config.listen_addr))?;
 
         info!(addr = %self.config.listen_addr, "proxy listening");
-
-        // Build TLS acceptor once, share via Arc.
-        let tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>> = self
-            .tls
-            .as_ref()
-            .map(|tm| Arc::new(tm.server_tls_acceptor()));
 
         // Idle connection reaper: evict stale pool connections every 30 s.
         let pool_reaper = Arc::clone(&self.pool);
@@ -100,18 +104,32 @@ impl ProxyServer {
                 }
             };
 
+            if !self.allowlist.load().allows(peer_addr.ip()) {
+                tracing::debug!(%peer_addr, "client refused by allowed_cidrs");
+                continue;
+            }
+
             let router = Arc::clone(&self.router);
             let pool = Arc::clone(&self.pool);
-            let tls_clone = tls_acceptor.clone();
+            // Read for each client, so a renewed certificate applies at once.
+            let tls_clone = self.acceptor.as_ref().map(|a| a.load_full());
             let m = Arc::clone(&self.metrics);
             let auth = Arc::clone(&self.auth);
+            let require_tls = self.config.require_tls;
 
             tokio::spawn(async move {
                 m.proxy_connections_total.inc();
                 m.connected_clients.inc();
                 tracing::debug!(%peer_addr, "client connected");
-                if let Err(e) =
-                    connection::ProxyConnection::run(stream, router, pool, tls_clone, auth).await
+                if let Err(e) = connection::ProxyConnection::run(
+                    stream,
+                    router,
+                    pool,
+                    tls_clone,
+                    auth,
+                    require_tls,
+                )
+                .await
                 {
                     tracing::debug!(%peer_addr, "connection ended: {e}");
                 }

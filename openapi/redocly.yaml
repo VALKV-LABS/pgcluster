@@ -1,0 +1,7 @@
+extends:
+  - recommended
+rules:
+  # /health and /agent/v1/ca take no input and need no credentials.
+  operation-4xx-response: off
+  no-server-example.com: off
+  security-defined: error

@@ -1,0 +1,20 @@
+[api]
+listen_addr = "0.0.0.0:8443"
+# SHA-256 of dev-admin-key-for-the-local-stack-only, the key in admin-compose.yml.
+api_key_hashes = ["a82de29c7a49e719b1ace45c970ad5b6b3ca5edd8b4656b79f4ea13c3d6d3063"]
+
+[agent_api]
+listen_addr = "0.0.0.0:8444"
+
+[tls]
+ca_dir       = "/ca"
+server_names = ["pgcluster-admin", "localhost", "127.0.0.1"]
+
+# The stack's hosts enrol with tokens loaded here, as the AWS template's do.
+[[bootstrap_hosts]]
+name         = "host-1"
+token_sha256 = "229cb9714a25ca6c8752e65f54037c3d9b9d29142f96b2029eca0f9f47ff453c"
+
+[[bootstrap_hosts]]
+name         = "host-systemd"
+token_sha256 = "dd29b6f9de5cc35bb9a50699b94d73d4a6c0b9ba01ef66dc82683fe6f3c7061b"

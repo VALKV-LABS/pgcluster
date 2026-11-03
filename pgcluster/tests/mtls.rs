@@ -8,7 +8,7 @@ use pgcluster::config::{PgClusterConfig, TlsConfig};
 use pgcluster::raft::raft_proto::topology_service_client::TopologyServiceClient;
 use pgcluster::raft::raft_proto::GetLeaderRequest;
 use pgcluster::raft::{serve_grpc, RaftNode};
-use pgcluster::tls::{certs, TlsManager};
+use pgcluster::tls::{certs, shared_client_tls, TlsManager};
 use tempfile::TempDir;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig};
 
@@ -62,6 +62,7 @@ struct Server {
     certs: TempDir,
     _data: TempDir,
     _raft: RaftNode,
+    reload: tokio::sync::watch::Sender<tonic::transport::ServerTlsConfig>,
 }
 
 async fn start_server() -> Server {
@@ -75,15 +76,15 @@ async fn start_server() -> Server {
     let tls = tls_config(&certs_dir, "localhost");
     let manager = TlsManager::new(&tls).unwrap();
     let cfg = config(&data, addr, tls);
-    let raft = RaftNode::start(&cfg, Some(manager.tonic_client_tls_config()))
-        .await
-        .unwrap();
+    let raft = RaftNode::start(
+        &cfg,
+        Some(shared_client_tls(manager.tonic_client_tls_config())),
+    )
+    .await
+    .unwrap();
 
-    tokio::spawn(serve_grpc(
-        raft.raft.clone(),
-        addr,
-        Some(manager.tonic_server_tls_config()),
-    ));
+    let (reload, rx) = tokio::sync::watch::channel(manager.tonic_server_tls_config());
+    tokio::spawn(serve_grpc(raft.raft.clone(), addr, Some(rx)));
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     Server {
@@ -91,6 +92,7 @@ async fn start_server() -> Server {
         certs: certs_dir,
         _data: data,
         _raft: raft,
+        reload,
     }
 }
 
@@ -138,6 +140,59 @@ async fn certificate_from_another_ca_is_rejected() {
     let ca = std::fs::read(server.certs.path().join("ca.crt")).unwrap();
     let tls = identity.ca_certificate(Certificate::from_pem(ca));
     assert!(get_leader(server.addr, Some(tls)).await.is_err());
+}
+
+/// After a reload, new connections meet the new certificate, on the same port.
+/// A second CA makes the change visible: only one side of it can connect.
+#[tokio::test]
+async fn a_reload_changes_the_certificate_without_closing_the_port() {
+    let server = start_server().await;
+    let old = TlsManager::new(&tls_config(&server.certs, "client")).unwrap();
+    get_leader(server.addr, Some(old.tonic_client_tls_config()))
+        .await
+        .unwrap();
+
+    // A connection in use across the reload. The call matters: with TLS 1.3 the
+    // client finishes first, so until a call returns the server may still be
+    // handshaking, and a new generation drops handshakes in flight. Clients
+    // reconnect from that on their own, so it costs a retry, not a client.
+    let port = server.addr.port();
+    let endpoint = Channel::from_shared(format!("https://localhost:{port}"))
+        .unwrap()
+        .tls_config(old.tonic_client_tls_config())
+        .unwrap();
+    let mut open = TopologyServiceClient::new(endpoint.connect().await.unwrap());
+    open.get_leader(GetLeaderRequest {}).await.unwrap();
+
+    let renewed = tempfile::tempdir().unwrap();
+    certs::generate(renewed.path(), &["localhost".into(), "client".into()]).unwrap();
+    let manager = TlsManager::new(&tls_config(&renewed, "localhost")).unwrap();
+    server
+        .reload
+        .send_replace(manager.tonic_server_tls_config());
+
+    let new = TlsManager::new(&tls_config(&renewed, "client")).unwrap();
+    let mut accepted = false;
+    for _ in 0..20 {
+        // The old generation accepts until its next wake, so allow it a moment.
+        accepted = get_leader(server.addr, Some(new.tonic_client_tls_config()))
+            .await
+            .is_ok();
+        if accepted {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(accepted, "the new certificate must be served");
+    assert!(
+        get_leader(server.addr, Some(old.tonic_client_tls_config()))
+            .await
+            .is_err(),
+        "the old CA must no longer verify the server"
+    );
+    open.get_leader(GetLeaderRequest {})
+        .await
+        .expect("a connection from before the reload stays up");
 }
 
 #[tokio::test]

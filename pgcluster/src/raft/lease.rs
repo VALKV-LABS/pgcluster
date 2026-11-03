@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use tonic::transport::{Channel, ClientTlsConfig};
+
+use crate::tls::SharedClientTls;
 use tracing::{info, warn};
 
 use super::raft_proto::topology_service_client::TopologyServiceClient;
@@ -57,6 +59,14 @@ impl QuorumLease {
     }
 }
 
+fn same_identity(a: &Option<Arc<ClientTlsConfig>>, b: &Option<Arc<ClientTlsConfig>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// Returns `true` if `reached` voters, counting this one, are a majority.
 fn is_majority(reached: usize, voters: usize) -> bool {
     reached > voters / 2
@@ -65,11 +75,12 @@ fn is_majority(reached: usize, voters: usize) -> bool {
 // ── Renewal ───────────────────────────────────────────────────────────────────
 
 /// Probe the voters four times per lease, renewing it on each majority.
-pub fn spawn_renewal(lease: Arc<QuorumLease>, raft: RaftClient, tls: Option<ClientTlsConfig>) {
+pub fn spawn_renewal(lease: Arc<QuorumLease>, raft: RaftClient, tls: Option<SharedClientTls>) {
     tokio::spawn(async move {
         let period = lease.duration / 4;
         let mut tick = tokio::time::interval(period);
         let mut channels: HashMap<NodeId, Channel> = HashMap::new();
+        let mut current_identity = tls.as_ref().map(|t| t.load_full());
         let mut held = false;
 
         loop {
@@ -81,6 +92,12 @@ pub fn spawn_renewal(lease: Arc<QuorumLease>, raft: RaftClient, tls: Option<Clie
             let voters: Vec<NodeId> = membership.voter_ids().collect();
 
             if voters.contains(&metrics.id) {
+                // A renewed certificate replaces the channels that hold the old one.
+                let identity = tls.as_ref().map(|t| t.load_full());
+                if !same_identity(&current_identity, &identity) {
+                    channels.clear();
+                    current_identity = identity.clone();
+                }
                 let probes: Vec<_> = voters
                     .iter()
                     .filter(|id| **id != metrics.id)
@@ -89,7 +106,7 @@ pub fn spawn_renewal(lease: Arc<QuorumLease>, raft: RaftClient, tls: Option<Clie
                         let channel = match channels.get(id) {
                             Some(channel) => channel.clone(),
                             None => {
-                                let channel = lazy_channel(addr, tls.as_ref())?;
+                                let channel = lazy_channel(addr, identity.as_deref())?;
                                 channels.insert(*id, channel.clone());
                                 channel
                             }

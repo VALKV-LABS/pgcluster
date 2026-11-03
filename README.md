@@ -60,7 +60,7 @@ Clients (Postgres wire protocol)
 ```bash
 git clone https://github.com/valkv-labs/pgcluster.git
 cd pgcluster
-make start        # builds images and starts 3-node stack
+make try          # builds images, starts everything, and prints the console's address
 make logs         # tail all container logs
 make status       # show container health and ports
 ```
@@ -75,6 +75,40 @@ The stack exposes:
 | `5490` | pg-primary direct (bypass proxy, debug only) |
 | `5491` | pg-replica-1 direct |
 | `5492` | pg-replica-2 direct |
+| `18080` | [Console](#console), on localhost only |
+| `18443` | `pgcluster-admin` admin API |
+| `20000-20039` | Databases created through `pgcluster-admin` |
+
+`make start` does the same without the directions, and `make stop` removes the stack and its data.
+
+### Console
+
+`make try` ends by pointing you at `http://localhost:18080`, a local page for trying every operation and checking the result:
+
+| Tab | Try |
+|---|---|
+| Databases | Create one, change its allowlist and extensions, rotate its password, and query it as the owner over verified TLS |
+| Hosts | Add a host and get its token, and see capacity |
+| Cluster | Switch over, fail over, change replication mode, run a rolling restart, and watch writes follow the primary |
+| Backups | Take a backup, check the WAL archive, and restore to a point in time |
+
+It is for one operator on their own machine, not a portal for users.
+
+### Managing many clusters
+
+`pgcluster-admin` runs a fleet: enrol your hosts, then ask for a database, and it appears with TLS, a generated password and your allowlist. With the stack from `make try` up:
+
+```bash
+docker compose -f docker/e2e-compose.yml -f docker/admin-compose.yml cp pgcluster-admin:/ca/ca.crt admin-ca.crt
+export PGCLUSTER_ADMIN_URL=https://localhost:18443
+export PGCLUSTER_ADMIN_KEY=dev-admin-key-for-the-local-stack-only
+export PGCLUSTER_ADMIN_CA=admin-ca.crt
+
+pgcluster host list
+pgcluster database create orders --allow 0.0.0.0/0 --extension vector --wait
+```
+
+The design is in [`docs/management-plane.md`](docs/management-plane.md), the contracts in [`openapi/`](openapi), and [`deploy/aws/`](deploy/aws/README.md) launches a test fleet in your own AWS account. One-node databases work today, and three-node databases and backups through this API are next. See [`todo.md`](todo.md).
 
 ### Quick test with psql
 
@@ -313,9 +347,12 @@ make check          # clippy (warnings-as-errors)
 make test           # unit tests (no Docker)
 make integ-up       # build + run unit + integration tests in Docker (stack stays up)
 make test-integ     # same, tears down when done
-make start          # start full 3-node e2e stack
-make stop           # stop and remove e2e stack
-make logs           # tail e2e stack logs
+make try            # start the full stack and print the console's address
+make start          # start the full stack
+make stop           # stop and remove the stack
+make logs           # tail the stack's logs
+make lint-openapi   # validate the API contracts
+make lint-deploy    # validate the node image and AWS template
 make status         # show container health
 ```
 
@@ -332,18 +369,33 @@ pgcluster/          — main cluster manager binary + library
     health_check/   — per-node health polling
     agent_clients/  — gRPC client for vk-agent
     config/         — TOML config + validation
+    console/        — local web page for trying every operation
   tests/            — integration tests (#[ignore] — need `make integ-up`)
 
-vk-agent/           — thin sidecar binary
+pgcluster-admin/    — management plane service
+  src/
+    api/            — admin API
+    agent.rs        — agent API
+    reconciler.rs   — runs operations, one stored step at a time
+    ca.rs           — internal certificate authorities
+  migrations/       — metadata schema
+  tests/            — integration and end-to-end tests
+
+vk-agent/           — thin sidecar binary, and `vk-agent host`
   src/
     grpc/           — agent gRPC server (promote, demote, heartbeat, status)
     postgres/       — pg_ctl / psql wrappers
     heartbeat/      — safe-mode watchdog
+    host/           — host agent: enrolment, rendering, process runners
 
 proto/              — .proto definitions shared by pgcluster and vk-agent
+openapi/            — admin API and agent API contracts
+images/             — node image recipe
+deploy/aws/         — Terraform template for a test fleet
 docker/             — Dockerfiles and compose files
   integ-compose.yml — single-node integ test stack
   e2e-compose.yml   — full 3-node e2e stack
+  admin-compose.yml — pgcluster-admin, a host and the console
 examples/           — sample config files
 ```
 

@@ -85,6 +85,7 @@ services:
         condition: service_healthy
     environment:
       PG_TEST_URL:         "postgres://postgres:test@postgres:5432/postgres"
+      ADMIN_TEST_DATABASE_URL: "postgres://postgres:test@postgres:5432/postgres"
       AGENT_TEST_ADDR:     "vk-agent:7001"
       PGCLUSTER_API_URL:   "http://pgcluster:8009"
       PGCLUSTER_METRICS_URL: "http://pgcluster:9190"
