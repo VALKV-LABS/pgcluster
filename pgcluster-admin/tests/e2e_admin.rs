@@ -2148,7 +2148,7 @@ async fn e2e_admin_resize_drain_and_replica_under_load() {
     let mut owner = node_endpoint(&snapshot, 0)
         .wait_connectable(&promoted.password)
         .await;
-    let copied: i64 = scalar(&mut owner, "SELECT count(*) FROM load_day_two")
+    let copied: i64 = scalar(&mut owner, "SELECT count(*)::text FROM load_day_two")
         .await
         .parse()
         .unwrap();
