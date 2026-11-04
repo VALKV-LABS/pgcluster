@@ -2821,6 +2821,10 @@ async fn a_replica_follows_its_source_and_promotes_into_a_database_of_its_own() 
     let instance = &state["instances"][0];
     assert_eq!(instance["role"], "member");
     assert_eq!(instance["peers"], json!([]));
+    assert_eq!(
+        instance["rename_from"], "orders",
+        "its data holds the source's database, under the source's name"
+    );
     let (_, source_state) = f.desired(&ha.hosts[0].1, -1).await;
     assert_eq!(source_state["instances"][0]["replicas"], json!([]));
 

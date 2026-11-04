@@ -12,4 +12,4 @@ The latest minor release receives security fixes.
 
 ## Scope
 
-In scope: `pgcluster`, `vk-agent`, the CLI and the published Docker images.
+In scope: `pgcluster`, `vk-agent` in both modes, `pgcluster-admin`, the CLI and console, the node image recipe, the AWS template and the published Docker images.

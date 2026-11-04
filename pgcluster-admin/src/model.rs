@@ -66,6 +66,10 @@ pub struct DatabaseSpec {
     /// region. Promotion clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica_of: Option<ReplicaOf>,
+    /// The database's name inside Postgres, when its data came from another
+    /// database by another name. The host renames it once it can write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -175,6 +179,7 @@ impl CreateDatabase {
             backup: self.backup,
             restore: None,
             replica_of: None,
+            data_name: None,
         };
         Ok((self.name, self.workspace, spec))
     }
@@ -543,6 +548,8 @@ pub struct Instance {
     /// `member`, or `replica` for an external standby of another database,
     /// which runs Postgres and `vk-agent` but no `pgcluster`.
     pub role: String,
+    /// The name the database has in its data, to rename from.
+    pub rename_from: Option<String>,
     /// External standbys of this database. They reach its Postgres and its
     /// leader reaches their agents, but they take no part in Raft.
     pub replicas: Vec<Peer>,

@@ -409,6 +409,10 @@ pub async fn build_desired_state(
         } else {
             "member"
         };
+        let rename_from = spec
+            .data_name
+            .clone()
+            .filter(|name| *name != row.database_name);
         let tasks = sqlx::query_as::<_, Task>(
             "SELECT id, kind, run_on, params FROM tasks \
              WHERE database_id = $1 AND status = 'pending' ORDER BY created_at",
@@ -446,6 +450,7 @@ pub async fn build_desired_state(
             owner: spec.owner,
             secrets: InstanceSecrets::merge(database, node),
             role: role.to_string(),
+            rename_from,
             replicas,
         });
     }

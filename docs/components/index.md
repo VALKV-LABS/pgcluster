@@ -1,5 +1,7 @@
 # pgcluster Component Index
 
+[architecture.md](../architecture.md) shows how these fit together: every process, its ports, and the data flow of each operation.
+
 ## Milestone 1 — Standard Postgres (MVP)
 
 | Component | Doc | Purpose |
@@ -16,7 +18,8 @@
 | `tls_manager` | [tls_manager.md](tls_manager.md) | TLS for Raft, agent gRPC and the proxy; certificate generation |
 | `rest_api` | [rest_api.md](rest_api.md) | HTTP API: status, switchover, failover, node management, backups |
 | `cli` | [cli.md](cli.md) | `pgcluster` binary: server mode + operator CLI subcommands |
-| `backup_coordinator` | [backup_coordinator.md](backup_coordinator.md) | Policy-scheduled base backups (daily/weekly/monthly); S3 upload; manifest tracking; retention |
+| `backup_coordinator` | [backup_coordinator.md](backup_coordinator.md) | Scheduled WAL-G backups from a standby, WAL archiving, manifests in Raft, retention, point-in-time restore |
+| `metrics` | [metrics.md](metrics.md) | Prometheus metrics and the alert rules for them |
 
 ## Milestone 5 — Horizontal Sharding (Cluster-of-Clusters)
 
@@ -45,8 +48,10 @@ Fleet management for many clusters. See [management-plane.md](../management-plan
 
 | Component | Doc | Purpose |
 |-----------|-----|---------|
-| `pgcluster_admin` | [pgcluster_admin.md](pgcluster_admin.md) | Admin API, agent API, desired state, operations, enrolment |
-| `host_agent` | [host_agent.md](host_agent.md) | `vk-agent host`: enrols, applies desired state, runs instances |
+| `pgcluster_admin` | [pgcluster_admin.md](pgcluster_admin.md) | Admin API, agent API, desired state, operations, enrolment, replicas, audit log |
+| `scheduler` | [scheduler.md](scheduler.md) | Placement without overcommit, port blocks, host drain, resizing |
+| `host_agent` | [host_agent.md](host_agent.md) | `vk-agent host`: enrols, applies desired state, runs instances in slices with disk quotas |
+| `console` | [console.md](console.md) | `pgcluster console`: a local page for trying every operation |
 
 ## Data Flow Summary
 
@@ -59,8 +64,12 @@ pgcluster Raft leader
   └── [node_monitor] ──polls──► [vk_agent] ──queries──► Postgres
   └── [failover_engine] ─────► [vk_agent] Promote RPC
   └── [switchover_engine] ────► [vk_agent] Promote + Demote RPCs
-  └── [backup_coordinator] ───► pg_basebackup → S3 (hourly schedule check)
+  └── [backup_coordinator] ───► [vk_agent] on a standby: wal-g backup-push → object storage
   └── [raft_consensus] ────────► [topology_store] (replicated to all instances)
 
 [proxy_layer] reads [topology_store] locally (no network hop) for every routing decision
+
+pgcluster-admin ◄──agent API, dialled out── [host_agent] on each machine
+  └── desired state, tasks ───► [host_agent] ──► instance files, units, firewall, quota
+                                     └── tasks ──► the local pgcluster REST API
 ```

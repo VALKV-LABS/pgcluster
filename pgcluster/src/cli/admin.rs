@@ -54,6 +54,10 @@ enum HostCommand {
     Show { id: String },
     /// Remove a host that runs no instances
     Delete { id: String },
+    /// Move every node off a host, with no downtime, and place nothing new there
+    Drain { id: String },
+    /// Let nodes land on a host again
+    Undrain { id: String },
 }
 
 #[derive(Args)]
@@ -108,6 +112,18 @@ pub struct EventArgs {
     /// Show only what came after this cursor
     #[arg(long)]
     after: Option<String>,
+}
+
+#[derive(Args)]
+pub struct AuditArgs {
+    #[command(flatten)]
+    connection: AdminConnection,
+    /// Show only changes made with this key
+    #[arg(long)]
+    key: Option<String>,
+    /// Show only changes to this database
+    #[arg(long)]
+    database: Option<String>,
 }
 
 #[derive(Args)]
@@ -232,6 +248,66 @@ enum DatabaseCommand {
     /// Replace the database's internal passwords
     RotatePasswords {
         id: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Give every node new resources. Storage only grows
+    Resize {
+        id: String,
+        #[arg(long)]
+        vcpu: f64,
+        #[arg(long)]
+        memory_gb: f64,
+        #[arg(long)]
+        storage_gb: f64,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Restart onto a newer minor release the hosts have installed
+    Upgrade {
+        id: String,
+        /// A release such as 18.2. Left out, the newest every host has
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Have every node's proxy present this certificate and key
+    Certificate {
+        id: String,
+        /// PEM file with the certificate, and any intermediates after it
+        #[arg(long)]
+        cert: String,
+        /// PEM file with the private key
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Add a cross-region replica of a three-node database
+    ReplicaAdd {
+        id: String,
+        /// Name of the replica, which it keeps if promoted
+        name: String,
+        /// Host to run on, by ID or name. Left out, one outside the source's domains
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// List a database's cross-region replicas
+    Replicas { id: String },
+    /// Detach a replica into a database of its own
+    ReplicaPromote {
+        id: String,
+        replica: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Delete a replica
+    ReplicaDelete {
+        id: String,
+        replica: String,
         #[arg(long)]
         wait: bool,
     },
@@ -429,6 +505,23 @@ pub async fn run_host(args: HostArgs) -> Result<()> {
             println!("deleted");
             Ok(())
         }
+        HostCommand::Drain { id } => {
+            let host = client
+                .send("POST", &format!("/v1/hosts/{id}/drain"), None)
+                .await?;
+            println!(
+                "{}. Follow it with pgcluster host show {id}",
+                text(&host, "status")
+            );
+            Ok(())
+        }
+        HostCommand::Undrain { id } => {
+            let host = client
+                .send("DELETE", &format!("/v1/hosts/{id}/drain"), None)
+                .await?;
+            println!("{}", text(&host, "status"));
+            Ok(())
+        }
     }
 }
 
@@ -600,6 +693,65 @@ pub async fn run_database(args: DatabaseArgs) -> Result<()> {
         DatabaseCommand::RotatePasswords { id, wait } => {
             client.act(&id, "rotate-passwords", wait).await
         }
+        DatabaseCommand::Resize {
+            id,
+            vcpu,
+            memory_gb,
+            storage_gb,
+            wait,
+        } => {
+            let body = json!({
+                "resources": { "vcpu": vcpu, "memory_gb": memory_gb, "storage_gb": storage_gb }
+            });
+            let path = format!("/v1/databases/{id}");
+            let operation = client.send("PATCH", &path, Some(body)).await?;
+            client.finish(&operation, wait).await
+        }
+        DatabaseCommand::Upgrade { id, version, wait } => {
+            let path = format!("/v1/databases/{id}/upgrade");
+            let operation = client
+                .send("POST", &path, Some(json!({ "version": version })))
+                .await?;
+            client.finish(&operation, wait).await
+        }
+        DatabaseCommand::Certificate {
+            id,
+            cert,
+            key,
+            wait,
+        } => {
+            let read =
+                |path: &str| std::fs::read_to_string(path).with_context(|| format!("read {path}"));
+            let body = json!({ "certificate_pem": read(&cert)?, "private_key_pem": read(&key)? });
+            let path = format!("/v1/databases/{id}/certificate");
+            let operation = client.send("PUT", &path, Some(body)).await?;
+            client.finish(&operation, wait).await
+        }
+        DatabaseCommand::ReplicaAdd {
+            id,
+            name,
+            host,
+            wait,
+        } => {
+            let path = format!("/v1/databases/{id}/replicas");
+            let body = json!({ "name": name, "host_id": host });
+            let operation = client.send("POST", &path, Some(body)).await?;
+            println!("replica {}", text(&operation, "database_id"));
+            client.finish(&operation, wait).await
+        }
+        DatabaseCommand::Replicas { id } => {
+            client.show(&format!("/v1/databases/{id}/replicas")).await
+        }
+        DatabaseCommand::ReplicaPromote { id, replica, wait } => {
+            let path = format!("/v1/databases/{id}/replicas/{replica}/promote");
+            let operation = client.send("POST", &path, None).await?;
+            client.finish(&operation, wait).await
+        }
+        DatabaseCommand::ReplicaDelete { id, replica, wait } => {
+            let path = format!("/v1/databases/{id}/replicas/{replica}");
+            let operation = client.send("DELETE", &path, None).await?;
+            client.finish(&operation, wait).await
+        }
         DatabaseCommand::Nodes { id } => client.show(&format!("/v1/databases/{id}/nodes")).await,
         DatabaseCommand::Backups { id } => {
             client.show(&format!("/v1/databases/{id}/backups")).await
@@ -658,6 +810,20 @@ pub async fn run_events(args: EventArgs) -> Result<()> {
         Some(after) => client.show(&format!("/v1/events?after={after}")).await,
         None => client.show("/v1/events").await,
     }
+}
+
+pub async fn run_audit(args: AuditArgs) -> Result<()> {
+    let client = AdminClient::new(&args.connection)?;
+    let mut filters = Vec::new();
+    if let Some(key) = &args.key {
+        filters.push(format!("key={key}"));
+    }
+    if let Some(database) = &args.database {
+        filters.push(format!("database_id={database}"));
+    }
+    client
+        .show(&format!("/v1/audit-log?{}", filters.join("&")))
+        .await
 }
 
 pub async fn run_admin_ca(args: AdminCaArgs) -> Result<()> {

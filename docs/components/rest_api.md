@@ -57,6 +57,7 @@ The CLI sends the key in the `PGCLUSTER_API_KEY` environment variable.
 | `POST` | `/api/pg-hba/reload` | `200` | Reload Postgres configuration on every node |
 | `GET` | `/api/backups` | `200` | List backups; `?frequency=` filters |
 | `POST` | `/api/backups` | `202` | Start a manual backup |
+| `GET` | `/api/backups/status` | `200` | The label and error of the last backup, if it failed |
 | `DELETE` | `/api/backups/:backup_id` | `204` | Delete a backup |
 
 Prometheus metrics are served separately, at `/metrics` on `metrics.listen_addr`.

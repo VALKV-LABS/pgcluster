@@ -315,6 +315,7 @@ pub async fn restore(
     let mut spec = source;
     spec.hosts = request.hosts;
     spec.replica_of = None;
+    spec.data_name = None;
     spec.restore = Some(RestoreSource {
         database_id: id.clone(),
         database_name: source_name,

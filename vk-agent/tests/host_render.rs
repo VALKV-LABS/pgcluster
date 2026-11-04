@@ -54,6 +54,7 @@ fn instance(allowed_cidrs: &[&str], extensions: &[&str]) -> Instance {
             proxy_key_pem: None,
         },
         role: "member".into(),
+        rename_from: None,
         replicas: vec![],
     }
 }

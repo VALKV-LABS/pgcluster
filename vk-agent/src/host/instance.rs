@@ -701,7 +701,35 @@ impl InstanceManager<'_> {
                 .fetch_one(&mut *postgres)
                 .await
                 .context("look up the database")?;
-        if !exists {
+        let rename_from = match (&instance.rename_from, exists) {
+            (Some(from), false) => sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)",
+            )
+            .bind(from)
+            .fetch_one(&mut *postgres)
+            .await
+            .context("look up the database to rename")?
+            .then_some(from),
+            _ => None,
+        };
+        if let Some(from) = rename_from {
+            // A promoted replica holds its source's database under the
+            // source's name. Clients are not let in yet, so nothing holds it.
+            sqlx::query(&format!(
+                "ALTER DATABASE {} RENAME TO {}",
+                quote_ident(from),
+                quote_ident(&instance.database_name)
+            ))
+            .execute(&mut *postgres)
+            .await
+            .context("rename the database")?;
+            self.client
+                .log(
+                    instance.operation_id.as_deref(),
+                    &format!("renamed database {from} to {}", instance.database_name),
+                )
+                .await;
+        } else if !exists {
             sqlx::query(&format!(
                 "CREATE DATABASE {} OWNER {name}",
                 quote_ident(&instance.database_name)

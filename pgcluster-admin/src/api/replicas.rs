@@ -61,7 +61,12 @@ pub async fn create(
     .bind(&id)
     .fetch_one(&mut *tx)
     .await?;
+    let source_name: String = sqlx::query_scalar("SELECT name FROM databases WHERE id = $1")
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
     let mut spec = source.clone();
+    spec.data_name = Some(source.data_name.clone().unwrap_or(source_name));
     spec.ha = false;
     spec.replication_mode = "async".into();
     spec.hosts = request.host_id.into_iter().collect();

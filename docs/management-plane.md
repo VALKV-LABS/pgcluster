@@ -1,6 +1,6 @@
 # Management Plane Specification
 
-**Status:** Stages 1 to 3 are built, and the AWS path awaits its first run. Later stages are proposed. [`todo.md`](../todo.md) tracks each step.
+**Status:** Stages 1 to 5 are built. The AWS path awaits its first run, and the load test of isolation on shared hosts awaits hosts with systemd and XFS. [`todo.md`](../todo.md) tracks each step, and [architecture.md](architecture.md) shows the processes, ports and data flows as built.
 **Audience:** contributors, and operators who run their own Postgres fleet.
 
 ## 1. Summary
@@ -129,7 +129,7 @@ deploy/aws/        Terraform template for a test fleet
 
 Conventions:
 
-- Authentication is `Authorization: Bearer <key>`. `pgcluster-admin` refuses to start with no keys configured, stores only their hashes, and accepts no key under 32 characters.
+- Authentication is `Authorization: Bearer <key>`. `pgcluster-admin` refuses to start with no keys configured, stores only their hashes, and accepts no key under 32 characters. Each key has a name, the audit log records which key made each change, and one key can be revoked alone with no restart.
 - Errors are `{ "error": { "code": "...", "message": "..." } }`.
 - Lists are `{ "items": [...], "next_page_token": "..." }`, with `limit` and `page_token`.
 - Changes that take time return `202` and an operation.
@@ -141,6 +141,7 @@ POST   /v1/hosts                  { name, failure_domain? } → enrollment_token
 GET    /v1/hosts                  status, reported capacity, free capacity
 GET    /v1/hosts/{id}
 POST   /v1/hosts/{id}/drain
+DELETE /v1/hosts/{id}/drain                     stop draining
 DELETE /v1/hosts/{id}
 ```
 
@@ -164,6 +165,7 @@ PATCH  /v1/databases/{id}                       resources, replication_mode, ret
 DELETE /v1/databases/{id}
 
 POST   /v1/databases/{id}/restart
+POST   /v1/databases/{id}/upgrade               { version? } a minor release the hosts have
 POST   /v1/databases/{id}/switchover
 POST   /v1/databases/{id}/backup
 POST   /v1/databases/{id}/restore               { name, target_time } → a new database
@@ -212,6 +214,7 @@ POST     /v1/databases/{id}/replicas/{replica_id}/promote
 GET /v1/databases/{id}/operations
 GET /v1/databases/{id}/operations/{op_id}       steps and logs
 GET /v1/events?after={cursor}
+GET /v1/audit-log?key={name}                    every change, and the key that made it
 GET /v1/admin-ca                                what to trust, and how far a rotation has got
 POST /v1/admin-ca/rotate
 ```
@@ -293,8 +296,9 @@ Clients get no access until step 7, so a reachable database always has a restora
 | Operation | How |
 |---|---|
 | Replace a node | Add the new node as a Raft learner, seed it from the primary, promote it to voter, remove the old member |
-| Grow storage | Grow the volume and filesystem online on each node |
-| Change resources | One standby at a time, then switch over, then the old primary |
+| Drain a host | Replace each of its nodes onto another host, one database at a time |
+| Grow storage | Raise each node's disk quota online |
+| Change resources | CPU limits change online. New memory restarts one standby at a time, then switches over, then restarts the old primary |
 | Add HA to one node | Add two nodes the same way as a replacement |
 | Minor upgrade | Rolling across standbys, then switch over, then the old primary |
 | Major upgrade | Not in scope yet. Restore or logical migration into a new database |
@@ -320,7 +324,7 @@ Even strict settings cannot promise literal zero loss. A transaction can become 
 
 - **One node:** no failover. If the host is lost, the database is restored from backup.
 - **Three nodes:** one node per failure domain. pgcluster needs three Raft voters for quorum, so two-node databases are not offered.
-- **Cross-region replicas:** an external standby that follows asynchronously, is not a Raft voter, and is never an automatic failover target. `promote` detaches it into an independent database. It needs the same major version and CPU architecture as the source.
+- **Cross-region replicas:** an external standby of a three-node database that follows asynchronously, is not a Raft voter, and is never an automatic failover target. `promote` detaches it into an independent database. It needs the same major version and CPU architecture as the source. It shares the source's CA and internal passwords, so the source cannot rotate them while it has replicas.
 
 ### Backups and restore
 
@@ -385,9 +389,9 @@ Enabling a preload extension needs a rolling restart.
 
 ### Several databases on one host
 
-- `vk-agent host` runs each instance as systemd units with cgroup v2 limits: `CPUQuota=`, `MemoryMax=` and `IOWeight=`. A plain process runner exists for development and tests.
-- Each instance gets a disk quota. Disk is the likeliest noisy neighbour, and CPU and memory limits do nothing about it.
-- The scheduler refuses overcommit, reserves memory for page cache and the OS, and places HA nodes on different hosts and failure domains.
+- `vk-agent host` runs each instance as systemd units in a slice of its own with cgroup v2 limits: `CPUQuota=`, `MemoryMax=` and `IOWeight=`. A plain process runner exists for development and tests.
+- Each instance gets an XFS project quota for disk. Disk is the likeliest noisy neighbour, and CPU and memory limits do nothing about it.
+- The scheduler refuses overcommit, reserves memory for page cache and the OS, and places HA nodes on different hosts and failure domains. A request no host can hold is refused at once. See [scheduler.md](components/scheduler.md).
 - A shared host is not a security boundary between mutually untrusting users. Only share hosts between databases with the same owner.
 
 ## 10. Requirements on pgcluster and vk-agent

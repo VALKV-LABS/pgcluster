@@ -49,6 +49,8 @@ pub enum Commands {
     Repository(admin::RepositoryArgs),
     /// Read the event feed of pgcluster-admin
     Events(admin::EventArgs),
+    /// Read the audit log of pgcluster-admin: each change, and the key that made it
+    AuditLog(admin::AuditArgs),
     /// Show or rotate the CA of pgcluster-admin
     AdminCa(admin::AdminCaArgs),
     /// Run a local web page for trying every operation
@@ -71,6 +73,7 @@ pub async fn run() -> anyhow::Result<()> {
         Commands::Database(args) => admin::run_database(args).await,
         Commands::Repository(args) => admin::run_repository(args).await,
         Commands::Events(args) => admin::run_events(args).await,
+        Commands::AuditLog(args) => admin::run_audit(args).await,
         Commands::AdminCa(args) => admin::run_admin_ca(args).await,
         Commands::Console(args) => console::run(args).await,
     }

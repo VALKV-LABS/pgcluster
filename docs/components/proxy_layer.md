@@ -86,7 +86,7 @@ fn select_read_replica(
 
 ---
 
-## Detailed Implementation Plan
+## Implementation
 
 ### 1. Module Layout
 
@@ -101,6 +101,10 @@ src/
     protocol.rs       # Postgres wire protocol framing (read/write packets)
     session.rs        # Session state: txn mode, SET vars, prepared stmts
     ssl.rs            # TLS upgrade for client connections
+    auth.rs           # Reads SCRAM verifiers through the auth role
+    scram.rs          # SCRAM with clients, and logging in to backends as them
+    allowlist.rs      # allowed_cidrs, reloaded on SIGHUP
+    limits.rs         # Connection limits and the login deadline
 ```
 
 ### 2. Connection State Machine
@@ -260,3 +264,16 @@ This is a custom virtual schema served entirely by pgcluster — the queries nev
 `[proxy] allowed_cidrs` lists the client addresses the proxy accepts. An empty list refuses everyone, and leaving it out accepts everyone. SIGHUP reloads it from the config file, and clients already connected stay connected. The proxy is the only place this can work: Postgres sees the proxy's address, so `pg_hba.conf` cannot filter clients.
 
 `[proxy] require_tls = true` refuses clients that do not negotiate TLS.
+
+## Connection Limits
+
+A connection counts as pending from accept until its client has logged in. Pending connections are capped in total and from each address, and each has a deadline, so a flood of half-open or slow connections cannot crowd out clients that are connected, or that connect from elsewhere. A logged-in client counts only toward the total.
+
+| Setting | Default | Caps |
+|---|---|---|
+| `max_client_connections` | 10000 | Every client connection |
+| `max_pending_logins` | 512 | Connections that have not logged in yet |
+| `max_pending_logins_per_address` | 64 | The same, from one address |
+| `login_timeout_ms` | 10000 | Time to negotiate TLS and log in |
+
+A connection over a limit is closed at once, and counts in `pgcluster_proxy_connections_refused_total`. One that misses the deadline is closed. An application server behind one address can still hold any number of logged-in connections, up to the total.

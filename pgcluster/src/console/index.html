@@ -327,6 +327,34 @@ async function databaseDetail(id) {
     event.preventDefault();
     change("Change extensions", "extensions", "PUT", { extensions: checked(extensionForm, "installed") });
   } }, checks("installed", database.extensions), el("button", { class: "plain" }, "Apply extensions"));
+  const resources = database.resources;
+  const resizeForm = el("form", { onsubmit: event => {
+    event.preventDefault();
+    const values = formValues(resizeForm);
+    act("Resize", async () => {
+      await waitFor(await call("PATCH", `/admin/v1/databases/${id}`, { resources: {
+        vcpu: Number(values.vcpu), memory_gb: Number(values.memory_gb), storage_gb: Number(values.storage_gb),
+      } }));
+      return "applied";
+    });
+  } },
+    field("vCPU", el("input", { name: "vcpu", type: "number", step: "0.5", min: "0.5", value: String(resources.vcpu), style: "width:70px" })),
+    field("Memory GB", el("input", { name: "memory_gb", type: "number", step: "0.5", min: "0.5", value: String(resources.memory_gb), style: "width:80px" })),
+    field("Storage GB", el("input", { name: "storage_gb", type: "number", min: String(resources.storage_gb), value: String(resources.storage_gb), style: "width:80px" })),
+    el("button", { class: "plain" }, "Resize"));
+  const replicas = database.ha && !database.replica_of
+    ? await call("GET", `/admin/v1/databases/${id}/replicas`).catch(() => ({ items: [] })) : { items: [] };
+  const replicaForm = el("form", { onsubmit: event => {
+    event.preventDefault();
+    const values = formValues(replicaForm);
+    act(`Add replica ${values.name}`, async () => {
+      await waitFor(await call("POST", `/admin/v1/databases/${id}/replicas`, { name: values.name, host_id: values.host || undefined }));
+      return "following";
+    });
+  } },
+    field("Replica name", el("input", { name: "name", required: true, pattern: "[a-z_][a-z0-9_]*" })),
+    field("Host, or empty to choose", el("input", { name: "host" })),
+    el("button", { class: "plain" }, "Add a replica"));
 
   const password = el("input", { type: "password", value: secret?.password || "", "aria-label": "Owner password", size: 30 });
   const sqlTarget = () => ({
@@ -353,6 +381,35 @@ async function databaseDetail(id) {
         change("Change allowlist", "allowlist", "PUT", { allowed_cidrs: words(allow.value) }) }, "Apply allowlist")),
     el("h3", {}, "Extensions"),
     extensionForm,
+    el("h3", {}, "Resources. CPU and storage change online; memory takes a rolling restart"),
+    resizeForm,
+    database.replica_of ? el("p", { class: "hint" }, `A replica of ${database.replica_of}. Promote or delete it from its source.`) : null,
+    database.ha && !database.replica_of ? [
+      el("h3", {}, "Cross-region replicas"),
+      table([
+        { label: "Name", cell: r => r.name },
+        { label: "Host", cell: r => r.host_name || "" },
+        { label: "Status", cell: r => statusCell(r.status) },
+        { label: "", cell: r => el("div", { class: "row" },
+            el("button", { class: "plain", onclick: () => {
+              if (confirm(`Promote ${r.name} into a database of its own?`)) {
+                act(`Promote ${r.name}`, async () => {
+                  await waitFor(await call("POST", `/admin/v1/databases/${id}/replicas/${r.id}/promote`));
+                  return "promoted";
+                });
+              }
+            } }, "Promote"),
+            el("button", { class: "danger", onclick: () => {
+              if (confirm(`Delete replica ${r.name}?`)) {
+                act(`Delete replica ${r.name}`, async () => {
+                  await waitFor(await call("DELETE", `/admin/v1/databases/${id}/replicas/${r.id}`));
+                  return "deleted";
+                });
+              }
+            } }, "Delete")) },
+      ], replicas.items, { empty: "No replicas." }),
+      replicaForm,
+    ] : null,
     el("h3", {}, "Operations"),
     el("div", { class: "row" },
       database.ha ? el("button", { class: "plain", onclick: () => change("Switch over", "switchover", "POST", {}) }, "Switch over") : null,
@@ -362,6 +419,8 @@ async function databaseDetail(id) {
         return "applied";
       }) }, "Apply mode") : null,
       el("button", { class: "plain", onclick: () => change("Rolling restart", "restart", "POST") }, "Rolling restart"),
+      el("button", { class: "plain", title: database.server_version ? `Runs ${database.server_version}` : "",
+        onclick: () => change("Minor upgrade", "upgrade", "POST", {}) }, "Upgrade to the hosts' minor release"),
       el("button", { class: "plain", onclick: () => change("Take a backup", "backup", "POST") }, "Take a backup"),
       el("button", { class: "plain", onclick: () => change("Rotate the CA", "rotate-ca", "POST") }, "Rotate the CA"),
       el("button", { class: "plain", onclick: () => change("Rotate internal passwords", "rotate-passwords", "POST") }, "Rotate internal passwords")),
@@ -481,9 +540,18 @@ async function drawHosts() {
         { label: "Address", cell: h => h.address || "" },
         { label: "Capacity", cell: h => capacity(h.capacity) },
         { label: "Free", cell: h => capacity(h.free_capacity) },
-        { label: "", cell: h => el("button", { class: "danger", onclick: () => {
-            if (confirm(`Remove host ${h.name}?`)) act(`Remove host ${h.name}`, () => call("DELETE", `/admin/v1/hosts/${h.id}`));
-          } }, "Remove") },
+        { label: "Instances", cell: h => String(h.instances ?? "") },
+        { label: "Postgres", cell: h => Object.values(h.postgres_versions || {}).join(", ") },
+        { label: "Drain", cell: h => h.drain_error ? el("span", { class: "bad" }, h.drain_error) : "" },
+        { label: "", cell: h => el("div", { class: "row" },
+            h.draining
+              ? el("button", { class: "plain", onclick: () => act(`Stop draining ${h.name}`, () => call("DELETE", `/admin/v1/hosts/${h.id}/drain`)) }, "Stop draining")
+              : el("button", { class: "plain", onclick: () => {
+                  if (confirm(`Move every node off ${h.name}?`)) act(`Drain ${h.name}`, () => call("POST", `/admin/v1/hosts/${h.id}/drain`));
+                } }, "Drain"),
+            el("button", { class: "danger", onclick: () => {
+              if (confirm(`Remove host ${h.name}?`)) act(`Remove host ${h.name}`, () => call("DELETE", `/admin/v1/hosts/${h.id}`));
+            } }, "Remove")) },
       ], hosts.items)),
   ];
 }

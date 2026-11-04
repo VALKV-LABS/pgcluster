@@ -91,19 +91,24 @@ Work in order, top to bottom. Each step lists what must be true for it to be don
 
 ## Part 9: Management plane, shared hosts (Stage 4)
 
-- [ ] **9.1 Add the scheduler.** Capacity tracking, no overcommit, memory reserved for page cache, and placement across failure domains. *Done when:* an impossible request fails with a clear error.
-- [ ] **9.2 Add port blocks.** *Done when:* several instances run on one host with no collisions.
-- [ ] **9.3 Add isolation.** cgroup v2 limits and per-instance disk quotas. *Done when:* one busy database cannot starve another, by load test.
-- [ ] **9.4 Add host drain.** *Done when:* draining moves every instance off a host with no downtime.
+- [x] **9.1 Add the scheduler.** Capacity tracking, no overcommit, memory reserved for page cache, and placement across failure domains. *Done when:* an impossible request fails with a clear error. `[scheduler]` sets the reserves. A request larger than any host, or one that enough hosts exist for but too few have room, is refused at once; too few hosts still waits for more to enrol, as before. Placement locks the hosts, so two creates cannot both take the last of one.
+- [x] **9.2 Add port blocks.** *Done when:* several instances run on one host with no collisions. The range is configurable, a host with every block taken counts as full, and a host refuses to start an instance whose ports something else holds.
+- [ ] **9.3 Add isolation.** cgroup v2 limits and per-instance disk quotas. *Done when:* one busy database cannot starve another, by load test. **Pending verification:** each instance runs in a systemd slice with `CPUQuota=`, `MemoryMax=` and `IOWeight=`, applied online with `set-property`, and gets an XFS project quota (`disk_quota = "auto"`, `"xfs"` or `"none"`). Unit files and quota commands are unit-tested, but the load test needs hosts with systemd, cgroup v2 delegation and an XFS volume mounted with `prjquota`, which the Docker stack does not have. The node image and AWS template should mount the instances volume that way. The `plain` runner sets no limits, by decision: it is for development.
+- [x] **9.4 Add host drain.** *Done when:* draining moves every instance off a host with no downtime. Each node moves through a replacement, one per database at a time. **Decision:** a host with a one-node database is refused with `409`, because moving one needs downtime; restore it elsewhere first. `DELETE /v1/hosts/{id}/drain` stops a drain, an addition to the spec's routes.
 
 ## Part 10: Management plane, day two (Stage 5)
 
-- [ ] **10.1 Add resizing.** Resources and storage. *Done when:* each passes under client load.
-- [ ] **10.2 Add minor upgrades.** *Done when:* a rolling upgrade passes under client load.
-- [ ] **10.3 Add cross-region replicas.** Uses 5.9. *Done when:* a replica promotes into an independent database through the API.
-- [ ] **10.4 Limit connections.** Cap TLS handshakes and open connections on the admin API, the agent API and the proxy. *Done when:* a connection flood cannot stop enrolled hosts or existing clients from working, by test.
-- [ ] **10.5 Add API key identities and an audit log.** Each key has a name, and every change records which key made it. *Done when:* each change through the admin API can be traced to one key, and a key can be revoked alone.
-- [ ] **10.6 Release `v1.0.0`.** *Done when:* every stage in the spec meets its completion check, and the upgrade path from `v0.2.0` is documented.
+- [x] **10.1 Add resizing.** Resources and storage. *Done when:* each passes under client load. CPU and storage change online through the slice and the quota; memory takes a rolling restart on three nodes and a restart on one. **Decision:** storage only grows, and growing raises the instance's quota on the host's filesystem rather than growing a volume, because instances share the host's disk.
+- [ ] **10.2 Add minor upgrades.** *Done when:* a rolling upgrade passes under client load. **Pending verification:** `POST /v1/databases/{id}/upgrade` checks every host has the release, runs a rolling restart and waits for every node to report it, tested against the admin API. Hosts report installed releases and nodes their running release. A run under load needs hosts with two minor releases of one major, which the pinned stack images do not have. **Decision:** upgrading `pgcluster` and `vk-agent` binaries on instances is a manual unit restart, documented in `docs/upgrading.md`.
+- [x] **10.3 Add cross-region replicas.** Uses 5.9. *Done when:* a replica promotes into an independent database through the API. **Decisions:** a replica is a database of its own with one node, which runs `vk-agent` and Postgres and no `pgcluster`, and shares the source's CA and internal passwords, so the source refuses secret rotation and deletion while it has replicas. Only three-node sources can have replicas: a one-node source's topology names loopback addresses a replica cannot reach. The CPU architecture is not checked: hosts do not report it yet.
+- [x] **10.4 Limit connections.** Cap TLS handshakes and open connections on the admin API, the agent API and the proxy. *Done when:* a connection flood cannot stop enrolled hosts or existing clients from working, by test. The agent API test floods from other addresses. The proxy's admission logic has unit tests; a flood against a running proxy is not yet in the integration suite.
+- [x] **10.5 Add API key identities and an audit log.** Each key has a name, and every change records which key made it. *Done when:* each change through the admin API can be traced to one key, and a key can be revoked alone. `[[api.keys]]` names keys, SIGHUP reloads them, and `GET /v1/audit-log` lists changes. **Decision:** keys stay in the config file, not the metadata database, so revoking one is an edit and a SIGHUP.
+- [ ] **10.6 Release `v1.0.0`.** *Done when:* every stage in the spec meets its completion check, and the upgrade path from `v0.2.0` is documented. **Pending go-ahead:** `docs/upgrading.md` documents the path. Stage 1 waits on the AWS run (6.11, 6.13) and Stage 4 on the isolation load test (9.3), and the release needs the PR merged, `v0.2.0` out first (5.10), and a pushed tag.
+
+## Part 11: Documentation
+- [x] **11.1 Add missing component docs.** `scheduler.md`, `console.md` and `metrics.md` are new, and the index lists them.
+- [x] **11.2 Document the architecture.** `docs/architecture.md` covers every process, its ports, trust between them, and the data flow of each operation in both planes.
+- [x] **11.3 Review the docs.** Updated the spec's status and routes, `pgcluster_admin.md`, `host_agent.md`, `proxy_layer.md`, `tls_manager.md`, `cli.md`, `rest_api.md`, the index, the README, `SECURITY.md` and the changelog, and rewrote `config_manager.md`, which described a design that was never built. Left as they are: the questions in `topology_store.md`, which read as open notes, and the design docs for Milestones 3 and 5.
 
 ## Done
 

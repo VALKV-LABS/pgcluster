@@ -521,6 +521,18 @@ components:
         - owner
         - secrets
       properties:
+        role:
+          type: string
+          enum: [member, replica]
+          description: A replica is an external standby of another database, and runs no `pgcluster`.
+        replicas:
+          type: array
+          description: External standbys of this database, admitted to its Postgres.
+          items:
+            $ref: "#/components/schemas/Peer"
+        rename_from:
+          type: [string, "null"]
+          description: The name the database has in its data. The host renames it to `database_name` once it can write.
         database_id:
           type: string
         database_name:

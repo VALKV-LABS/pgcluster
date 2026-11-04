@@ -5,6 +5,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Added
+- A scheduler that never overcommits a host, keeps memory back for the OS and the page cache, and refuses a request no host can hold at once. `[scheduler]` sets the reserves and the port range.
+- Each instance runs in a systemd slice with `CPUQuota=`, `MemoryMax=` and `IOWeight=`, and gets an XFS project quota for disk, set by `disk_quota` in the host config. A host refuses to start an instance whose ports something else holds.
+- `POST /v1/hosts/{id}/drain` moves every node off a host with no downtime, and `DELETE` stops it.
+- Resizing through `PATCH /v1/databases/{id}`: CPU and storage change online, and memory takes a rolling restart.
+- `POST /v1/databases/{id}/upgrade` moves to a newer minor release the hosts have installed, by rolling restart. Hosts report installed releases, and nodes the release they run.
+- Cross-region replicas: `POST /v1/databases/{id}/replicas`, listing, deletion, and `promote`, which detaches one into a database of its own.
+- `PUT /v1/databases/{id}/certificate` gives the proxy a certificate of its own, through `[tls] proxy_cert` and `proxy_key` in `pgcluster`.
+- Connection limits on the admin API, the agent API and the proxy, so a flood cannot stop enrolled hosts or connected clients.
+- Named API keys in `[[api.keys]]`, reloaded on SIGHUP, and `GET /v1/audit-log`, which records every change with the key that made it.
+- The console drains hosts, resizes, upgrades, and manages replicas.
+- [`docs/architecture.md`](docs/architecture.md), and component docs for the scheduler, the console and metrics.
 - Three-node databases through `pgcluster-admin`, one node per failure domain, with replication modes that change online, node replacement, switchover and rolling restart as operations, and `GET /v1/events`.
 - Backups through `pgcluster-admin`: verified S3 or POSIX repositories, per-database encryption, retention, on-demand backups, the restore window, and point-in-time restore into a new database.
 - Host firewalling with nftables: peer ports accept only a database's own nodes, and the proxy port accepts the allowlist. `firewall = "none"` turns it off.
@@ -14,10 +25,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `postgres_config_file` runs Postgres from a config outside the data directory.
 
 ### Changed
+- **Breaking:** the agent API's `Instance` gains `role` and `replicas`, and its secrets may carry a proxy certificate. Reports gain `postgres_versions` and `server_version`. Older hosts ignore what they do not know, but cannot run replicas.
+- **Breaking:** `POST /v1/hosts/{id}/drain` answers with the host, not an operation.
+- **Breaking:** `POST /v1/databases/{id}/backup`, `restart` and other changes answer `409` on a replica, and a database with replicas refuses `rotate-ca`, `rotate-passwords` and deletion.
 - **Breaking:** `POST /v1/databases` needs `backup`, and a database stays closed until its first backup exists, so creating one takes two generations.
 - **Breaking:** the agent API's `Instance` gains `address`, `backup` and `tasks`, and `bootstrap` can be `seed` or `restore`.
 
 ### Fixed
+- `vk-agent` built only alongside crates that turned on sqlx's `chrono` feature.
 - Failover, switchover and the repair of a stale standby used port 5432 for the primary, whatever its address said.
 - A standby counted as already following the primary if the primary's host appeared anywhere in its conninfo.
 - The proxy trusted the CA it started with, so a new CA broke its logins to Postgres until a restart.

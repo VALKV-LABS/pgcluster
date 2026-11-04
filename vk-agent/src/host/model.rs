@@ -172,6 +172,10 @@ pub struct Instance {
     /// `member`, or `replica` for an external standby of another database.
     #[serde(default = "member")]
     pub role: String,
+    /// The name the database has in its data, such as a promoted replica's
+    /// source's. It is renamed to `database_name` once it can be written.
+    #[serde(default)]
+    pub rename_from: Option<String>,
     /// External standbys of this database, which reach its Postgres, and whose
     /// agents its leader reaches. They take no part in Raft.
     #[serde(default)]
@@ -222,6 +226,9 @@ impl Instance {
             bail!("invalid Postgres version {:?}", self.postgres_version);
         }
         check_identifier(&self.database_name)?;
+        if let Some(from) = &self.rename_from {
+            check_identifier(from)?;
+        }
         check_identifier(&self.owner.username)?;
         check_verifier(&self.owner.scram_verifier)?;
         for extension in &self.extensions {
@@ -471,6 +478,7 @@ pub mod tests {
                 proxy_key_pem: None,
             },
             role: "member".into(),
+            rename_from: None,
             replicas: vec![],
         }
     }
