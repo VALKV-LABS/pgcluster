@@ -50,6 +50,7 @@ Clients (Postgres wire protocol)
 - **Prometheus metrics** — failover count, replication lag, leader status, connection pool saturation
 - **REST API** — cluster status, node management, manual failover/switchover
 - **Works with stock Postgres 12+** — no patches, no extensions required
+- **Fleet management** — `pgcluster-admin` and `vk-agent host` create, resize, upgrade, back up, restore and replicate many databases across your own hosts, sharing hosts without overcommit and draining them with no downtime. See [the architecture](docs/architecture.md) and [the management plane spec](docs/management-plane.md)
 
 ---
 
@@ -109,7 +110,7 @@ pgcluster repository add-posix main /backups
 pgcluster database create orders --allow 0.0.0.0/0 --extension vector --wait
 ```
 
-The design is in [`docs/management-plane.md`](docs/management-plane.md), the contracts in [`openapi/`](openapi), and [`deploy/aws/`](deploy/aws/README.md) launches a test fleet in your own AWS account. One-node and three-node databases, backups, point-in-time restore and secret rotation all work through this API. See [`todo.md`](todo.md) for what is next.
+The design is in [`docs/management-plane.md`](docs/management-plane.md), the contracts in [`openapi/`](openapi), and [`deploy/aws/`](deploy/aws/README.md) launches a test fleet in your own AWS account. One-node and three-node databases, backups, point-in-time restore, secret rotation, shared hosts with drain, resizing, minor upgrades and cross-region replicas all work through this API, and [`docs/architecture.md`](docs/architecture.md) shows how the processes fit together. [`docs/upgrading.md`](docs/upgrading.md) covers upgrades. See [`todo.md`](todo.md) for what is next.
 
 ### Quick test with psql
 
@@ -364,12 +365,13 @@ pgcluster/          — main cluster manager binary + library
   src/
     raft/           — Raft consensus, topology state machine, log storage
     api/            — axum REST API handlers
-    proxy/          — Postgres-protocol proxy + connection pool
-    failover/       — automatic failover engine
-    switchover/     — planned switchover engine
-    health_check/   — per-node health polling
-    agent_clients/  — gRPC client for vk-agent
-    config/         — TOML config + validation
+    proxy/          — Postgres-protocol proxy, connection pool, limits
+    failover/       — automatic failover engine, seeding and rewind
+    switchover/     — planned switchover and rolling restart
+    node_monitor/   — per-node health polling and replication modes
+    backup/         — backup coordinator and WAL-G settings
+    agent_clients.rs — gRPC client for vk-agent
+    config/         — TOML config, validation and runtime reload
     console/        — local web page for trying every operation
   tests/            — integration tests (#[ignore] — need `make integ-up`)
 
@@ -378,16 +380,19 @@ pgcluster-admin/    — management plane service
     api/            — admin API
     agent.rs        — agent API
     reconciler.rs   — runs operations, one stored step at a time
+    scheduler.rs    — placement without overcommit, and port blocks
+    drain.rs        — moves nodes off a draining host
     ca.rs           — internal certificate authorities
   migrations/       — metadata schema
   tests/            — integration and end-to-end tests
 
 vk-agent/           — thin sidecar binary, and `vk-agent host`
   src/
-    grpc/           — agent gRPC server (promote, demote, heartbeat, status)
-    postgres/       — pg_ctl / psql wrappers
-    heartbeat/      — safe-mode watchdog
-    host/           — host agent: enrolment, rendering, process runners
+    server.rs       — agent gRPC server (promote, demote, seed, backups, status)
+    postgres.rs     — pg_ctl and SQL helpers
+    heartbeat.rs    — self-fencing watchdog
+    walg.rs         — WAL-G commands
+    host/           — host agent: enrolment, rendering, process runners, quotas
 
 proto/              — .proto definitions shared by pgcluster and vk-agent
 openapi/            — admin API and agent API contracts

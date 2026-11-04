@@ -45,6 +45,22 @@ pub struct HostConfig {
     /// Path to the WAL-G binary.
     #[serde(default = "default_walg_path")]
     pub walg_path: String,
+    /// How each instance's disk use is capped.
+    #[serde(default)]
+    pub disk_quota: QuotaKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuotaKind {
+    /// XFS project quotas if `instances_dir` is on XFS mounted with
+    /// `prjquota`, and no quota otherwise.
+    #[default]
+    Auto,
+    /// XFS project quotas, and refuse to start without them.
+    Xfs,
+    /// No quota, for development.
+    None,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

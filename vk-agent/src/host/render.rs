@@ -212,6 +212,15 @@ fn path(p: PathBuf) -> String {
 pub fn pgcluster_toml(instance: &Instance, layout: &Layout) -> String {
     let tls = layout.tls();
     let (raft_peers, nodes) = members(instance);
+    let mut tls_section = json!({
+        "ca_cert": path(tls.join("ca.crt")),
+        "cert": path(tls.join("node.crt")),
+        "key": path(tls.join("node.key")),
+    });
+    if instance.secrets.proxy_cert_pem.is_some() {
+        tls_section["proxy_cert"] = json!(path(tls.join("proxy.crt")));
+        tls_section["proxy_key"] = json!(path(tls.join("proxy.key")));
+    }
     let mut api_keys = vec![instance.secrets.api_key.clone()];
     api_keys.extend(instance.secrets.next.iter().map(|n| n.api_key.clone()));
     let config = json!({
@@ -238,11 +247,7 @@ pub fn pgcluster_toml(instance: &Instance, layout: &Layout) -> String {
             "allowed_cidrs": instance.allowed_cidrs,
             "require_tls": true,
         },
-        "tls": {
-            "ca_cert": path(tls.join("ca.crt")),
-            "cert": path(tls.join("node.crt")),
-            "key": path(tls.join("node.key")),
-        },
+        "tls": tls_section,
         "metrics": { "listen_addr": local(instance, METRICS) },
         "api": {
             "listen_addr": local(instance, REST_API),
@@ -569,6 +574,24 @@ mod tests {
             "{text}"
         );
         assert!(env_file(&i).contains("PG_REPLICATION_PASSWORD_NEXT=r2\n"));
+    }
+
+    #[test]
+    fn a_custom_certificate_is_for_the_proxy_alone() {
+        let mut i = instance();
+        let text = pgcluster_toml(&i, &layout());
+        assert!(!text.contains("proxy_cert"), "{text}");
+        i.secrets.proxy_cert_pem = Some("cert".into());
+        i.secrets.proxy_key_pem = Some("key".into());
+        let config: toml::Value = toml::from_str(&pgcluster_toml(&i, &layout())).unwrap();
+        assert_eq!(
+            config["tls"]["proxy_cert"].as_str(),
+            Some("/instances/db-1-n1/tls/proxy.crt")
+        );
+        assert_eq!(
+            config["tls"]["cert"].as_str(),
+            Some("/instances/db-1-n1/tls/node.crt")
+        );
     }
 
     #[test]

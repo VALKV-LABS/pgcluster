@@ -173,6 +173,32 @@ pub struct ProxyConfig {
     /// Refuse clients that do not negotiate TLS.
     #[serde(default)]
     pub require_tls: bool,
+    /// Client connections open at once. More are closed on accept.
+    #[serde(default = "default_max_client_connections")]
+    pub max_client_connections: usize,
+    /// Connections that have not logged in yet, in total and from one
+    /// address. Logged-in clients do not count, so a flood of half-open
+    /// connections cannot crowd them out.
+    #[serde(default = "default_max_pending_logins")]
+    pub max_pending_logins: usize,
+    #[serde(default = "default_max_pending_logins_per_address")]
+    pub max_pending_logins_per_address: usize,
+    /// How long a client has to negotiate TLS and log in.
+    #[serde(default = "default_login_timeout")]
+    pub login_timeout_ms: u64,
+}
+
+fn default_max_client_connections() -> usize {
+    10_000
+}
+fn default_max_pending_logins() -> usize {
+    512
+}
+fn default_max_pending_logins_per_address() -> usize {
+    64
+}
+fn default_login_timeout() -> u64 {
+    10_000
 }
 
 fn default_auth_user() -> String {
@@ -305,6 +331,12 @@ pub struct TlsConfig {
     /// Development only: run gRPC and Postgres connections in plaintext.
     #[serde(default)]
     pub insecure_plaintext: bool,
+    /// A certificate the proxy presents to clients in place of `cert`, such as
+    /// one from a public CA for the database's own name. Both or neither.
+    #[serde(default)]
+    pub proxy_cert: Option<String>,
+    #[serde(default)]
+    pub proxy_key: Option<String>,
 }
 
 // ── [metrics] ─────────────────────────────────────────────────────────────────

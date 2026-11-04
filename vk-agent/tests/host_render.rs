@@ -50,7 +50,12 @@ fn instance(allowed_cidrs: &[&str], extensions: &[&str]) -> Instance {
             auth_password: "auth".into(),
             api_key: "api-key".into(),
             next: None,
+            proxy_cert_pem: None,
+            proxy_key_pem: None,
         },
+        role: "member".into(),
+        rename_from: None,
+        replicas: vec![],
     }
 }
 

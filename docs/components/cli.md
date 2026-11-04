@@ -64,16 +64,16 @@ Replication Lag:
 ### Config
 
 ```bash
-pgcluster config show            # Print current running config
-pgcluster config reload          # Reload config from file (non-restart fields)
-pgcluster config validate        # Validate pgcluster.toml without starting
+pgcluster config show                      # Print the running config, without secrets
+pgcluster config validate <path>           # Validate pgcluster.toml without starting
 ```
+
+To reload what can change with no restart, send `SIGHUP` to `pgcluster`. See [config_manager.md](config_manager.md).
 
 ### Failover (manual)
 
 ```bash
-pgcluster failover               # Let pgcluster pick best candidate
-pgcluster failover --target pg2  # Force specific target
+pgcluster failover pg1           # Abandon pg1 and promote the most current standby
 ```
 
 ### Init (bootstrap)
@@ -92,14 +92,43 @@ pgcluster host add host-1 --failure-domain rack-1   # Prints the enrolment token
 pgcluster host list
 pgcluster host show <id>
 pgcluster host delete <id>
+pgcluster host drain <id>                             # Moves every node off, with no downtime
+pgcluster host undrain <id>
+
+pgcluster repository add-posix main /backups
+pgcluster repository list
 
 pgcluster database create orders --allow 198.51.100.0/24 --extension vector --wait
+pgcluster database create orders --ha --mode sync --wait   # Three nodes, in separate failure domains
 pgcluster database list
 pgcluster database show <id>
 pgcluster database allow <id> 198.51.100.0/24 203.0.113.4/32 --wait   # Replaces the whole list
 pgcluster database extensions <id> vector pg_trgm --wait              # Replaces the whole list
+pgcluster database mode <id> sync_strict --wait
+pgcluster database retention <id> 14 --wait
+pgcluster database resize <id> --vcpu 2 --memory-gb 4 --storage-gb 50 --wait
+pgcluster database upgrade <id> --wait                # Onto the minor release the hosts have
+pgcluster database switchover <id> --wait
+pgcluster database restart <id> --wait
+pgcluster database replace <id> n2 --host host-4 --wait
+pgcluster database nodes <id>
+pgcluster database backup <id> --wait
+pgcluster database backups <id>
+pgcluster database restore-window <id>
+pgcluster database restore <id> orders_copy --time 2026-11-01T12:00:00Z --wait
+pgcluster database certificate <id> --cert proxy.crt --key proxy.key --wait
+pgcluster database replica-add <id> orders_dr --wait  # A cross-region replica
+pgcluster database replicas <id>
+pgcluster database replica-promote <id> <replica> --wait
+pgcluster database replica-delete <id> <replica> --wait
 pgcluster database rotate-password <id> --wait
+pgcluster database rotate-ca <id> --wait
+pgcluster database rotate-passwords <id> --wait
 pgcluster database delete <id> --wait
+
+pgcluster events --after <cursor>
+pgcluster audit-log --key ci                          # Each change, and the key that made it
+pgcluster admin-ca show
 ```
 
 `database create` and `rotate-password` generate the password on this machine and send only its SCRAM verifier. The password is printed once. With `--wait`, `database create` also writes the database's CA to `ca.crt` and prints a `psql` command.

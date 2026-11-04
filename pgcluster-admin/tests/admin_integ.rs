@@ -2190,3 +2190,683 @@ async fn a_new_secret_key_seals_everything_and_the_old_one_stops_working() {
         .is_err());
     let _ = host;
 }
+
+// ── Shared hosts and day two ──────────────────────────────────────────────────
+
+impl Fixture {
+    /// Report as a host with this many vCPUs, and these Postgres releases.
+    async fn report_as(
+        &self,
+        host: &reqwest::Client,
+        observed: i64,
+        vcpu: f64,
+        versions: Value,
+        instances: Value,
+    ) {
+        let response = host
+            .post(format!("{}/agent/v1/report", self.agent_url))
+            .json(&json!({
+                "observed_generation": observed,
+                "version": "test",
+                "address": "127.0.0.1",
+                "capacity": { "vcpu": vcpu, "memory_gb": 8.0, "storage_gb": 100.0 },
+                "instances": instances,
+                "postgres_versions": versions,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+    }
+
+    async fn operation(&self, path: &str, operation: &Value) -> Value {
+        let id = operation["id"].as_str().unwrap();
+        self.api("GET", &format!("{path}/operations/{id}"), None)
+            .await
+            .1
+    }
+
+    async fn database_generation(&self, database_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT generation FROM databases WHERE id = $1")
+            .bind(database_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+}
+
+fn sized(name: &str, vcpu: f64) -> Value {
+    let mut request = database_request(name);
+    request["resources"]["vcpu"] = json!(vcpu);
+    request
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn an_impossible_request_fails_with_a_clear_error() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (_, secret) = f.add_host("a").await;
+    let host = f.enroll(&secret).await;
+    f.report(&host, 0, json!([])).await;
+
+    let (status, body) = f
+        .api("POST", "/v1/databases", Some(sized("big", 8.0)))
+        .await;
+    assert_eq!(status, 422, "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("no host is large enough"), "{message}");
+
+    // Memory is kept back: 8 GB leaves 5.6 GB to hand out.
+    let mut request = database_request("hungry");
+    request["resources"]["memory_gb"] = json!(6);
+    let (status, body) = f.api("POST", "/v1/databases", Some(request)).await;
+    assert_eq!(status, 422, "{body}");
+
+    // What is placed counts: a second large database has no room left.
+    let (status, _) = f
+        .api("POST", "/v1/databases", Some(sized("one", 3.0)))
+        .await;
+    assert_eq!(status, 202);
+    f.drain().await;
+    let (status, body) = f
+        .api("POST", "/v1/databases", Some(sized("two", 2.0)))
+        .await;
+    assert_eq!(status, 422, "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("room for 2 vCPU"), "{message}");
+    assert!(message.contains("1 vCPU"), "{message}");
+
+    // Two asked for at once both pass the first check. Placement holds the
+    // line, and the one that does not fit fails with the reason.
+    let (_, three) = f
+        .api("POST", "/v1/databases", Some(sized("three", 1.0)))
+        .await;
+    let (_, four) = f
+        .api("POST", "/v1/databases", Some(sized("four", 1.0)))
+        .await;
+    f.drain().await;
+    let mut statuses = Vec::new();
+    for operation in [&three, &four] {
+        let id = operation["database_id"].as_str().unwrap();
+        let (_, database) = f.api("GET", &format!("/v1/databases/{id}"), None).await;
+        statuses.push((
+            database["status"].as_str().unwrap().to_string(),
+            database["status_reason"].as_str().unwrap_or("").to_string(),
+        ));
+    }
+    statuses.sort();
+    assert_eq!(statuses[0].0, "error", "{statuses:?}");
+    assert!(statuses[0].1.contains("room"), "{statuses:?}");
+    assert_eq!(statuses[1].0, "provisioning", "{statuses:?}");
+
+    let (_, hosts) = f.api("GET", "/v1/hosts", None).await;
+    let free = &hosts["items"][0]["free_capacity"];
+    assert_eq!(free["vcpu"], 0.0, "{hosts}");
+    assert_eq!(hosts["items"][0]["instances"], 2);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn instances_on_one_host_get_separate_port_blocks_until_none_are_left() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let mut state = f.state.clone();
+    state.scheduler = Arc::new(pgcluster_admin::scheduler::SchedulerConfig {
+        port_base_start: 21000,
+        port_base_end: 21010,
+        ..Default::default()
+    });
+    let reconciler = Reconciler::new(state, Duration::from_millis(50));
+    let (_, secret) = f.add_host("a").await;
+    let host = f.enroll(&secret).await;
+    f.report(&host, 0, json!([])).await;
+    for name in ["one", "two", "three"] {
+        f.create_database(name).await;
+    }
+    while reconciler.step_once().await.unwrap() {}
+    let (_, desired) = f.desired(&host, 0).await;
+    let mut ports: Vec<i64> = desired["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["port_base"].as_i64().unwrap())
+        .collect();
+    ports.sort();
+    assert_eq!(ports, [21000, 21010]);
+    let reason: String =
+        sqlx::query_scalar("SELECT status_reason FROM databases WHERE status = 'error'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert!(reason.contains("port block"), "{reason}");
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_drain_moves_every_node_off_its_host() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let mut ha = f.ha().await;
+    let (a_id, _) = ha.hosts[0].clone();
+    let host_path = format!("/v1/hosts/{a_id}");
+
+    let (status, host) = f.api("POST", &format!("{host_path}/drain"), None).await;
+    assert_eq!(status, 202, "{host}");
+    assert_eq!(host["status"], "draining");
+    let leaving: String = sqlx::query_scalar("SELECT node FROM nodes WHERE host_id = $1")
+        .bind(&a_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+
+    // Nowhere to go yet: the other racks hold the database's other nodes.
+    pgcluster_admin::drain::advance(&f.state).await.unwrap();
+    let (_, host) = f.api("GET", &host_path, None).await;
+    let reason = host["drain_error"].as_str().unwrap();
+    assert!(
+        reason.contains(&format!("cannot move orders/{leaving}")),
+        "{reason}"
+    );
+
+    // Nothing new lands on a draining host.
+    let mut request = database_request("elsewhere");
+    request["hosts"] = json!(["a"]);
+    let (_, operation) = f.api("POST", "/v1/databases", Some(request)).await;
+    f.drain().await;
+    let placed: i64 = sqlx::query_scalar("SELECT count(*) FROM nodes WHERE database_id = $1")
+        .bind(operation["database_id"].as_str().unwrap())
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(placed, 0);
+    f.api(
+        "DELETE",
+        &format!(
+            "/v1/databases/{}",
+            operation["database_id"].as_str().unwrap()
+        ),
+        None,
+    )
+    .await;
+    f.drain().await;
+
+    let (d_id, d_client) = f.add_host_in("d", "r4").await;
+    pgcluster_admin::drain::advance(&f.state).await.unwrap();
+    let (_, host) = f.api("GET", &host_path, None).await;
+    assert_eq!(host["drain_error"], Value::Null, "{host}");
+    let (kind, params): (String, sqlx::types::Json<Value>) = sqlx::query_as(
+        "SELECT kind, params FROM operations WHERE database_id = $1 ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(&ha.database_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(kind, "replace");
+    assert_eq!(params.0["old_node"], leaving.as_str());
+    let new_host: String = sqlx::query_scalar("SELECT host_id FROM nodes WHERE node = 'n4'")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(new_host, d_id);
+    ha.hosts.push((d_id, d_client));
+
+    // The replacement runs as any other: peers apply, the leader swaps
+    // members, and the old node goes.
+    f.report_all(&ha, 3).await;
+    f.finish_tasks(&ha.hosts[1].1).await;
+    f.hurry().await;
+    f.drain().await;
+    let (_, old) = ha.hosts.remove(0);
+    f.report(&old, 100, json!([])).await;
+    f.hurry().await;
+    f.drain().await;
+    f.report_all(&ha, 4).await;
+
+    pgcluster_admin::drain::advance(&f.state).await.unwrap();
+    let (_, host) = f.api("GET", &host_path, None).await;
+    assert_eq!(host["status"], "drained", "{host}");
+    assert_eq!(host["instances"], 0);
+    let (_, events) = f.api("GET", "/v1/events", None).await;
+    let types: Vec<&str> = events["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert!(types.contains(&"host_draining"), "{types:?}");
+    assert!(types.contains(&"host_drained"), "{types:?}");
+    let (status, _) = f.api("DELETE", &host_path, None).await;
+    assert_eq!(status, 204);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_host_with_a_one_node_database_is_not_drained() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (host_id, _, _) = active_database(&f).await;
+    let (status, body) = f
+        .api("POST", &format!("/v1/hosts/{host_id}/drain"), None)
+        .await;
+    assert_eq!(status, 409, "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("orders"), "{message}");
+    let (_, host) = f.api("GET", &format!("/v1/hosts/{host_id}"), None).await;
+    assert_eq!(host["draining"], false);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_database_resizes_within_its_hosts_room() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (_, database_id, host) = active_database(&f).await;
+    let path = format!("/v1/databases/{database_id}");
+    let resize = |vcpu: f64, memory_gb: f64, storage_gb: f64| json!({ "resources": { "vcpu": vcpu, "memory_gb": memory_gb, "storage_gb": storage_gb } });
+
+    let (status, body) = f.api("PATCH", &path, Some(resize(1.0, 1.0, 5.0))).await;
+    assert_eq!(status, 422, "{body}");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("shrink"));
+    let (status, body) = f.api("PATCH", &path, Some(resize(5.0, 1.0, 10.0))).await;
+    assert_eq!(status, 422, "{body}");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("no room"));
+
+    let (status, operation) = f.api("PATCH", &path, Some(resize(2.0, 2.0, 20.0))).await;
+    assert_eq!(status, 202, "{operation}");
+    assert_eq!(operation["kind"], "resize");
+    let (_, state) = f.desired(&host, 0).await;
+    assert_eq!(state["instances"][0]["resources"]["storage_gb"], 20.0);
+
+    // One node restarts itself when it applies the change, so there is no
+    // rolling restart to wait for.
+    let generation = f.database_generation(&database_id).await;
+    f.report(&host, 100, running(&database_id, generation))
+        .await;
+    f.hurry().await;
+    f.drain().await;
+    let detail = f.operation(&path, &operation).await;
+    assert_eq!(detail["status"], "succeeded", "{detail}");
+    let (_, database) = f.api("GET", &path, None).await;
+    assert_eq!(database["resources"]["vcpu"], 2.0);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_new_memory_size_on_three_nodes_takes_a_rolling_restart() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let ha = f.ha().await;
+    let request = json!({ "resources": { "vcpu": 1, "memory_gb": 2, "storage_gb": 10 } });
+    let (status, operation) = f.api("PATCH", &ha.path, Some(request)).await;
+    assert_eq!(status, 202, "{operation}");
+    let generation = f.database_generation(&ha.database_id).await;
+    f.report_all(&ha, generation).await;
+    let (_, state) = f.desired(&ha.hosts[0].1, -1).await;
+    assert_eq!(state["instances"][0]["tasks"][0]["kind"], "rolling_restart");
+    f.finish_all_tasks(&ha).await;
+    let detail = f.operation(&ha.path, &operation).await;
+    assert_eq!(detail["status"], "succeeded", "{detail}");
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_minor_upgrade_restarts_onto_what_the_hosts_have() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (host_id, database_id, host) = active_database(&f).await;
+    let path = format!("/v1/databases/{database_id}");
+    let upgrade = format!("{path}/upgrade");
+    let observed = f.generation(&host_id).await;
+    let on = |version: &str| {
+        json!([{
+            "database_id": database_id,
+            "node": "n1",
+            "observed_generation": 2,
+            "state": "running",
+            "server_version": version,
+        }])
+    };
+
+    f.report_as(&host, observed, 4.0, json!({ "18": "18.1" }), on("18.1"))
+        .await;
+    let (status, body) = f.api("POST", &upgrade, None).await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("already"));
+    let (_, database) = f.api("GET", &path, None).await;
+    assert_eq!(database["server_version"], "18.1");
+
+    // The host's package moved on; the running server has not.
+    f.report_as(&host, observed, 4.0, json!({ "18": "18.2" }), on("18.1"))
+        .await;
+    let (status, body) = f
+        .api("POST", &upgrade, Some(json!({ "version": "17.9" })))
+        .await;
+    assert_eq!(status, 422, "{body}");
+    let (status, operation) = f.api("POST", &upgrade, None).await;
+    assert_eq!(status, 202, "{operation}");
+    assert_eq!(operation["kind"], "upgrade");
+    f.drain().await;
+    f.finish_tasks(&host).await;
+    f.hurry().await;
+    f.drain().await;
+    let detail = f.operation(&path, &operation).await;
+    assert_eq!(detail["status"], "running", "{detail}");
+
+    f.report_as(&host, observed, 4.0, json!({ "18": "18.2" }), on("18.2"))
+        .await;
+    f.hurry().await;
+    f.drain().await;
+    let detail = f.operation(&path, &operation).await;
+    assert_eq!(detail["status"], "succeeded", "{detail}");
+    let (_, nodes) = f.api("GET", &format!("{path}/nodes"), None).await;
+    assert_eq!(nodes["items"][0]["server_version"], "18.2");
+}
+
+/// Open `count` TCP connections from `source` that never start TLS.
+async fn flood(
+    target: std::net::SocketAddr,
+    source: [u8; 4],
+    count: usize,
+) -> Vec<tokio::net::TcpStream> {
+    let mut held = Vec::new();
+    for _ in 0..count {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket
+            .bind(std::net::SocketAddr::from((source, 0)))
+            .unwrap();
+        if let Ok(stream) = socket.connect(target).await {
+            held.push(stream);
+        }
+    }
+    held
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_connection_flood_cannot_stop_an_enrolled_host() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (_, secret) = f.add_host("a").await;
+    let host = f.enroll(&secret).await;
+
+    // A listener of our own, with small limits and slow handshake timeouts, so
+    // the flood holds what it takes for the length of the test.
+    let issued = f
+        .state
+        .ca()
+        .issue_server(&["127.0.0.1".to_string()])
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let limits = tls::Limits {
+        total: 64,
+        handshakes: 8,
+        anonymous: 16,
+        per_address: 4,
+        handshake_timeout: Duration::from_secs(60),
+        header_timeout: Duration::from_secs(60),
+    };
+    tokio::spawn(tls::serve_with(
+        listener,
+        tls::shared(tls::agent_tls(&[f.state.ca().cert_pem()], &issued).unwrap()),
+        agent::router(f.state.clone()),
+        limits,
+    ));
+    let url = format!("https://{addr}/agent/v1/desired-state?generation=0&wait_seconds=0");
+    let call = |client: &reqwest::Client| client.get(&url).send();
+
+    // A connection the host already has keeps working under any flood.
+    assert_eq!(call(&host).await.unwrap().status(), 200);
+
+    // One address cannot take what others need: a new connection gets through.
+    let _one = flood(addr, [127, 0, 0, 2], 200).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let other = client(&f.ca_pem, None);
+    let anon_url = format!("https://{addr}/agent/v1/ca");
+    let response = other.get(&anon_url).send().await;
+    assert!(
+        response.is_ok(),
+        "a stranger from another address still connects"
+    );
+
+    // Many addresses can fill every handshake slot. The host's open
+    // connection still serves it.
+    let mut held = Vec::new();
+    for last in 3..10 {
+        held.push(flood(addr, [127, 0, 0, last], 4).await);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(call(&host).await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn every_change_is_traced_to_one_key_and_a_key_is_revoked_alone() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let other = "another-key-that-is-long-enough-to-pass";
+    let hash = |key: &str| pgcluster_admin::state::hash_api_key(key).unwrap();
+    f.state
+        .set_keys(&[("ci".into(), hash(API_KEY)), ("ops".into(), hash(other))])
+        .unwrap();
+    let as_ops = |method: &str, path: &str| {
+        f.http
+            .request(method.parse().unwrap(), format!("{}{path}", f.admin_url))
+            .bearer_auth(other)
+    };
+
+    let (database_id, _) = f.create_database("orders").await;
+    let response = as_ops("POST", &format!("/v1/databases/{database_id}/restart"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        409,
+        "not serving yet, and recorded anyway"
+    );
+    f.api("GET", "/v1/databases", None).await;
+
+    let (_, log) = f.api("GET", "/v1/audit-log", None).await;
+    let entries: Vec<(String, String, i64)> = log["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["key_name"].as_str().unwrap().to_string(),
+                e["path"].as_str().unwrap().to_string(),
+                e["status"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("ci".to_string(), "/v1/databases".to_string(), 202),
+            (
+                "ops".to_string(),
+                format!("/v1/databases/{database_id}/restart"),
+                409
+            ),
+        ],
+        "reads are not recorded"
+    );
+    let (_, mine) = f.api("GET", "/v1/audit-log?key=ops", None).await;
+    assert_eq!(mine["items"].as_array().unwrap().len(), 1);
+    assert_eq!(mine["items"][0]["database_id"], database_id.as_str());
+
+    // Revoke one, and the other keeps working.
+    f.state.set_keys(&[("ci".into(), hash(API_KEY))]).unwrap();
+    let response = as_ops("GET", "/v1/databases").send().await.unwrap();
+    assert_eq!(response.status(), 401);
+    let (status, _) = f.api("GET", "/v1/databases", None).await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_replica_follows_its_source_and_promotes_into_a_database_of_its_own() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let ha = f.ha().await;
+    let replicas = format!("{}/replicas", ha.path);
+
+    // Nowhere outside the source's racks yet.
+    let (status, operation) = f
+        .api("POST", &replicas, Some(json!({ "name": "orders_dr" })))
+        .await;
+    assert_eq!(status, 202, "{operation}");
+    assert_eq!(operation["kind"], "create_replica");
+    let replica_id = operation["database_id"].as_str().unwrap().to_string();
+    let replica_path = format!("/v1/databases/{replica_id}");
+    f.drain().await;
+    let placed: i64 = sqlx::query_scalar("SELECT count(*) FROM nodes WHERE database_id = $1")
+        .bind(&replica_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(placed, 0);
+
+    let (d_id, d) = f.add_host_in("d", "r4").await;
+    f.hurry().await;
+    f.drain().await;
+    let (_, state) = f.desired(&d, 0).await;
+    let instance = &state["instances"][0];
+    assert_eq!(instance["role"], "replica");
+    assert_eq!(instance["bootstrap"], "replica");
+    assert_eq!(
+        instance["peers"].as_array().unwrap().len(),
+        3,
+        "its source's nodes"
+    );
+    // It shares the source's CA, so the source's leader can reach its agent.
+    let (_, source_state) = f.desired(&ha.hosts[0].1, -1).await;
+    let source = &source_state["instances"][0];
+    assert_eq!(
+        source["secrets"]["ca_cert_pem"],
+        instance["secrets"]["ca_cert_pem"]
+    );
+    assert_eq!(source["replicas"][0]["node"], "r1");
+    assert_eq!(source["tasks"][0]["kind"], "add_replica");
+    assert_eq!(source["tasks"][0]["params"]["node_id"], "r1");
+
+    f.finish_tasks(&ha.hosts[0].1).await;
+    f.hurry().await;
+    f.drain().await;
+    let replica_report = |generation: i64| {
+        json!([{
+            "database_id": replica_id,
+            "node": "n1",
+            "observed_generation": generation,
+            "state": "running",
+        }])
+    };
+    f.report(&d, f.generation(&d_id).await, replica_report(1))
+        .await;
+    f.hurry().await;
+    f.drain().await;
+    let (_, replica) = f.api("GET", &replica_path, None).await;
+    assert_eq!(replica["status"], "active", "{replica}");
+    assert_eq!(replica["replica_of"], ha.database_id.as_str());
+    let (_, list) = f.api("GET", &replicas, None).await;
+    assert_eq!(list["items"][0]["id"], replica_id.as_str());
+    assert_eq!(list["items"][0]["host_name"], "d");
+
+    // A replica follows; its source keeps the secrets it shares.
+    let (status, _) = f
+        .api("POST", &format!("{replica_path}/restart"), None)
+        .await;
+    assert_eq!(status, 409);
+    let (status, _) = f.api("POST", &format!("{}/rotate-ca", ha.path), None).await;
+    assert_eq!(status, 409);
+    let (status, _) = f.api("DELETE", &ha.path, None).await;
+    assert_eq!(status, 409);
+
+    let promote = format!("{replicas}/{replica_id}/promote");
+    let (status, operation) = f.api("POST", &promote, None).await;
+    assert_eq!(status, 202, "{operation}");
+    f.drain().await;
+    let (_, source_state) = f.desired(&ha.hosts[0].1, -1).await;
+    assert_eq!(
+        source_state["instances"][0]["tasks"][0]["kind"],
+        "detach_replica"
+    );
+    f.finish_tasks(&ha.hosts[0].1).await;
+    f.hurry().await;
+    f.drain().await;
+
+    // Now a one-node database: no peers, and the source lets it go.
+    let (_, state) = f.desired(&d, -1).await;
+    let instance = &state["instances"][0];
+    assert_eq!(instance["role"], "member");
+    assert_eq!(instance["peers"], json!([]));
+    assert_eq!(
+        instance["rename_from"], "orders",
+        "its data holds the source's database, under the source's name"
+    );
+    let (_, source_state) = f.desired(&ha.hosts[0].1, -1).await;
+    assert_eq!(source_state["instances"][0]["replicas"], json!([]));
+
+    let generation = f.database_generation(&replica_id).await;
+    f.report(&d, f.generation(&d_id).await, replica_report(generation))
+        .await;
+    f.hurry().await;
+    f.drain().await;
+    let (_, state) = f.desired(&d, -1).await;
+    assert_eq!(state["instances"][0]["tasks"][0]["kind"], "backup");
+    f.finish_tasks(&d).await;
+    f.hurry().await;
+    f.drain().await;
+    let generation = f.database_generation(&replica_id).await;
+    f.report(&d, f.generation(&d_id).await, replica_report(generation))
+        .await;
+    f.hurry().await;
+    f.drain().await;
+    let detail = f.operation(&replica_path, &operation).await;
+    assert_eq!(detail["status"], "succeeded", "{detail}");
+    let (_, promoted) = f.api("GET", &replica_path, None).await;
+    assert_eq!(promoted["status"], "active");
+    assert_eq!(promoted["replica_of"], Value::Null);
+    let (_, list) = f.api("GET", &replicas, None).await;
+    assert_eq!(list["items"], json!([]));
+    let (status, _) = f.api("DELETE", &ha.path, None).await;
+    assert_eq!(status, 202, "the source no longer has replicas");
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_one_node_database_has_no_replicas() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (_, database_id, _) = active_database(&f).await;
+    let (status, body) = f
+        .api(
+            "POST",
+            &format!("/v1/databases/{database_id}/replicas"),
+            Some(json!({ "name": "orders_dr" })),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+}

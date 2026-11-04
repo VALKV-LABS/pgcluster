@@ -5,7 +5,27 @@ use std::net::UdpSocket;
 use anyhow::{Context, Result};
 use nix::sys::statvfs::statvfs;
 
+use super::config::HostConfig;
 use super::model::Resources;
+
+/// The Postgres majors `pgcluster-admin` offers.
+const MAJORS: &[&str] = &["16", "17", "18"];
+
+/// Each major installed here, and its full version, from `postgres --version`.
+/// A package upgrade changes this before any running server restarts.
+pub fn postgres_versions(config: &HostConfig) -> std::collections::BTreeMap<String, String> {
+    MAJORS
+        .iter()
+        .filter_map(|major| {
+            let output = std::process::Command::new(format!("{}/postgres", config.pg_bin(major)))
+                .arg("--version")
+                .output()
+                .ok()?;
+            let version = super::instance::release(&String::from_utf8_lossy(&output.stdout))?;
+            Some((major.to_string(), version))
+        })
+        .collect()
+}
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 

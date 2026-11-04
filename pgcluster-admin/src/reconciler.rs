@@ -12,8 +12,9 @@ use serde_json::{json, Value};
 use sqlx::{FromRow, Postgres, Transaction};
 
 use crate::ca::Ca;
-use crate::model::{choose_hosts, DatabaseSpec, HA_NODES};
+use crate::model::{DatabaseSpec, HA_NODES};
 use crate::operations::{self, event, Kind};
+use crate::scheduler::{host_loads, place, HostLoad, Placement, PORT_BLOCK};
 use crate::secrets::{
     random_backup_key, random_token, DatabaseSecrets, NextPasswords, NodeSecrets,
 };
@@ -21,11 +22,6 @@ use crate::state::AdminState;
 
 /// A host that has not reported for this long counts as offline.
 pub const ONLINE_WINDOW_SECONDS: i64 = 60;
-
-/// First port of the first instance on a host, and past the last one.
-const PORT_BASE_START: i32 = 20000;
-const PORT_BASE_END: i32 = 32760;
-const PORT_BLOCK: i32 = 10;
 
 const WAIT_RETRY: Duration = Duration::from_secs(1);
 /// Renew a node certificate with this long left, which leaves room for a host
@@ -90,6 +86,9 @@ impl Reconciler {
                 }
                 if let Err(e) = self.renew_certificates().await {
                     tracing::error!(err = format!("{e:#}"), "certificate renewal failed");
+                }
+                if let Err(e) = crate::drain::advance(&self.state).await {
+                    tracing::error!(err = format!("{e:#}"), "host drain failed");
                 }
                 if let Err(e) = crate::rotation::advance(&self.state).await {
                     tracing::error!(err = format!("{e:#}"), "admin CA rotation failed");
@@ -217,6 +216,20 @@ impl Reconciler {
                 Ok(Outcome::Done)
             }
             "rolling_restart" => run_task(tx, step, "rolling_restart", "leader", json!({})).await,
+            "resize_restart" if step.params["restart"].as_bool() == Some(true) => {
+                run_task(tx, step, "rolling_restart", "leader", json!({})).await
+            }
+            "resize_restart" => Ok(Outcome::Done),
+            "upgrade_check" => upgrade_check(tx, step).await,
+            "place_replica" => self.place_replica(tx, step).await,
+            "add_replica" => replica_task(tx, step, "add_replica").await,
+            "detach_replica" => replica_task(tx, step, "detach_replica").await,
+            "remove_replica" => match replica_of(tx, &step.database_id).await? {
+                Some(_) => replica_task(tx, step, "remove_replica").await,
+                None => Ok(Outcome::Done),
+            },
+            "promote" => promote(tx, step).await,
+            "wait_version" => wait_version(tx, step).await,
             "switchover" => {
                 let params = json!({ "target": step.params["target"] });
                 run_task(tx, step, "switchover", "leader", params).await
@@ -380,31 +393,25 @@ impl Reconciler {
                 .fetch_one(&mut **tx)
                 .await?;
 
-        let candidates: Vec<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT h.id, h.address, h.failure_domain FROM hosts h \
-             WHERE h.last_seen_at > now() - make_interval(secs => $1) \
-               AND h.address IS NOT NULL \
-               AND (cardinality($2::text[]) = 0 OR h.id = ANY($2) OR h.name = ANY($2)) \
-             ORDER BY (h.capacity->>'memory_gb')::float8 - coalesce(( \
-                 SELECT sum((d.spec->'resources'->>'memory_gb')::float8) \
-                 FROM nodes n JOIN databases d ON d.id = n.database_id \
-                 WHERE n.host_id = h.id), 0) DESC, h.id \
-             FOR UPDATE OF h",
-        )
-        .bind(ONLINE_WINDOW_SECONDS as f64)
-        .bind(&spec.hosts)
-        .fetch_all(&mut **tx)
-        .await?;
+        let hosts: Vec<HostLoad> = host_loads(tx, true)
+            .await?
+            .into_iter()
+            .filter(|h| h.online && !h.draining && h.address.is_some())
+            .filter(|h| {
+                spec.hosts.is_empty() || spec.hosts.contains(&h.id) || spec.hosts.contains(&h.name)
+            })
+            .collect();
         let count = if spec.ha { HA_NODES } else { 1 };
-        let chosen = choose_hosts(candidates, count, |(id, _, domain)| {
-            domain.clone().unwrap_or_else(|| id.clone())
-        });
-        let Some(chosen) = chosen else {
-            return Ok(Outcome::Wait(if spec.ha {
-                "waiting for three online hosts in separate failure domains".into()
-            } else {
-                "waiting for an online host".into()
-            }));
+        let chosen = match place(&self.state.scheduler, &hosts, count, &spec.resources) {
+            Placement::Placed(chosen) => chosen,
+            Placement::TooFewHosts => {
+                return Ok(Outcome::Wait(if spec.ha {
+                    "waiting for three online hosts in separate failure domains".into()
+                } else {
+                    "waiting for an online host".into()
+                }));
+            }
+            Placement::NoRoom(message) => return Ok(Outcome::Fail(message)),
         };
 
         let ca = Ca::generate(&format!("pgcluster-{name}"))?;
@@ -426,6 +433,7 @@ impl Reconciler {
             source_backup_key,
             previous_ca_cert_pem: None,
             next: None,
+            proxy_certificate: None,
         };
 
         sqlx::query("UPDATE databases SET ca_cert_pem = $2, secrets = $3 WHERE id = $1")
@@ -443,7 +451,8 @@ impl Reconciler {
         } else {
             "initdb"
         };
-        for (index, (host_id, address, _)) in chosen.iter().enumerate() {
+        for (index, host) in chosen.iter().enumerate() {
+            let (host_id, address) = (&host.id, host.address.as_deref().unwrap_or_default());
             let node = format!("n{}", index + 1);
             let bootstrap = if index == 0 { first } else { "seed" };
             let added = add_node(
@@ -468,6 +477,90 @@ impl Reconciler {
             )
             .await?;
         }
+        Ok(Outcome::Done)
+    }
+
+    /// Put a replica on a host away from its source. It shares the source's CA
+    /// and passwords, which its data holds, and gets a backup key of its own
+    /// for when it is promoted.
+    async fn place_replica(&self, tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+        let (spec,): (sqlx::types::Json<DatabaseSpec>,) =
+            sqlx::query_as("SELECT spec FROM databases WHERE id = $1")
+                .bind(&step.database_id)
+                .fetch_one(&mut **tx)
+                .await?;
+        let source = spec
+            .replica_of
+            .clone()
+            .context("the database is not a replica")?;
+        let taken: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT h.id, h.failure_domain FROM nodes n JOIN hosts h ON h.id = n.host_id \
+             WHERE n.database_id = $1 AND NOT n.retracted",
+        )
+        .bind(&source.database_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let domains: Vec<String> = taken
+            .iter()
+            .map(|(id, domain)| domain.clone().unwrap_or_else(|| id.clone()))
+            .collect();
+        let hosts: Vec<HostLoad> = host_loads(tx, true)
+            .await?
+            .into_iter()
+            .filter(|h| h.online && !h.draining && h.address.is_some())
+            .filter(|h| !domains.contains(&h.domain()))
+            .filter(|h| {
+                spec.hosts.is_empty() || spec.hosts.contains(&h.id) || spec.hosts.contains(&h.name)
+            })
+            .collect();
+        let host = match place(&self.state.scheduler, &hosts, 1, &spec.resources) {
+            Placement::Placed(mut chosen) => chosen.remove(0),
+            Placement::TooFewHosts => {
+                return Ok(Outcome::Wait(
+                    "waiting for an online host outside the source's failure domains".into(),
+                ));
+            }
+            Placement::NoRoom(message) => return Ok(Outcome::Fail(message)),
+        };
+
+        let mut secrets = self.database_secrets(tx, &source.database_id).await?;
+        secrets.backup_key = random_backup_key();
+        secrets.source_backup_key = None;
+        secrets.previous_ca_cert_pem = None;
+        secrets.next = None;
+        secrets.proxy_certificate = None;
+        let ca = Ca::from_pem(&secrets.ca_cert_pem, &secrets.ca_key_pem)?;
+        self.store_secrets(tx, &step.database_id, &secrets).await?;
+        let address = host.address.clone().unwrap_or_default();
+        let added = add_node(
+            &self.state,
+            tx,
+            &step.database_id,
+            "n1",
+            &host.id,
+            &address,
+            "replica",
+            &ca,
+        )
+        .await?;
+        let Some(port_base) = added else {
+            return Ok(Outcome::Fail(format!(
+                "host {} has no free ports",
+                host.name
+            )));
+        };
+        // The source's nodes let the replica in.
+        bump_hosts(tx, &source.database_id).await?;
+        operations::log(
+            tx,
+            &step.operation_id,
+            "reconciler",
+            &format!(
+                "placed the replica on host {} at port {port_base}",
+                host.name
+            ),
+        )
+        .await?;
         Ok(Outcome::Done)
     }
 
@@ -678,8 +771,8 @@ pub async fn add_node(
          WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.host_id = $4 AND n.port_base = p) \
          ORDER BY p LIMIT 1",
     )
-    .bind(PORT_BASE_START)
-    .bind(PORT_BASE_END)
+    .bind(state.scheduler.port_base_start)
+    .bind(state.scheduler.port_base_end)
     .bind(PORT_BLOCK)
     .bind(host_id)
     .fetch_optional(&mut **tx)
@@ -789,7 +882,7 @@ async fn fail(tx: &mut Tx<'_>, step: &Claimed, message: &str) -> Result<()> {
     operations::log(tx, &step.operation_id, "reconciler", message).await?;
     // A failed update leaves a database serving on its old settings.
     let status = match Kind::parse(&step.kind) {
-        Some(Kind::Create | Kind::Delete) => "error",
+        Some(Kind::Create | Kind::Delete | Kind::CreateReplica | Kind::PromoteReplica) => "error",
         _ => "degraded",
     };
     set_status(tx, &step.database_id, status, Some(message)).await?;
@@ -851,6 +944,20 @@ async fn run_task(
     run_on: &str,
     params: Value,
 ) -> Result<Outcome> {
+    let database_id = step.database_id.clone();
+    run_task_on(tx, step, &database_id, kind, run_on, params).await
+}
+
+/// As `run_task`, on the nodes of `database_id`, which a replica's operations
+/// use to reach their source's leader.
+async fn run_task_on(
+    tx: &mut Tx<'_>,
+    step: &Claimed,
+    database_id: &str,
+    kind: &str,
+    run_on: &str,
+    params: Value,
+) -> Result<Outcome> {
     let task: Option<(String, Option<String>)> =
         sqlx::query_as("SELECT status, error FROM tasks WHERE operation_id = $1 AND kind = $2")
             .bind(&step.operation_id)
@@ -865,13 +972,13 @@ async fn run_task(
             )
             .bind(uuid::Uuid::new_v4().to_string())
             .bind(&step.operation_id)
-            .bind(&step.database_id)
+            .bind(database_id)
             .bind(kind)
             .bind(run_on)
             .bind(sqlx::types::Json(&params))
             .execute(&mut **tx)
             .await?;
-            bump_hosts(tx, &step.database_id).await?;
+            bump_hosts(tx, database_id).await?;
             Ok(Outcome::Wait(format!("waiting for {kind}")))
         }
         Some((status, _)) if status == "succeeded" => Ok(Outcome::Done),
@@ -965,6 +1072,10 @@ async fn drop_old(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
 }
 
 async fn retract(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+    // The source stops letting a deleted replica in.
+    if let Some(source) = replica_of(tx, &step.database_id).await? {
+        bump_hosts(tx, &source.database_id).await?;
+    }
     let hosts: Vec<String> = sqlx::query_scalar(
         "UPDATE nodes SET retracted = true WHERE database_id = $1 RETURNING host_id",
     )
@@ -1002,5 +1113,113 @@ async fn finalize(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
         .execute(&mut **tx)
         .await?;
     set_status(tx, &step.database_id, "deleted", None).await?;
+    Ok(Outcome::Done)
+}
+
+fn target_version(step: &Claimed) -> Result<&str> {
+    step.params["target_version"]
+        .as_str()
+        .context("the operation names no version")
+}
+
+/// Every host must still have the release installed. One may have been rebuilt
+/// since the operation was asked for.
+async fn upgrade_check(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+    let target = target_version(step)?;
+    let major = target.split('.').next().unwrap_or_default();
+    let missing: Vec<String> = sqlx::query_scalar(
+        "SELECT h.name FROM nodes n JOIN hosts h ON h.id = n.host_id \
+         WHERE n.database_id = $1 AND NOT n.retracted \
+           AND h.postgres_versions->>$2 IS DISTINCT FROM $3 \
+         ORDER BY h.name",
+    )
+    .bind(&step.database_id)
+    .bind(major)
+    .bind(target)
+    .fetch_all(&mut **tx)
+    .await?;
+    if missing.is_empty() {
+        Ok(Outcome::Done)
+    } else {
+        Ok(Outcome::Fail(format!(
+            "Postgres {target} is not installed on {}",
+            missing.join(", ")
+        )))
+    }
+}
+
+/// Every node runs the new release once it reports so.
+async fn wait_version(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+    let target = target_version(step)?;
+    let behind: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT node, server_version FROM nodes \
+         WHERE database_id = $1 AND NOT retracted AND server_version IS DISTINCT FROM $2 \
+         ORDER BY node",
+    )
+    .bind(&step.database_id)
+    .bind(target)
+    .fetch_all(&mut **tx)
+    .await?;
+    match behind.first() {
+        None => Ok(Outcome::Done),
+        Some((node, version)) => Ok(Outcome::Wait(format!(
+            "waiting for {node} to run {target}, not {}",
+            version.as_deref().unwrap_or("an unknown version")
+        ))),
+    }
+}
+
+async fn replica_of(tx: &mut Tx<'_>, database_id: &str) -> Result<Option<crate::model::ReplicaOf>> {
+    let (spec,): (sqlx::types::Json<DatabaseSpec>,) =
+        sqlx::query_as("SELECT spec FROM databases WHERE id = $1")
+            .bind(database_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok(spec.0.replica_of)
+}
+
+/// Work on a replica that its source's Raft leader does.
+async fn replica_task(tx: &mut Tx<'_>, step: &Claimed, kind: &str) -> Result<Outcome> {
+    let source = replica_of(tx, &step.database_id)
+        .await?
+        .context("the database is not a replica")?;
+    let (address, port_base): (Option<String>, i32) = sqlx::query_as(
+        "SELECT h.address, n.port_base FROM nodes n JOIN hosts h ON h.id = n.host_id \
+         WHERE n.database_id = $1 ORDER BY n.node LIMIT 1",
+    )
+    .bind(&step.database_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let address = address.unwrap_or_default();
+    let params = json!({
+        "node_id": source.node_id,
+        "agent_addr": format!("{address}:{}", port_base + 4),
+        "postgres_addr": format!("{address}:{}", port_base + 2),
+    });
+    run_task_on(tx, step, &source.database_id, kind, "leader", params).await
+}
+
+/// The source has let go: the replica becomes a one-node database of its own,
+/// and its `pgcluster` starts a Raft group of one on the data it has.
+async fn promote(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+    let (spec,): (sqlx::types::Json<DatabaseSpec>,) =
+        sqlx::query_as("SELECT spec FROM databases WHERE id = $1")
+            .bind(&step.database_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let mut spec = spec.0;
+    if let Some(source) = spec.replica_of.take() {
+        bump_hosts(tx, &source.database_id).await?;
+    }
+    sqlx::query("UPDATE databases SET spec = $2 WHERE id = $1")
+        .bind(&step.database_id)
+        .bind(sqlx::types::Json(&spec))
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE nodes SET bootstrap = 'promoted' WHERE database_id = $1")
+        .bind(&step.database_id)
+        .execute(&mut **tx)
+        .await?;
+    new_generation(tx, step).await?;
     Ok(Outcome::Done)
 }

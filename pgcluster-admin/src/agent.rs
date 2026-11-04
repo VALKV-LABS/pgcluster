@@ -305,6 +305,18 @@ async fn checks_for(state: &AdminState, host_id: &str) -> Result<Vec<RepositoryC
     Ok(checks)
 }
 
+fn to_peers(rows: Vec<(String, Option<String>, i32)>) -> Vec<Peer> {
+    rows.into_iter()
+        .filter_map(|(node, address, port_base)| {
+            address.map(|address| Peer {
+                node,
+                address,
+                port_base,
+            })
+        })
+        .collect()
+}
+
 /// Read generation and instances in one statement's snapshot, so a host never
 /// records a generation newer than the state it was sent.
 pub async fn build_desired_state(
@@ -361,24 +373,46 @@ pub async fn build_desired_state(
             target_time: Some(source.target_time.clone()),
             source_database: source.database_name.clone(),
         });
+        // A replica's peers are its source's nodes, which it follows and
+        // whose leader reaches its agent.
+        let (peer_database, peer_node) = match &spec.replica_of {
+            Some(source) => (source.database_id.clone(), String::new()),
+            None => (row.database_id.clone(), row.node.clone()),
+        };
         let peers: Vec<(String, Option<String>, i32)> = sqlx::query_as(
             "SELECT n.node, h.address, n.port_base FROM nodes n JOIN hosts h ON h.id = n.host_id \
              WHERE n.database_id = $1 AND n.node <> $2 AND NOT n.retracted ORDER BY n.node",
         )
-        .bind(&row.database_id)
-        .bind(&row.node)
+        .bind(&peer_database)
+        .bind(&peer_node)
         .fetch_all(&state.pool)
         .await?;
-        let peers = peers
-            .into_iter()
-            .filter_map(|(node, address, port_base)| {
-                address.map(|address| Peer {
-                    node,
-                    address,
-                    port_base,
-                })
-            })
-            .collect();
+        let peers = to_peers(peers);
+        let replicas: Vec<(String, Option<String>, i32)> = if spec.replica_of.is_some() {
+            vec![]
+        } else {
+            sqlx::query_as(
+                "SELECT d.spec->'replica_of'->>'node_id', h.address, n.port_base \
+                 FROM databases d JOIN nodes n ON n.database_id = d.id \
+                 JOIN hosts h ON h.id = n.host_id \
+                 WHERE d.spec->'replica_of'->>'database_id' = $1 AND d.status <> 'deleted' \
+                   AND NOT n.retracted \
+                 ORDER BY d.id",
+            )
+            .bind(&row.database_id)
+            .fetch_all(&state.pool)
+            .await?
+        };
+        let replicas = to_peers(replicas);
+        let role = if spec.replica_of.is_some() {
+            "replica"
+        } else {
+            "member"
+        };
+        let rename_from = spec
+            .data_name
+            .clone()
+            .filter(|name| *name != row.database_name);
         let tasks = sqlx::query_as::<_, Task>(
             "SELECT id, kind, run_on, params FROM tasks \
              WHERE database_id = $1 AND status = 'pending' ORDER BY created_at",
@@ -415,6 +449,9 @@ pub async fn build_desired_state(
             extensions: spec.extensions,
             owner: spec.owner,
             secrets: InstanceSecrets::merge(database, node),
+            role: role.to_string(),
+            rename_from,
+            replicas,
         });
     }
     Ok(DesiredState {
@@ -435,7 +472,7 @@ async fn report(
     let mut tx = state.pool.begin().await?;
     sqlx::query(
         "UPDATE hosts SET observed_generation = $2, version = $3, address = $4, capacity = $5, \
-                          ca_fingerprint = $6, last_seen_at = now() \
+                          ca_fingerprint = $6, postgres_versions = $7, last_seen_at = now() \
          WHERE id = $1",
     )
     .bind(&host_id)
@@ -444,6 +481,7 @@ async fn report(
     .bind(&report.address)
     .bind(sqlx::types::Json(&report.capacity))
     .bind(&report.ca_fingerprint)
+    .bind(sqlx::types::Json(&report.postgres_versions))
     .execute(&mut *tx)
     .await?;
 
@@ -462,7 +500,8 @@ async fn report(
             Some(instance) => {
                 sqlx::query(
                     "UPDATE nodes SET present = true, observed_generation = $3, state = $4, \
-                                      error = $5, archived_until = $6 \
+                                      error = $5, archived_until = $6, \
+                                      server_version = coalesce($7, server_version) \
                      WHERE database_id = $1 AND node = $2",
                 )
                 .bind(&database_id)
@@ -471,6 +510,7 @@ async fn report(
                 .bind(&instance.state)
                 .bind(&instance.error)
                 .bind(instance.archived_until)
+                .bind(&instance.server_version)
                 .execute(&mut *tx)
                 .await?;
             }

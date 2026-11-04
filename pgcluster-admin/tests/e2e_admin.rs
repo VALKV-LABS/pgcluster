@@ -2047,3 +2047,115 @@ async fn wait_online_with(client: &reqwest::Client, name: &str) {
     })
     .await;
 }
+
+async fn host_status(client: &reqwest::Client, name: &str) -> Value {
+    let hosts = api(client, "GET", "/v1/hosts?limit=500", None).await;
+    hosts["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["name"] == name)
+        .cloned()
+        .unwrap()
+}
+
+/// Stages 4 and 5 under client load: a resize, a host drain, and a
+/// cross-region replica promoted into a database of its own, with no commit
+/// lost along the way.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn e2e_admin_resize_drain_and_replica_under_load() {
+    let _stack = Stack::up(&HA_HOSTS);
+    let client = admin_client();
+    wait_ha_hosts(&client).await;
+    add_repository(&client).await;
+    let database = create_ha(&client, "orders", "async").await;
+    database.wait_healthy(&client, 3).await;
+    let load = Load::start(&database, &client, "load_day_two").await;
+    load.wait_progress().await;
+    let path = format!("/v1/databases/{}", database.id);
+
+    // New memory takes a rolling restart, and Postgres comes back with it.
+    let resize = serde_json::json!({
+        "resources": { "vcpu": 1, "memory_gb": 2, "storage_gb": 12 }
+    });
+    let operation = api(&client, "PATCH", &path, Some(resize)).await;
+    assert_eq!(operation["kind"], "resize", "{operation}");
+    database.wait_operation(&client, &operation).await;
+    load.wait_progress().await;
+    let endpoint = node_endpoint(&database.get(&client).await, 0);
+    let mut owner = endpoint.wait_connectable(&database.password).await;
+    assert_eq!(scalar(&mut owner, "SHOW shared_buffers").await, "512MB");
+    owner.close().await.ok();
+
+    // Drain the host in rack b. The only free rack is d.
+    database.wait_healthy(&client, 3).await;
+    let drained = host_status(&client, "host-ha-2").await;
+    let drain = format!("/v1/hosts/{}/drain", drained["id"].as_str().unwrap());
+    api(&client, "POST", &drain, None).await;
+    wait_for("the drain", Duration::from_secs(600), async || {
+        let host = host_status(&client, "host-ha-2").await;
+        assert!(host["drain_error"].is_null(), "{host}");
+        host["status"] == "drained"
+    })
+    .await;
+    let hosts: Vec<String> = database
+        .nodes(&client)
+        .await
+        .into_iter()
+        .map(|(_, host)| host)
+        .collect();
+    assert!(hosts.contains(&"host-ha-4".to_string()), "{hosts:?}");
+    assert!(!hosts.contains(&"host-ha-2".to_string()), "{hosts:?}");
+    load.wait_progress().await;
+
+    // Take it back, and put a replica there, outside the source's racks.
+    api(&client, "DELETE", &drain, None).await;
+    database.wait_healthy(&client, 3).await;
+    let replicas = format!("{path}/replicas");
+    let operation = api(
+        &client,
+        "POST",
+        &replicas,
+        Some(serde_json::json!({ "name": "orders_dr" })),
+    )
+    .await;
+    database.wait_operation(&client, &operation).await;
+    let replica_id = operation["database_id"].as_str().unwrap().to_string();
+    let listed = api(&client, "GET", &replicas, None).await;
+    assert_eq!(listed["items"][0]["host_name"], "host-ha-2", "{listed}");
+    load.wait_progress().await;
+
+    let (acked, _) = load.stop().await;
+    assert_eq!(lost(&database, &client, "load_day_two", &acked).await, 0);
+
+    // Promoted, it serves on its own, with what the source had.
+    let operation = api(
+        &client,
+        "POST",
+        &format!("{replicas}/{replica_id}/promote"),
+        None,
+    )
+    .await;
+    database.wait_operation(&client, &operation).await;
+    let promoted = HaDatabase {
+        id: replica_id,
+        password: database.password.clone(),
+    };
+    let snapshot = promoted.get(&client).await;
+    assert_eq!(snapshot["status"], "active", "{snapshot}");
+    assert!(snapshot["replica_of"].is_null());
+    let mut owner = node_endpoint(&snapshot, 0)
+        .wait_connectable(&promoted.password)
+        .await;
+    let copied: i64 = scalar(&mut owner, "SELECT count(*)::text FROM load_day_two")
+        .await
+        .parse()
+        .unwrap();
+    assert!(copied > 0, "the replica had the source's rows");
+    sqlx::query("INSERT INTO load_day_two VALUES (-1)")
+        .persistent(false)
+        .execute(&mut owner)
+        .await
+        .expect("the promoted database takes writes");
+}

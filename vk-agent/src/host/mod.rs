@@ -12,6 +12,7 @@ pub mod firewall;
 pub mod fsutil;
 pub mod instance;
 pub mod model;
+pub mod quota;
 pub mod render;
 pub mod restore;
 pub mod runner;
@@ -127,6 +128,7 @@ impl HostAgent {
                 state,
                 error,
                 archived_until: None,
+                server_version: None,
             };
             self.status
                 .lock()
@@ -184,7 +186,7 @@ impl HostAgent {
     async fn health_check(&self, desired: &DesiredState) -> bool {
         for instance in &desired.instances {
             let id = instance.id();
-            let running = match self.manager().processes(&id, &instance.postgres_version) {
+            let running = match self.manager().processes_for(instance) {
                 Ok(processes) => self.runner.is_running(&processes).await.unwrap_or(false),
                 Err(_) => false,
             };
@@ -440,11 +442,14 @@ fn spawn_watcher(worker: Worker, desired: SharedDesired, status: SharedStatus) {
                 if !layout.data().join("PG_VERSION").exists() {
                     continue;
                 }
-                let until = manager
-                    .archived_until(instance, samples.entry(id.clone()).or_default())
+                let (version, until) = manager
+                    .observe(instance, samples.entry(id.clone()).or_default())
                     .await;
                 if let Some(report) = status.lock().expect("status lock").instances.get_mut(&id) {
                     report.archived_until = until.map(|time| time.to_rfc3339());
+                    if version.is_some() {
+                        report.server_version = version;
+                    }
                 }
                 if !ticks.is_multiple_of(report_every) {
                     continue;
@@ -485,6 +490,7 @@ fn build_report(
         capacity: capacity::measure(&config.instances_dir)?,
         instances,
         ca_fingerprint: client.ca_fingerprint()?,
+        postgres_versions: capacity::postgres_versions(config),
     })
 }
 
@@ -496,6 +502,7 @@ pub async fn run(config_path: &str) -> Result<()> {
     std::fs::create_dir_all(&config.instances_dir)
         .with_context(|| format!("create {}", config.instances_dir))?;
     let run_as = config.run_as.as_deref().map(RunAs::lookup).transpose()?;
+    quota::init(config.disk_quota, &config.instances_dir)?;
 
     // An unreachable server is worth waiting for, but a refused token is not:
     // retrying cannot make it work.

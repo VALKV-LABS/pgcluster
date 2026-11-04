@@ -15,7 +15,10 @@ pgcluster-admin --config /etc/pgcluster-admin/config.toml
 ```toml
 [api]
 listen_addr = "0.0.0.0:8443"
-api_key_hashes = ["<SHA-256 of the key, in hex>"]   # Required. There is no way to run without.
+
+[[api.keys]]                       # At least one key is required
+name   = "ci"                      # Recorded in the audit log with each change it makes
+sha256 = "<SHA-256 of the key, in hex>"
 
 [agent_api]
 listen_addr = "0.0.0.0:8444"
@@ -35,9 +38,35 @@ It needs two environment variables, whose names `database_url_env` and `secret_k
 
 `pgcluster-admin generate-key` prints a new key and its hash, and `pgcluster-admin hash-key` hashes a key from standard input. The config holds only hashes, so a copy of it cannot call the API. Keys must be at least 32 characters: the tools refuse shorter ones, and the API never accepts them, even if a hash is configured.
 
+`[api] api_key_hashes = ["..."]` still works, and names its keys `key-1`, `key-2` and so on, in order. `SIGHUP` reads the keys again, so a key is added or revoked by editing the config, with no restart and no effect on other keys. A config that fails to load leaves the old keys in use.
+
 `[api] insecure_plaintext = true` serves the admin API without TLS, for local development only. `GET /health` is public, and answers `503` if the metadata database is unreachable.
 
 `GET /health` and `POST /agent/v1/enroll` need no credentials, so they share a few slots, and answer `429` with `Retry-After` when those are full. A flood fails fast there, and cannot take the database connections that hosts and operators need.
+
+## Connection Limits
+
+Both listeners cap connections, so a flood can neither crowd out enrolled hosts nor, from one address, everyone else:
+
+| Limit | Default | Applies to |
+|---|---|---|
+| Total | 4096 | Every connection |
+| Handshakes | 256 | TLS handshakes in progress, each with a 10 second deadline |
+| Anonymous | 512 | Connections without a client certificate |
+| Per address | 32 | Connections without a client certificate, from one address |
+| Header deadline | 30 seconds | Time to send a request's headers |
+
+A connection over a limit is closed at once, before its handshake. A host's verified certificate takes its connection out of the anonymous and per-address caps, and a connection a host already holds keeps working whatever arrives after it. Admin API clients have no certificates, so the per-address cap is what keeps one address from taking every slot.
+
+## Audit Log
+
+Every request to the admin API that is not a read is recorded, whether it succeeded or not, with the name of the key that made it, the method, the path, the status it was answered with and the database it named:
+
+```
+GET /v1/audit-log?key=ci&database_id=...&page_token=...
+```
+
+Entries come oldest first. A failure to record a change is logged, and does not undo the change.
 
 ## Hosts and Enrolment
 
@@ -68,9 +97,13 @@ A change stores the new spec, raises the database's `generation`, and records an
 | Replace a node | `wait_peers`, `replace_member`, `retract_old`, `wait_old_removed`, `drop_old`, `wait_applied`, `settle` |
 | Rotate a database's CA | `ca_trust_both`, `ca_issue` and `ca_trust_new`, each followed by `wait_applied` |
 | Rotate internal passwords | `passwords_offer`, `wait_applied`, `passwords_alter`, `passwords_commit`, `wait_applied`, `settle` |
-| Delete | `retract`, `wait_removed`, `finalize`. It replaces any operation still running |
+| Resize | `wait_applied`, `resize_restart`, `settle`. The restart is a rolling restart task, and runs only when memory changes on three nodes |
+| Minor upgrade | `upgrade_check`, `rolling_restart`, `wait_version`, `settle` |
+| Create a replica | `place_replica`, `add_replica`, `wait_applied`, `activate` |
+| Promote a replica | `detach_replica`, `promote`, `wait_applied`, `first_backup`, `open_access`, `wait_applied`, `activate` |
+| Delete | `remove_replica`, which does nothing unless the database is a replica, then `retract`, `wait_removed`, `finalize`. It replaces any operation still running |
 
-A step that must wait, such as for a host to apply a generation, retries each second. An operation fails after 10 minutes, or 6 hours if it moves data: create, backup, restart and replace. A failed create or delete marks the database `error`, and any other failure leaves it `degraded`, serving as it was. Every few seconds a sweep marks databases `degraded` when a node has failed, its host has stopped reporting, sync has fallen back to async, or backups are failing, and clears that when they recover.
+A step that must wait, such as for a host to apply a generation, retries each second. An operation fails after 10 minutes, or 6 hours if it moves data or restarts nodes: create, backup, restart, replace, resize, upgrade, and creating or promoting a replica. A failed create, delete, or replica creation or promotion marks the database `error`, and any other failure leaves it `degraded`, serving as it was. Every few seconds a sweep marks databases `degraded` when a node has failed, its host has stopped reporting, sync has fallen back to async, or backups are failing, and clears that when they recover.
 
 On a three-node database, `wait_applied` skips a host that has gone offline. The database is serving without it, and the host reads its state when it returns.
 
@@ -82,7 +115,7 @@ The host of the Raft leader also reports what the cluster knows: the primary, sy
 
 ## Three-Node Databases
 
-`place` takes three online hosts, each in a failure domain of its own, and waits if there are not enough. A host with no domain counts as a domain of its own. Naming hosts in one domain is refused at once. The first node runs `initdb`. The others start empty, and the Raft leader seeds them from the primary.
+`place` takes three online hosts with room, each in a failure domain of its own, and waits if there are not enough. A host with no domain counts as a domain of its own. Naming hosts in one domain is refused at once. [scheduler.md](scheduler.md) explains how hosts are chosen, how much of each is handed out, and how a host drains. The first node runs `initdb`. The others start empty, and the Raft leader seeds them from the primary.
 
 `endpoint` is the first node on an online host, and `endpoints` lists every node's proxy. Each proxy routes writes to the primary, wherever it is.
 
@@ -100,6 +133,7 @@ The host of the Raft leader also reports what the cluster knows: the primary, sy
 | `sync_degraded`, `sync_restored` | `sync` fell back to async, and came back |
 | `backup_completed`, `backup_failed` | The leader reported a new backup or a failure |
 | `operation_failed` | An operation ended in failure |
+| `host_draining`, `host_drained` | A drain began, and the host has no nodes left |
 
 ## Backups
 
@@ -128,6 +162,25 @@ Each of these runs under client load, and restarts nothing that clients use.
 
 The admin CA moves in three phases, each once every enrolled host has caught up. In `trust`, hosts learn the new CA and the agent API accepts certificates from both. In `issue`, this service presents a certificate from the new CA, and hosts ask for new client certificates. In `trim`, nobody trusts the old CA, and `ca.crt` and `ca.key` are replaced. A host that stays offline holds the rotation open, in place of being locked out: delete it to let the rotation finish. API clients need `bundle_pem` from `GET /v1/admin-ca` before `issue`. An enrolment token carries the hash of one CA, so issue new ones after the rotation ends.
 
-## Later Stages
+## Resizing and Minor Upgrades
 
-Resizing answers `not_supported`. Other later-stage routes in the contract answer `404`.
+`PATCH /v1/databases/{id}` with `resources` resizes every node. [scheduler.md](scheduler.md#resizing) says what applies online and what restarts.
+
+`POST /v1/databases/{id}/upgrade` moves to a newer minor release of the same major. Install it on the database's hosts first, with a package upgrade or a new node image: running servers keep the old binaries until they restart. Each host reports the release each major has installed, and each node reports the release its server runs, which `GET /v1/databases/{id}` shows as `server_version` once every node agrees. With no body, the target is the newest release every one of the database's hosts has. A rolling restart then moves standbys first, switches over, and moves the old primary. A request for a release a host lacks, or for a major upgrade, is refused: a major upgrade restores into a new database.
+
+## Cross-Region Replicas
+
+```
+POST   /v1/databases/{id}/replicas                         { name, host_id? }
+GET    /v1/databases/{id}/replicas
+DELETE /v1/databases/{id}/replicas/{replica_id}
+POST   /v1/databases/{id}/replicas/{replica_id}/promote
+```
+
+A replica is an external standby of a three-node database, as [failover_engine.md](failover_engine.md#external-standbys) describes, run as a database of its own with one node. It lands on a host outside the source's failure domains, follows asynchronously, is not a Raft voter, and is never a failover target. It runs `vk-agent` and Postgres, and no `pgcluster`: the source's leader drives it. It shares the source's CA and internal passwords, because its data holds the same roles. So while a database has replicas, it refuses `rotate-ca`, `rotate-passwords` and deletion, and a replica refuses every change but promotion and deletion. A one-node source cannot have replicas, because its nodes listen only on loopback: restore it into another region instead.
+
+`promote` detaches the replica: the source's leader has it promote and forgets it, and it becomes a one-node database with a Raft group of its own. Its data holds the source's database under the source's name, so its host renames that to the replica's name before clients are let in. It keeps what it had replayed, so commits in flight on the source may be missing. As with a create, clients reach it only once its first backup exists. It needs the same Postgres major, which it has by construction, and the same CPU architecture, which is the operator's to ensure.
+
+## Custom Proxy Certificate
+
+`PUT /v1/databases/{id}/certificate` with `certificate_pem` and `private_key_pem` has every node's proxy present that certificate, such as one from a public CA for the database's own name. The key must belong to the certificate and the certificate must be in date. Proxies load it on SIGHUP, with no restart. Raft, agents and Postgres keep the database's own CA, and `endpoint.ca_cert_pem` still names that CA, so clients of a custom certificate verify it against its own issuer.

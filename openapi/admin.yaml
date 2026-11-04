@@ -144,20 +144,44 @@ paths:
     post:
       operationId: drainHost
       summary: "Move every instance off a host"
+      description: |
+        Stops placing nodes on the host, and replaces each node it runs with
+        one on another host, one database at a time, with no downtime. Each move
+        is a `replace` operation of its database. The host shows `draining`
+        until it is empty, then `drained`, and `drain_error` says why a node
+        cannot move yet. A one-node database cannot move without downtime, so a
+        host that runs one answers `409`.
       tags: [hosts]
       x-stage: 4
       responses:
         "202":
-          description: Accepted. The operation tracks the change.
+          description: Accepted. The host's status tracks the drain.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Operation"
+                $ref: "#/components/schemas/Host"
         "401":
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
         "409":
+          $ref: "#/components/responses/Error"
+    delete:
+      operationId: undrainHost
+      summary: "Let nodes land on a host again"
+      description: Moves already started finish.
+      tags: [hosts]
+      x-stage: 4
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Host"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
           $ref: "#/components/responses/Error"
   /v1/backup-repositories:
     post:
@@ -355,6 +379,44 @@ paths:
         "404":
           $ref: "#/components/responses/Error"
         "409":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/upgrade:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: upgradeDatabase
+      summary: "Move to a newer minor release with a rolling restart"
+      description: |
+        Install the release on the database's hosts first, for example with a
+        package upgrade or a new node image. Standbys restart first, then a
+        switchover, then the old primary. Major upgrades restore into a new
+        database instead.
+      tags: [databases]
+      x-stage: 5
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Upgrade"
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
           $ref: "#/components/responses/Error"
   /v1/databases/{id}/switchover:
     parameters:
@@ -635,6 +697,10 @@ paths:
     put:
       operationId: putCertificate
       summary: "Replace the proxy certificate"
+      description: |
+        Every node's proxy presents this certificate to clients, with no
+        restart. Raft, agents and Postgres keep the database's own CA. The key
+        must belong to the certificate, and the certificate must be in date.
       tags: [databases]
       x-stage: 5
       requestBody:
@@ -781,6 +847,12 @@ paths:
     post:
       operationId: createReplica
       summary: "Add a cross-region replica"
+      description: |
+        An external standby of a three-node database, on a host outside its
+        failure domains. It follows asynchronously, is not a Raft voter and is
+        never a failover target. It shares the source's CA and passwords, so
+        the source refuses `rotate-ca` and `rotate-passwords`, and deletion,
+        while it has replicas. The host must run the same CPU architecture.
       tags: [replicas]
       x-stage: 5
       requestBody:
@@ -868,6 +940,11 @@ paths:
     post:
       operationId: promoteReplica
       summary: "Detach a replica into an independent database"
+      description: |
+        The replica stops following and becomes a one-node database with its
+        own Raft group and backups. It keeps what it had replayed, so commits
+        in flight on the source may be missing. It goes `active` once its first
+        backup exists.
       tags: [replicas]
       x-stage: 5
       responses:
@@ -973,6 +1050,37 @@ paths:
         "401":
           $ref: "#/components/responses/Error"
         "409":
+          $ref: "#/components/responses/Error"
+  /v1/audit-log:
+    get:
+      operationId: listAuditLog
+      summary: "Every change made through this API, and the key that made it"
+      description: |
+        Oldest first. Each request that is not a read is recorded with the
+        name of its key, whether it succeeded or not. Name keys with
+        `[[api.keys]]` in the config; a key in `api_key_hashes` is `key-1`,
+        `key-2` and so on.
+      tags: [operations]
+      x-stage: 5
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+        - name: key
+          in: query
+          schema:
+            type: string
+        - name: database_id
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditList"
+        "401":
           $ref: "#/components/responses/Error"
   /v1/events:
     get:
@@ -1087,7 +1195,7 @@ components:
           nullable: true
         status:
           type: string
-          enum: [pending, online, offline]
+          enum: [pending, online, offline, draining, drained]
         address:
           type: string
           nullable: true
@@ -1104,6 +1212,28 @@ components:
           nullable: true
           allOf:
             - $ref: "#/components/schemas/Resources"
+          description: |
+            What the scheduler can still place here: capacity less every
+            instance, and less what it keeps back for the OS, the page cache
+            and the disk's own needs.
+        instances:
+          type: integer
+          format: int64
+        postgres_versions:
+          type: object
+          additionalProperties:
+            type: string
+          description: 'Each Postgres major installed, and its full release, such as `{"18": "18.1"}`.'
+        draining:
+          type: boolean
+        drain_error:
+          type: string
+          nullable: true
+          description: Why the drain cannot move a node yet.
+        drained_at:
+          type: string
+          format: date-time
+          nullable: true
         last_seen_at:
           type: string
           format: date-time
@@ -1178,12 +1308,22 @@ components:
         resources:
           allOf:
             - $ref: "#/components/schemas/Resources"
-          description: Answers `not_supported` until stage 5.
+          description: |
+            Every node's host must have room for the growth. Storage only
+            grows. CPU and storage change online; new memory takes a rolling
+            restart on three nodes, and a restart on one. Not with
+            `replication_mode` in the same request.
         replication_mode:
           $ref: "#/components/schemas/ReplicationMode"
         retention_days:
           type: integer
           minimum: 1
+    Upgrade:
+      type: object
+      properties:
+        version:
+          type: string
+          description: A full release, such as `18.2`. When left out, the newest every host of the database has.
     Endpoint:
       type: object
       required: [host, port, database, ca_cert_pem]
@@ -1265,6 +1405,14 @@ components:
           type: string
           nullable: true
           description: The node the cluster last reported as primary. The cluster decides this.
+        server_version:
+          type: string
+          nullable: true
+          description: The release every node runs, such as `18.1`, or nothing while they differ.
+        replica_of:
+          type: string
+          nullable: true
+          description: The database this one is a cross-region replica of.
         created_at:
           type: string
           format: date-time
@@ -1365,6 +1513,9 @@ components:
         error:
           type: string
           nullable: true
+        server_version:
+          type: string
+          nullable: true
     ReplaceNode:
       type: object
       required: [host_id]
@@ -1393,6 +1544,10 @@ components:
             - replace
             - rotate_ca
             - rotate_passwords
+            - resize
+            - upgrade
+            - create_replica
+            - promote_replica
         status:
           type: string
           enum: [pending, running, succeeded, failed]
@@ -1540,20 +1695,75 @@ components:
           format: date-time
     CreateReplica:
       type: object
-      required: [host_id]
+      required: [name]
       properties:
+        name:
+          type: string
+          description: The replica's name as a database, which it keeps when promoted.
         host_id:
           type: string
+          description: |
+            A host by ID or name. When left out, the scheduler chooses one
+            outside the source's failure domains, which a named host must be too.
     Replica:
       type: object
-      required: [id, host_id, status]
+      required: [id, name, source_id, status, created_at]
       properties:
         id:
           type: string
-        host_id:
+          description: The replica's database ID.
+        name:
+          type: string
+        source_id:
           type: string
         status:
           type: string
+          enum: [provisioning, active, degraded, deleting, error]
+        status_reason:
+          type: string
+          nullable: true
+        host_id:
+          type: string
+          nullable: true
+        host_name:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    AuditEntry:
+      type: object
+      required: [cursor, key_name, method, path, status, at]
+      properties:
+        cursor:
+          type: string
+        key_name:
+          type: string
+          description: The name of the API key that made the change.
+        method:
+          type: string
+        path:
+          type: string
+        status:
+          type: integer
+          description: The HTTP status the change was answered with.
+        database_id:
+          type: string
+          nullable: true
+        at:
+          type: string
+          format: date-time
+    AuditList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEntry"
+        next_page_token:
+          type: string
+          nullable: true
     Event:
       type: object
       required: [cursor, type, at]

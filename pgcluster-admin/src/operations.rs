@@ -24,6 +24,14 @@ pub enum Kind {
     Replace,
     RotateCa,
     RotatePasswords,
+    /// New resources. Memory sets `shared_buffers`, which needs a restart.
+    Resize,
+    /// A rolling restart onto a newer minor release the hosts have installed.
+    Upgrade,
+    /// An external standby of another database, on a host of its own.
+    CreateReplica,
+    /// A replica detached into a database of its own.
+    PromoteReplica,
 }
 
 impl Kind {
@@ -40,6 +48,10 @@ impl Kind {
             Self::Replace => "replace",
             Self::RotateCa => "rotate_ca",
             Self::RotatePasswords => "rotate_passwords",
+            Self::Resize => "resize",
+            Self::Upgrade => "upgrade",
+            Self::CreateReplica => "create_replica",
+            Self::PromoteReplica => "promote_replica",
         }
     }
 
@@ -56,6 +68,10 @@ impl Kind {
             "replace" => Some(Self::Replace),
             "rotate_ca" => Some(Self::RotateCa),
             "rotate_passwords" => Some(Self::RotatePasswords),
+            "resize" => Some(Self::Resize),
+            "upgrade" => Some(Self::Upgrade),
+            "create_replica" => Some(Self::CreateReplica),
+            "promote_replica" => Some(Self::PromoteReplica),
             _ => None,
         }
     }
@@ -81,7 +97,8 @@ impl Kind {
                 "settle",
             ],
             Self::ReplicationMode => &["wait_applied", "set_replication_mode", "settle"],
-            Self::Delete => &["retract", "wait_removed", "finalize"],
+            // A replica leaves its source's cluster first.
+            Self::Delete => &["remove_replica", "retract", "wait_removed", "finalize"],
             Self::Restart => &["rolling_restart", "settle"],
             Self::Switchover => &["switchover", "settle"],
             Self::Backup => &["backup", "settle"],
@@ -114,14 +131,35 @@ impl Kind {
                 "wait_applied",
                 "settle",
             ],
+            // CPU and storage limits change online. A new memory size restarts
+            // standbys first, then switches over, then restarts the old primary.
+            Self::Resize => &["wait_applied", "resize_restart", "settle"],
+            // The source's leader adds the standby, and its monitor seeds it.
+            Self::CreateReplica => &["place_replica", "add_replica", "wait_applied", "activate"],
+            // As a create from here: clients stay out until a backup exists.
+            Self::PromoteReplica => &[
+                "detach_replica",
+                "promote",
+                "wait_applied",
+                "first_backup",
+                "open_access",
+                "wait_applied",
+                "activate",
+            ],
+            Self::Upgrade => &["upgrade_check", "rolling_restart", "wait_version", "settle"],
         }
     }
 
     fn timeout_seconds(self) -> i32 {
         match self {
-            Self::Create | Self::Backup | Self::Replace | Self::Restart => {
-                DATA_OPERATION_TIMEOUT_SECONDS
-            }
+            Self::Create
+            | Self::Backup
+            | Self::Replace
+            | Self::Restart
+            | Self::Resize
+            | Self::Upgrade
+            | Self::CreateReplica
+            | Self::PromoteReplica => DATA_OPERATION_TIMEOUT_SECONDS,
             _ => OPERATION_TIMEOUT_SECONDS,
         }
     }

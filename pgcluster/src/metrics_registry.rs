@@ -10,6 +10,7 @@ pub struct Metrics {
     pub switchover_total: IntCounter,
     pub primary_changes_total: IntCounter,
     pub proxy_connections_total: IntCounter,
+    pub proxy_connections_refused_total: IntCounter,
     pub connected_clients: IntGauge,
     pub primary_node_id: prometheus::GaugeVec,
     pub replica_lag_bytes: prometheus::GaugeVec,
@@ -33,6 +34,10 @@ impl Metrics {
         let proxy_connections_total = IntCounter::with_opts(Opts::new(
             "pgcluster_proxy_connections_total",
             "Total client connections accepted by the proxy",
+        ))?;
+        let proxy_connections_refused_total = IntCounter::with_opts(Opts::new(
+            "pgcluster_proxy_connections_refused_total",
+            "Client connections the proxy closed at once, over its connection limits",
         ))?;
         let switchover_total = IntCounter::with_opts(Opts::new(
             "pgcluster_switchovers_total",
@@ -79,6 +84,7 @@ impl Metrics {
         registry.register(Box::new(failover_total.clone()))?;
         registry.register(Box::new(failover_duration_seconds.clone()))?;
         registry.register(Box::new(proxy_connections_total.clone()))?;
+        registry.register(Box::new(proxy_connections_refused_total.clone()))?;
         registry.register(Box::new(switchover_total.clone()))?;
         registry.register(Box::new(primary_changes_total.clone()))?;
         registry.register(Box::new(connected_clients.clone()))?;
@@ -95,6 +101,7 @@ impl Metrics {
             switchover_total,
             primary_changes_total,
             proxy_connections_total,
+            proxy_connections_refused_total,
             connected_clients,
             primary_node_id,
             replica_lag_bytes,

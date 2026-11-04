@@ -28,6 +28,16 @@ All three are required, in both `pgcluster` and `vk-agent` configs. Certificates
 
 A certificate's subject alternative name must match the address peers use: the `agent_addr`, `postgres_addr` or Raft peer address in the config.
 
+The proxy can present a certificate of its own to clients, such as one from a public CA for the database's name, while everything else keeps the cluster's:
+
+```toml
+[tls]
+proxy_cert = "/etc/pgcluster/proxy.crt"   # Both or neither
+proxy_key  = "/etc/pgcluster/proxy.key"
+```
+
+`pgcluster-admin` sets these from `PUT /v1/databases/{id}/certificate`.
+
 For local development only, `insecure_plaintext = true` replaces all three and turns TLS off. Both binaries log a warning. The flag cannot be combined with certificate files.
 
 ## Generating certificates
@@ -63,10 +73,10 @@ vk-agent/src/tls.rs   # Server TLS config for the agent
 
 - `raft` uses `tonic_server_tls_config()` for its listener and `tonic_client_tls_config()` for peer connections.
 - `agent_clients` uses `tonic_client_tls_config()` for connections to vk-agent.
-- `proxy` uses `server_tls_acceptor()` for clients and `client_tls_connector()` for Postgres.
+- `proxy` uses `proxy_tls_acceptor()` for clients, which is the node's certificate unless `proxy_cert` is set, and `client_tls_connector()` for Postgres.
 
 ## Reloading Certificates
 
-SIGHUP makes `pgcluster` and `vk-agent` read their certificate files again, with no restart. The proxy swaps its acceptor, so connected clients are untouched. Each gRPC server starts a new generation on the same listener, so RPCs in flight finish on the old certificate and the port never stops accepting. Outbound gRPC drops its cached channels, so new ones present the new certificate. The proxy's connections to Postgres pick up a new CA for each new connection. Postgres needs `pg_ctl reload`. If the files do not load, the old certificates stay in use and the error is logged.
+SIGHUP makes `pgcluster` and `vk-agent` read their certificate files again, with no restart. `pgcluster` reads `[tls]` from its config file again too, so a newly added `proxy_cert` takes effect the same way. The proxy swaps its acceptor, so connected clients are untouched. Each gRPC server starts a new generation on the same listener, so RPCs in flight finish on the old certificate and the port never stops accepting. Outbound gRPC drops its cached channels, so new ones present the new certificate. The proxy's connections to Postgres pick up a new CA for each new connection. Postgres needs `pg_ctl reload`. If the files do not load, the old certificates stay in use and the error is logged.
 
 `ca_cert` can hold several certificates, which is how a CA rotates: nodes trust both, move to certificates from the new one, then drop the old.
