@@ -8,11 +8,13 @@ pub mod agent;
 pub mod api;
 pub mod ca;
 pub mod config;
+pub mod drain;
 pub mod error;
 pub mod model;
 pub mod operations;
 pub mod reconciler;
 pub mod rotation;
+pub mod scheduler;
 pub mod secrets;
 pub mod state;
 pub mod tls;
@@ -62,6 +64,27 @@ pub async fn load_bootstrap_hosts(pool: &PgPool, config: &AdminConfig) -> Result
     Ok(())
 }
 
+/// SIGHUP reads the API keys again, so one can be added or revoked with no
+/// restart. A config that fails to parse changes nothing.
+fn reload_keys_on_hangup(state: AdminState, config_path: String) -> Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut hangup = signal(SignalKind::hangup()).context("listen for SIGHUP")?;
+    tokio::spawn(async move {
+        while hangup.recv().await.is_some() {
+            let reloaded = AdminConfig::from_file(&config_path)
+                .and_then(|config| state.set_keys(&config.api.named_keys()).map(|_| config));
+            match reloaded {
+                Ok(config) => tracing::info!(
+                    keys = config.api.named_keys().len(),
+                    "reloaded the API keys"
+                ),
+                Err(e) => tracing::error!(err = format!("{e:#}"), "kept the old API keys"),
+            }
+        }
+    });
+    Ok(())
+}
+
 pub async fn run(config_path: &str) -> Result<()> {
     // sqlx's rustls pulls in aws-lc-rs too, so pin ring, as pgcluster does.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -101,7 +124,8 @@ pub async fn run(config_path: &str) -> Result<()> {
         tracing::info!(count, "sealed secrets with the new key. Remove the old one");
     }
 
-    let mut state = AdminState::new(pool, ca.clone(), secrets, &config.api.api_key_hashes)?;
+    let mut state = AdminState::with_keys(pool, ca.clone(), secrets, &config.api.named_keys())?;
+    state.scheduler = Arc::new(config.scheduler.clone());
     let server_cert = ca.issue_server(&config.tls.server_names)?;
 
     let agent_listener = TcpListener::bind(&config.agent_api.listen_addr)
@@ -138,6 +162,7 @@ pub async fn run(config_path: &str) -> Result<()> {
         tokio::spawn(tls::serve(api_listener, api_acceptor, api_app))
     };
 
+    reload_keys_on_hangup(state.clone(), config_path.to_string())?;
     let reconciler = reconciler::Reconciler::new(state, RECONCILE_TICK);
     let reconcile_task = tokio::spawn(reconciler.run());
 

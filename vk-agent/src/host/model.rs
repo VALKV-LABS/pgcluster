@@ -123,6 +123,11 @@ pub struct InstanceSecrets {
     /// Set during a rotation, until the roles have moved to them.
     #[serde(default)]
     pub next: Option<NextPasswords>,
+    /// A certificate the proxy presents in place of `cert_pem`.
+    #[serde(default)]
+    pub proxy_cert_pem: Option<String>,
+    #[serde(default)]
+    pub proxy_key_pem: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -164,6 +169,17 @@ pub struct Instance {
     pub extensions: Vec<String>,
     pub owner: Owner,
     pub secrets: InstanceSecrets,
+    /// `member`, or `replica` for an external standby of another database.
+    #[serde(default = "member")]
+    pub role: String,
+    /// External standbys of this database, which reach its Postgres, and whose
+    /// agents its leader reaches. They take no part in Raft.
+    #[serde(default)]
+    pub replicas: Vec<Peer>,
+}
+
+fn member() -> String {
+    "member".into()
 }
 
 impl Instance {
@@ -179,6 +195,12 @@ impl Instance {
 
     pub fn ha(&self) -> bool {
         !self.peers.is_empty()
+    }
+
+    /// An external standby runs Postgres and `vk-agent`, and no `pgcluster`:
+    /// its source's cluster drives it.
+    pub fn is_replica(&self) -> bool {
+        self.role == "replica"
     }
 
     /// Anything can serve the agent API, and these values reach paths, unit
@@ -211,8 +233,12 @@ impl Instance {
                 bail!("invalid extension name {extension:?}");
             }
         }
+        match self.role.as_str() {
+            "member" | "replica" => {}
+            other => bail!("unsupported role {other:?}"),
+        }
         match (self.bootstrap.as_str(), &self.restore) {
-            ("initdb" | "seed", _) => {}
+            ("initdb" | "seed" | "replica" | "promoted", _) => {}
             ("restore", Some(restore)) => {
                 check_identifier(&restore.source_database)?;
                 if let Some(target) = &restore.target_time {
@@ -232,6 +258,18 @@ impl Instance {
             check_node_name(&peer.node)?;
             if peer.port_base > u16::MAX - 10 {
                 bail!("port_base {} leaves no room for a block", peer.port_base);
+            }
+        }
+        for replica in &self.replicas {
+            check_address(&replica.address)?;
+            let plain = !replica.node.is_empty()
+                && replica.node.len() <= 32
+                && replica
+                    .node
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            if !plain || replica.port_base > u16::MAX - 10 {
+                bail!("invalid replica {:?}", replica.node);
             }
         }
         for cidr in &self.allowed_cidrs {
@@ -332,6 +370,8 @@ pub struct Report {
     pub instances: Vec<InstanceReport>,
     /// The hash of the CA bundle this host trusts.
     pub ca_fingerprint: String,
+    /// Each Postgres major installed here, and its full version.
+    pub postgres_versions: std::collections::BTreeMap<String, String>,
 }
 
 /// One outcome of a task.
@@ -374,6 +414,9 @@ pub struct InstanceReport {
     /// reports it.
     #[serde(default)]
     pub archived_until: Option<String>,
+    /// The release the running server reports, such as `18.1`.
+    #[serde(default)]
+    pub server_version: Option<String>,
 }
 
 #[cfg(test)]
@@ -424,8 +467,33 @@ pub mod tests {
                 auth_password: "auth".into(),
                 api_key: "api".into(),
                 next: None,
+                proxy_cert_pem: None,
+                proxy_key_pem: None,
             },
+            role: "member".into(),
+            replicas: vec![],
         }
+    }
+
+    #[test]
+    fn a_replica_is_named_apart_and_checked() {
+        let mut i = instance();
+        i.role = "replica".into();
+        i.bootstrap = "replica".into();
+        i.validate().unwrap();
+        assert!(i.is_replica());
+        i.role = "leader".into();
+        assert!(i.validate().is_err());
+
+        let mut i = instance();
+        i.replicas.push(Peer {
+            node: "r1".into(),
+            address: "10.1.0.1".into(),
+            port_base: 20000,
+        });
+        i.validate().unwrap();
+        i.replicas[0].node = "r1; drop".into();
+        assert!(i.validate().is_err());
     }
 
     #[test]

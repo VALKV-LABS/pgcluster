@@ -31,6 +31,15 @@ pub struct DatabaseSecrets {
     /// Passwords about to replace these, during a rotation.
     #[serde(default)]
     pub next: Option<NextPasswords>,
+    /// A certificate the proxy presents in place of the one from this CA.
+    #[serde(default)]
+    pub proxy_certificate: Option<ProxyCertificate>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ProxyCertificate {
+    pub cert_pem: String,
+    pub key_pem: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

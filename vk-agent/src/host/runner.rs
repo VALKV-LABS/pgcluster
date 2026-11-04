@@ -12,6 +12,7 @@ use nix::unistd::{Gid, Pid, Uid, User};
 use tokio::process::Command;
 
 use super::config::{HostConfig, RunnerKind};
+use super::model::Resources;
 use super::render::Layout;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -63,6 +64,21 @@ pub struct Processes {
     pub pg_ctl: String,
     pub run_as: Option<RunAs>,
     pub user: Option<String>,
+    /// What the instance may use. Set when applying desired state.
+    pub resources: Option<Resources>,
+    /// Whether it runs `pgcluster`. An external standby does not.
+    pub proxy: bool,
+}
+
+impl Processes {
+    /// The units this instance runs, `vk-agent` first.
+    fn units(&self) -> Vec<String> {
+        let mut units = vec![agent_unit_name(&self.id)];
+        if self.proxy {
+            units.push(proxy_unit_name(&self.id));
+        }
+        units
+    }
 }
 
 // async_trait generates the attribute, so this lint cannot be fixed at the source.
@@ -106,6 +122,53 @@ fn proxy_unit_name(id: &str) -> String {
     format!("vk-instance-{id}-pgcluster.service")
 }
 
+fn slice_name(id: &str) -> String {
+    format!("vk-instance-{id}.slice")
+}
+
+/// The cgroup v2 limits both of an instance's units share, so a busy database
+/// cannot take another's CPU, memory or disk bandwidth.
+pub struct Limits {
+    pub cpu_quota_percent: u64,
+    pub memory_max_bytes: u64,
+    pub io_weight: u64,
+}
+
+impl Limits {
+    pub fn of(resources: &Resources) -> Self {
+        Self {
+            cpu_quota_percent: (resources.vcpu * 100.0).round().max(1.0) as u64,
+            memory_max_bytes: (resources.memory_gb * 1024.0 * 1024.0 * 1024.0) as u64,
+            // In proportion to CPU, so bandwidth under contention follows size.
+            io_weight: (resources.vcpu * 100.0).round().clamp(1.0, 10000.0) as u64,
+        }
+    }
+
+    fn properties(&self) -> [String; 3] {
+        [
+            format!("CPUQuota={}%", self.cpu_quota_percent),
+            format!("MemoryMax={}", self.memory_max_bytes),
+            format!("IOWeight={}", self.io_weight),
+        ]
+    }
+}
+
+pub fn slice_unit(id: &str, limits: &Limits) -> String {
+    let [cpu, memory, io] = limits.properties();
+    format!(
+        "[Unit]\n\
+         Description=Resource limits for {id}\n\
+         \n\
+         [Slice]\n\
+         CPUAccounting=yes\n\
+         MemoryAccounting=yes\n\
+         IOAccounting=yes\n\
+         {cpu}\n\
+         {memory}\n\
+         {io}\n"
+    )
+}
+
 /// SIGINT is a fast shutdown for Postgres, and stops `vk-agent` too. Postgres is
 /// not `vk-agent`'s child, but they share this unit's control group.
 pub fn agent_unit(processes: &Processes) -> String {
@@ -117,6 +180,7 @@ pub fn agent_unit(processes: &Processes) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
+         Slice={slice}\n\
          {user}\
          ExecStart={program} {config}\n\
          Restart=always\n\
@@ -129,6 +193,7 @@ pub fn agent_unit(processes: &Processes) -> String {
          [Install]\n\
          WantedBy=multi-user.target\n",
         id = processes.id,
+        slice = slice_name(&processes.id),
         program = processes.vk_agent,
         config = processes.layout.agent_config().display(),
     )
@@ -143,6 +208,7 @@ pub fn proxy_unit(processes: &Processes) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
+         Slice={slice}\n\
          {user}\
          EnvironmentFile={env}\n\
          ExecStart={program} server --config {config}\n\
@@ -153,6 +219,7 @@ pub fn proxy_unit(processes: &Processes) -> String {
          [Install]\n\
          WantedBy=multi-user.target\n",
         id = processes.id,
+        slice = slice_name(&processes.id),
         agent = agent_unit_name(&processes.id),
         env = processes.layout.env_file().display(),
         program = processes.pgcluster,
@@ -189,10 +256,18 @@ impl Runner for Systemd {
     async fn install(&self, processes: &Processes) -> Result<()> {
         let agent = self.unit_dir.join(agent_unit_name(&processes.id));
         let proxy = self.unit_dir.join(proxy_unit_name(&processes.id));
-        let units = [
+        let mut units = vec![
             (agent, agent_unit(processes)),
             (proxy, proxy_unit(processes)),
         ];
+        let slice = slice_name(&processes.id);
+        let limits = processes.resources.as_ref().map(Limits::of);
+        if let Some(limits) = &limits {
+            units.push((
+                self.unit_dir.join(&slice),
+                slice_unit(&processes.id, limits),
+            ));
+        }
         let mut changed = false;
         for (path, text) in units {
             if tokio::fs::read_to_string(&path).await.ok().as_ref() != Some(&text) {
@@ -204,6 +279,13 @@ impl Runner for Systemd {
         }
         if changed {
             systemctl(&["daemon-reload"]).await?;
+            // Applies new limits to a running slice at once, with no restart.
+            if let Some(limits) = &limits {
+                let properties = limits.properties();
+                let mut args = vec!["set-property", "--runtime", slice.as_str()];
+                args.extend(properties.iter().map(String::as_str));
+                systemctl(&args).await?;
+            }
         }
         Ok(())
     }
@@ -211,9 +293,10 @@ impl Runner for Systemd {
     /// `enable`, so an instance returns after a reboot with no help from
     /// `pgcluster-admin`.
     async fn start(&self, processes: &Processes) -> Result<()> {
-        let agent = agent_unit_name(&processes.id);
-        let proxy = proxy_unit_name(&processes.id);
-        systemctl(&["enable", "--now", &agent, &proxy]).await
+        let units = processes.units();
+        let mut args = vec!["enable", "--now"];
+        args.extend(units.iter().map(String::as_str));
+        systemctl(&args).await
     }
 
     async fn stop(&self, processes: &Processes) -> Result<()> {
@@ -223,10 +306,10 @@ impl Runner for Systemd {
     }
 
     async fn restart(&self, processes: &Processes) -> Result<()> {
-        let agent = agent_unit_name(&processes.id);
-        let proxy = proxy_unit_name(&processes.id);
-        systemctl(&["restart", &agent]).await?;
-        systemctl(&["restart", &proxy]).await
+        for unit in processes.units() {
+            systemctl(&["restart", &unit]).await?;
+        }
+        Ok(())
     }
 
     /// SIGHUP to the main process, from systemd itself, so it needs no `kill`
@@ -237,16 +320,14 @@ impl Runner for Systemd {
     }
 
     async fn reload_certificates(&self, processes: &Processes) -> Result<()> {
-        let agent = agent_unit_name(&processes.id);
-        let proxy = proxy_unit_name(&processes.id);
-        systemctl(&["kill", "--kill-whom=main", "--signal=HUP", &agent, &proxy]).await
+        let units = processes.units();
+        let mut args = vec!["kill", "--kill-whom=main", "--signal=HUP"];
+        args.extend(units.iter().map(String::as_str));
+        systemctl(&args).await
     }
 
     async fn is_running(&self, processes: &Processes) -> Result<bool> {
-        for unit in [
-            agent_unit_name(&processes.id),
-            proxy_unit_name(&processes.id),
-        ] {
+        for unit in processes.units() {
             let status = Command::new("systemctl")
                 .args(["is-active", "--quiet", &unit])
                 .status()
@@ -264,6 +345,7 @@ impl Runner for Systemd {
         for name in [
             agent_unit_name(&processes.id),
             proxy_unit_name(&processes.id),
+            slice_name(&processes.id),
         ] {
             let path = self.unit_dir.join(name);
             if path.exists() {
@@ -389,6 +471,9 @@ impl Runner for Plain {
             &[],
         )
         .await?;
+        if !processes.proxy {
+            return Ok(());
+        }
         let proxy_config = layout.pgcluster_config();
         let proxy_arg = proxy_config.to_string_lossy();
         spawn_detached(
@@ -441,6 +526,9 @@ impl Runner for Plain {
     }
 
     async fn reload_proxy(&self, processes: &Processes) -> Result<()> {
+        if !processes.proxy {
+            return Ok(());
+        }
         let layout = &processes.layout;
         let pid = live_pid(&pid_path(layout, "pgcluster"), &layout.pgcluster_config())
             .context("pgcluster is not running")?;
@@ -459,7 +547,7 @@ impl Runner for Plain {
         let layout = &processes.layout;
         let agent = live_pid(&pid_path(layout, "vk-agent"), &layout.agent_config());
         let proxy = live_pid(&pid_path(layout, "pgcluster"), &layout.pgcluster_config());
-        Ok(agent.is_some() && proxy.is_some())
+        Ok(agent.is_some() && (proxy.is_some() || !processes.proxy))
     }
 
     async fn remove(&self, processes: &Processes) -> Result<()> {
@@ -480,7 +568,38 @@ mod tests {
             pg_ctl: "/usr/lib/postgresql/18/bin/pg_ctl".into(),
             run_as: None,
             user: Some("postgres".into()),
+            resources: None,
+            proxy: true,
         }
+    }
+
+    #[test]
+    fn a_replica_runs_no_pgcluster() {
+        let mut p = processes();
+        assert_eq!(p.units().len(), 2);
+        p.proxy = false;
+        assert_eq!(p.units(), ["vk-instance-db-1-n1-agent.service"]);
+    }
+
+    #[test]
+    fn both_units_run_in_the_instances_slice() {
+        let p = processes();
+        assert!(agent_unit(&p).contains("Slice=vk-instance-db-1-n1.slice"));
+        assert!(proxy_unit(&p).contains("Slice=vk-instance-db-1-n1.slice"));
+    }
+
+    #[test]
+    fn the_slice_caps_cpu_memory_and_io() {
+        let limits = Limits::of(&Resources {
+            vcpu: 1.5,
+            memory_gb: 2.0,
+            storage_gb: 10.0,
+        });
+        let unit = slice_unit("db-1-n1", &limits);
+        assert!(unit.contains("CPUQuota=150%"), "{unit}");
+        assert!(unit.contains("MemoryMax=2147483648"), "{unit}");
+        assert!(unit.contains("IOWeight=150"), "{unit}");
+        assert!(unit.contains("[Slice]"), "{unit}");
     }
 
     #[test]

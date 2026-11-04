@@ -223,6 +223,7 @@ mod tests {
             cert: file(format!("{name}.crt")),
             key: file(format!("{name}.key")),
             insecure_plaintext: false,
+            ..Default::default()
         })
         .unwrap()
     }

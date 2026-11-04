@@ -62,6 +62,27 @@ pub struct DatabaseSpec {
     /// Set when this database begins as a copy of another's backups.
     #[serde(default)]
     pub restore: Option<RestoreSource>,
+    /// Set while this database is an external standby of another, in its own
+    /// region. Promotion clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_of: Option<ReplicaOf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplicaOf {
+    pub database_id: String,
+    /// What the source cluster calls this standby.
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateReplica {
+    pub name: String,
+    /// The host to run on, by ID or name. Left out, the scheduler chooses one
+    /// outside the source's failure domains.
+    #[serde(default)]
+    pub host_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -153,6 +174,7 @@ impl CreateDatabase {
             owner: self.owner,
             backup: self.backup,
             restore: None,
+            replica_of: None,
         };
         Ok((self.name, self.workspace, spec))
     }
@@ -518,6 +540,12 @@ pub struct Instance {
     pub extensions: Vec<String>,
     pub owner: Owner,
     pub secrets: InstanceSecrets,
+    /// `member`, or `replica` for an external standby of another database,
+    /// which runs Postgres and `vk-agent` but no `pgcluster`.
+    pub role: String,
+    /// External standbys of this database. They reach its Postgres and its
+    /// leader reaches their agents, but they take no part in Raft.
+    pub replicas: Vec<Peer>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -537,11 +565,20 @@ pub struct InstanceSecrets {
     pub auth_password: String,
     pub api_key: String,
     pub next: Option<NextPasswords>,
+    /// What the proxy presents to clients, if not the node's own certificate.
+    pub proxy_cert_pem: Option<String>,
+    pub proxy_key_pem: Option<String>,
 }
 
 impl InstanceSecrets {
     pub fn merge(database: DatabaseSecrets, node: NodeSecrets) -> Self {
+        let (proxy_cert_pem, proxy_key_pem) = match database.proxy_certificate.clone() {
+            Some(c) => (Some(c.cert_pem), Some(c.key_pem)),
+            None => (None, None),
+        };
         Self {
+            proxy_cert_pem,
+            proxy_key_pem,
             ca_cert_pem: database.ca_bundle(),
             cert_pem: node.cert_pem,
             key_pem: node.key_pem,
@@ -569,6 +606,9 @@ pub struct Report {
     pub instances: Vec<InstanceReport>,
     #[serde(default)]
     pub ca_fingerprint: Option<String>,
+    /// Each Postgres major the host has, and its full version.
+    #[serde(default)]
+    pub postgres_versions: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -622,6 +662,9 @@ pub struct InstanceReport {
     pub error: Option<String>,
     #[serde(default)]
     pub archived_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// What the running server reports, such as `18.1`.
+    #[serde(default)]
+    pub server_version: Option<String>,
 }
 
 #[cfg(test)]
@@ -852,6 +895,8 @@ mod tests {
             auth_password: String::new(),
             api_key: String::new(),
             next: None,
+            proxy_cert_pem: None,
+            proxy_key_pem: Some("private".into()),
         };
         assert!(!format!("{secrets:?}").contains("private"));
     }

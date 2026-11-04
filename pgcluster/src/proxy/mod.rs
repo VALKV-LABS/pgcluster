@@ -5,6 +5,7 @@ pub mod allowlist;
 pub mod auth;
 pub mod backend;
 pub mod connection;
+pub mod limits;
 pub mod pool;
 pub mod protocol;
 pub mod router;
@@ -29,6 +30,7 @@ use crate::{
 
 use allowlist::SharedAllowlist;
 use auth::AuthQuery;
+use limits::{Admitted, ConnectionLimits};
 use pool::ConnectionPool;
 pub use router::Router;
 
@@ -94,6 +96,7 @@ impl ProxyServer {
             }
         });
 
+        let limits = ConnectionLimits::new(&self.config);
         loop {
             let (stream, peer_addr) = match listener.accept().await {
                 Ok(pair) => pair,
@@ -107,6 +110,11 @@ impl ProxyServer {
                 tracing::debug!(%peer_addr, "client refused by allowed_cidrs");
                 continue;
             }
+            let Some(admitted) = limits.admit(peer_addr.ip()) else {
+                tracing::debug!(%peer_addr, "client refused: too many connections");
+                self.metrics.proxy_connections_refused_total.inc();
+                continue;
+            };
 
             let router = Arc::clone(&self.router);
             let pool = Arc::clone(&self.pool);
@@ -115,22 +123,42 @@ impl ProxyServer {
             let m = Arc::clone(&self.metrics);
             let auth = Arc::clone(&self.auth);
             let require_tls = self.config.require_tls;
+            let login_timeout = limits.login_timeout;
 
             tokio::spawn(async move {
                 m.proxy_connections_total.inc();
                 m.connected_clients.inc();
                 tracing::debug!(%peer_addr, "client connected");
-                if let Err(e) = connection::ProxyConnection::run(
+                let Admitted {
+                    total: _total,
+                    login,
+                } = admitted;
+                let logged_in = login.done_flag();
+                let session = connection::ProxyConnection::run(
                     stream,
                     router,
                     pool,
                     tls_clone,
                     auth,
                     require_tls,
-                )
-                .await
-                {
-                    tracing::debug!(%peer_addr, "connection ended: {e}");
+                    login,
+                );
+                // A client that has not logged in by the deadline is dropped.
+                let deadline = async {
+                    tokio::time::sleep(login_timeout).await;
+                    if logged_in.load(std::sync::atomic::Ordering::SeqCst) {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                tokio::select! {
+                    result = session => {
+                        if let Err(e) = result {
+                            tracing::debug!(%peer_addr, "connection ended: {e}");
+                        }
+                    }
+                    () = deadline => {
+                        tracing::debug!(%peer_addr, "client did not log in in time");
+                    }
                 }
                 m.connected_clients.dec();
             });

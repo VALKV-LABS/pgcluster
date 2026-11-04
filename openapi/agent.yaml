@@ -624,6 +624,9 @@ components:
           type: [string, "null"]
           format: date-time
           description: Every commit before this is in the WAL archive. Only the primary reports it.
+        server_version:
+          type: [string, "null"]
+          description: The release the running server reports, such as `18.1`.
     Report:
       type: object
       required: [observed_generation, version, address, capacity, instances]
@@ -646,6 +649,11 @@ components:
         ca_fingerprint:
           type: string
           description: The SHA-256 of the CA bundle this host trusts.
+        postgres_versions:
+          type: object
+          additionalProperties:
+            type: string
+          description: 'Each Postgres major installed, and its full release, such as `{"18": "18.1"}`.'
     LogEntry:
       type: object
       required: [message]

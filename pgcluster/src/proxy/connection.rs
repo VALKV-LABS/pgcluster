@@ -16,6 +16,7 @@ use tokio::net::TcpStream;
 use super::{
     auth::AuthQuery,
     backend::{BackendConnection, BackendStream},
+    limits::LoginGuard,
     pool::{ConnectionPool, Login},
     protocol::{
         self, read_frontend_frame, read_startup_message, write_error_response, FrontendMessage,
@@ -68,6 +69,7 @@ impl ProxyConnection {
         tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
         auth: Arc<AuthQuery>,
         require_tls: bool,
+        mut pending: LoginGuard,
     ) -> Result<()> {
         // ── 1. SSL negotiation ────────────────────────────────────────────
         let tls_ref = tls.as_deref();
@@ -182,6 +184,7 @@ impl ProxyConnection {
         };
         client.write_all(&rest).await.context("forward startup")?;
         client.flush().await.context("flush startup")?;
+        pending.finish();
 
         // ── 4. Message routing loop ───────────────────────────────────────
         // Inject the now-authenticated connection into the pool so it can be

@@ -23,6 +23,9 @@ pub struct AdminConfig {
     /// template uses this so that hosts need no admin key to enrol.
     #[serde(default)]
     pub bootstrap_hosts: Vec<BootstrapHost>,
+    /// How much of each host is handed out, and which ports.
+    #[serde(default)]
+    pub scheduler: crate::scheduler::SchedulerConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,9 +38,62 @@ pub struct ApiConfig {
     /// There is no way to run without one.
     #[serde(default)]
     pub api_key_hashes: Vec<String>,
+    /// Named keys, so the audit log says which one made each change, and one
+    /// can be revoked alone: remove it here and send SIGHUP.
+    #[serde(default)]
+    pub keys: Vec<NamedKey>,
     /// Development only: serve the admin API in plaintext.
     #[serde(default)]
     pub insecure_plaintext: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedKey {
+    pub name: String,
+    /// SHA-256 of the key, in hex.
+    pub sha256: String,
+}
+
+impl ApiConfig {
+    /// Every accepted key, by name. Keys in `api_key_hashes` are `key-1`,
+    /// `key-2` and so on, in order.
+    pub fn named_keys(&self) -> Vec<(String, String)> {
+        self.api_key_hashes
+            .iter()
+            .enumerate()
+            .map(|(i, hash)| (format!("key-{}", i + 1), hash.clone()))
+            .chain(self.keys.iter().map(|k| (k.name.clone(), k.sha256.clone())))
+            .collect()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let keys = self.named_keys();
+        if keys.is_empty() {
+            anyhow::bail!(
+                "[api] needs at least one key, in [[api.keys]] or api_key_hashes. \
+                 Run pgcluster-admin generate-key to make a key"
+            );
+        }
+        let mut names = std::collections::HashSet::new();
+        for (name, hash) in &keys {
+            if !is_sha256(hash) {
+                anyhow::bail!("[api] the hash of key {name:?} must be 64 hex digits");
+            }
+            let plain = !name.is_empty()
+                && name.len() <= 63
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+            if !plain {
+                anyhow::bail!("[api] key name {name:?} must be 1 to 63 letters, digits, dots, dashes and underscores");
+            }
+            if !names.insert(name.as_str()) {
+                anyhow::bail!("[api] two keys are named {name:?}");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,15 +168,7 @@ impl AdminConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.api.api_key_hashes.is_empty() {
-            anyhow::bail!(
-                "[api] api_key_hashes must contain at least one hash. \
-                 Run pgcluster-admin generate-key to make a key"
-            );
-        }
-        if !self.api.api_key_hashes.iter().all(|h| is_sha256(h)) {
-            anyhow::bail!("[api] api_key_hashes must each be 64 hex digits");
-        }
+        self.api.validate()?;
         for (name, addr) in [
             ("api", &self.api.listen_addr),
             ("agent_api", &self.agent_api.listen_addr),
@@ -134,6 +182,7 @@ impl AdminConfig {
         if self.tls.server_names.is_empty() {
             anyhow::bail!("[tls] server_names must contain at least one name");
         }
+        self.scheduler.validate()?;
         for host in &self.bootstrap_hosts {
             if !is_sha256(&host.token_sha256) {
                 anyhow::bail!(
@@ -180,7 +229,7 @@ server_names = ["admin.internal"]
         let err = parse(&VALID.replace(&VALID[start..end], ""))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("api_key_hashes"), "{err}");
+        assert!(err.contains("at least one key"), "{err}");
     }
 
     #[test]
@@ -194,6 +243,19 @@ server_names = ["admin.internal"]
     fn the_old_setting_is_refused_rather_than_ignored() {
         let text = VALID.replace("api_key_hashes", "api_keys");
         assert!(parse(&text).is_err());
+    }
+
+    #[test]
+    fn named_keys_join_the_unnamed_ones() {
+        let hash = "ab0d8f2c6a1e4b7790c3de15f24a6b8c1d3e5f7091a2b4c6d8e0f1a3b5c7d9e1";
+        let text = format!("{VALID}\n[[api.keys]]\nname = \"ci\"\nsha256 = \"{hash}\"\n");
+        let cfg = parse(&text).unwrap();
+        let names: Vec<String> = cfg.api.named_keys().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["key-1", "ci"]);
+        let twice = text.replace("name = \"ci\"", "name = \"key-1\"");
+        assert!(parse(&twice).is_err());
+        let bad = text.replace("name = \"ci\"", "name = \"a b\"");
+        assert!(parse(&bad).is_err());
     }
 
     #[test]

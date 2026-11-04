@@ -26,6 +26,7 @@ fn tls_config(dir: &TempDir, name: &str) -> TlsConfig {
         cert: file(format!("{name}.crt")),
         key: file(format!("{name}.key")),
         insecure_plaintext: false,
+        ..Default::default()
     }
 }
 

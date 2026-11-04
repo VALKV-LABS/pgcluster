@@ -43,6 +43,9 @@ pub fn shared_client_tls(config: tonic::transport::ClientTlsConfig) -> SharedCli
 pub struct TlsManager {
     client_tls: Arc<rustls::ClientConfig>,
     server_tls: Arc<rustls::ServerConfig>,
+    /// What the proxy presents to clients: `server_tls`, unless a certificate
+    /// of its own is configured.
+    proxy_tls: Arc<rustls::ServerConfig>,
     /// Raw PEM bytes kept so callers can build tonic/tokio-rustls handles.
     ca_pem: Vec<u8>,
     cert_pem: Vec<u8>,
@@ -67,11 +70,21 @@ impl TlsManager {
 
         let server_tls =
             build_server_config(&cert_pem, &key_pem).context("build server TLS config")?;
+        let proxy_tls = match (&config.proxy_cert, &config.proxy_key) {
+            (Some(cert), Some(key)) => {
+                let cert = std::fs::read(cert).with_context(|| format!("read {cert}"))?;
+                let key = std::fs::read(key).with_context(|| format!("read {key}"))?;
+                Arc::new(build_server_config(&cert, &key).context("build proxy TLS config")?)
+            }
+            (None, None) => Arc::new(server_tls.clone()),
+            _ => bail!("[tls] set both proxy_cert and proxy_key, or neither"),
+        };
         let client_tls = build_client_config(&ca_cert_pem).context("build client TLS config")?;
 
         Ok(Self {
             client_tls: Arc::new(client_tls),
             server_tls: Arc::new(server_tls),
+            proxy_tls,
             ca_pem: ca_cert_pem,
             cert_pem,
             key_pem,
@@ -86,6 +99,11 @@ impl TlsManager {
     /// Returns a `TlsAcceptor` for incoming client / peer connections.
     pub fn server_tls_acceptor(&self) -> TlsAcceptor {
         TlsAcceptor::from(Arc::clone(&self.server_tls))
+    }
+
+    /// What the proxy presents to its clients.
+    pub fn proxy_tls_acceptor(&self) -> TlsAcceptor {
+        TlsAcceptor::from(Arc::clone(&self.proxy_tls))
     }
 
     /// Returns a `TlsConnector` for outbound connections to backends or peers.
@@ -129,11 +147,12 @@ impl TlsManager {
     ///
     /// **Never use in production.**
     pub fn insecure() -> Self {
-        let server_tls = build_insecure_server_config();
+        let server_tls = Arc::new(build_insecure_server_config());
         let client_tls = build_insecure_client_config();
         Self {
             client_tls: Arc::new(client_tls),
-            server_tls: Arc::new(server_tls),
+            proxy_tls: server_tls.clone(),
+            server_tls,
             ca_pem: Vec::new(),
             cert_pem: Vec::new(),
             key_pem: Vec::new(),

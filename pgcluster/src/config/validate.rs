@@ -146,6 +146,17 @@ fn validate_timing(cfg: &PgClusterConfig) -> anyhow::Result<()> {
     if cfg.proxy.require_tls && cfg.tls.insecure_plaintext {
         anyhow::bail!("[proxy] require_tls needs certificates, not insecure_plaintext");
     }
+    let p = &cfg.proxy;
+    if p.max_client_connections == 0
+        || p.max_pending_logins == 0
+        || p.max_pending_logins_per_address == 0
+        || p.login_timeout_ms == 0
+    {
+        anyhow::bail!(
+            "[proxy] max_client_connections, max_pending_logins, \
+             max_pending_logins_per_address and login_timeout_ms must be above zero"
+        );
+    }
     if lease < MIN_QUORUM_LEASE_MS {
         anyhow::bail!("[proxy] quorum_lease_ms ({lease}) must be >= {MIN_QUORUM_LEASE_MS}");
     }
@@ -309,6 +320,10 @@ mod tests {
                 quorum_lease_ms: 1000,
                 allowed_cidrs: None,
                 require_tls: false,
+                max_client_connections: 10_000,
+                max_pending_logins: 512,
+                max_pending_logins_per_address: 64,
+                login_timeout_ms: 10_000,
             },
             failover: FailoverConfig::default(),
             tls: TlsConfig {
@@ -316,6 +331,7 @@ mod tests {
                 cert: Some("/certs/node.crt".into()),
                 key: Some("/certs/node.key".into()),
                 insecure_plaintext: false,
+                ..Default::default()
             },
             metrics: MetricsConfig::default(),
             api: ApiConfig {

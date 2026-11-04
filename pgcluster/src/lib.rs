@@ -69,6 +69,7 @@ fn spawn_settings_reload(
 #[allow(clippy::too_many_arguments)]
 fn spawn_certificate_reload(
     cfg: Arc<config::PgClusterConfig>,
+    config_path: String,
     client_tls: tls::SharedClientTls,
     acceptor: tls::SharedAcceptor,
     backend_tls: tls::SharedConnector,
@@ -81,10 +82,15 @@ fn spawn_certificate_reload(
     let mut hangup = signal(SignalKind::hangup())?;
     tokio::spawn(async move {
         while hangup.recv().await.is_some() {
-            match tls::TlsManager::new(&cfg.tls) {
+            // The file may name certificates it did not, such as the proxy's
+            // own, so read it again.
+            let tls_config = config::PgClusterConfig::from_file(&config_path)
+                .map(|c| c.tls)
+                .unwrap_or_else(|_| cfg.tls.clone());
+            match tls::TlsManager::new(&tls_config) {
                 Ok(manager) => {
                     client_tls.store(Arc::new(manager.tonic_client_tls_config()));
-                    acceptor.store(Arc::new(manager.server_tls_acceptor()));
+                    acceptor.store(Arc::new(manager.proxy_tls_acceptor()));
                     backend_tls.store(Arc::new(manager.client_tls_connector()));
                     ca_pem.store(Arc::new(manager.ca_cert_pem().to_vec()));
                     credentials::bump();
@@ -148,7 +154,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         .map(|t| tls::shared_client_tls(t.tonic_client_tls_config()));
     let acceptor: Option<tls::SharedAcceptor> = tls_mgr
         .as_ref()
-        .map(|t| Arc::new(arc_swap::ArcSwap::from_pointee(t.server_tls_acceptor())));
+        .map(|t| Arc::new(arc_swap::ArcSwap::from_pointee(t.proxy_tls_acceptor())));
     let backend_tls: Option<tls::SharedConnector> = tls_mgr
         .as_ref()
         .map(|t| Arc::new(arc_swap::ArcSwap::from_pointee(t.client_tls_connector())));
@@ -408,6 +414,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
     {
         spawn_certificate_reload(
             cfg.clone(),
+            config_path.to_string(),
             client_tls,
             acceptor,
             backend_tls,

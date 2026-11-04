@@ -18,6 +18,7 @@ use super::config::HostConfig;
 use super::firewall;
 use super::fsutil::{give_to, write_private_if_changed};
 use super::model::Instance;
+use super::quota;
 use super::render::{self, Layout, REPLICATION_USER, SUPERUSER};
 use super::restore::Restorer;
 use super::runner::{command_as, Processes, RunAs, Runner};
@@ -48,9 +49,17 @@ pub enum Progress {
     Seeding,
 }
 
-/// The time, the WAL position, the last file archived, the segment size, and
-/// whether this is a standby.
-type WalPosition = (DateTime<Utc>, String, Option<String>, i64, bool);
+/// The time, the WAL position, the last file archived, the segment size,
+/// whether this is a standby, and the server's version.
+type WalPosition = (DateTime<Utc>, String, Option<String>, i64, bool, String);
+
+/// `18.1` from `18.1 (Debian 18.1-1.pgdg120+1)` or from the output of
+/// `postgres --version`.
+pub fn release(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|word| word.starts_with(|c: char| c.is_ascii_digit()))
+        .map(|word| word.trim_end_matches(',').to_string())
+}
 
 /// What a page header takes at the start of a WAL segment, which is where the
 /// position rests once an idle server has switched segments.
@@ -92,6 +101,13 @@ fn archived_end(segment: &str, segment_size: u64) -> Option<u64> {
     let high = u64::from_str_radix(&segment[8..16], 16).ok()?;
     let low = u64::from_str_radix(&segment[16..24], 16).ok()?;
     Some((high << 32) + (low + 1) * segment_size)
+}
+
+/// The ports of a block at `port_base` that something already listens on.
+pub fn ports_in_use(port_base: u16) -> Vec<u16> {
+    (port_base..port_base.saturating_add(10))
+        .filter(|port| std::net::TcpListener::bind(("0.0.0.0", *port)).is_err())
+        .collect()
 }
 
 pub fn read_applied(layout: &Layout) -> Option<Applied> {
@@ -137,7 +153,17 @@ impl InstanceManager<'_> {
             pg_ctl: format!("{}/pg_ctl", self.config.pg_bin(version)),
             run_as: self.run_as,
             user: self.config.run_as.clone(),
+            resources: None,
+            proxy: true,
         })
+    }
+
+    /// The processes of `instance`, with its limits and role.
+    pub fn processes_for(&self, instance: &Instance) -> Result<Processes> {
+        let mut processes = self.processes(&instance.id(), &instance.postgres_version)?;
+        processes.resources = Some(instance.resources.clone());
+        processes.proxy = !instance.is_replica();
+        Ok(processes)
     }
 
     /// Every address that may reach this instance's peer ports. Peers can be
@@ -150,6 +176,7 @@ impl InstanceManager<'_> {
         let names = instance
             .peers
             .iter()
+            .chain(&instance.replicas)
             .map(|peer| peer.address.as_str())
             .chain([instance.address.as_str()]);
         for name in names {
@@ -163,7 +190,7 @@ impl InstanceManager<'_> {
 
     pub async fn apply(&self, instance: &Instance) -> Result<Progress> {
         instance.validate()?;
-        let processes = self.processes(&instance.id(), &instance.postgres_version)?;
+        let processes = self.processes_for(instance)?;
         let layout = &processes.layout;
         let pg_bin = self.config.pg_bin(&instance.postgres_version);
         if !Path::new(&pg_bin).join("initdb").exists() {
@@ -178,6 +205,12 @@ impl InstanceManager<'_> {
         // failed create can still be removed.
         let previous = read_applied(layout);
         if previous.is_none() {
+            // Something outside pgcluster may hold a port in the block, and
+            // would break the instance in ways harder to read than this.
+            let taken = ports_in_use(instance.port_base);
+            if !taken.is_empty() {
+                bail!("ports {taken:?} of this instance's block are in use by another process");
+            }
             let marker = Applied {
                 host_id: self.client.host_id.clone(),
                 ..Default::default()
@@ -185,6 +218,15 @@ impl InstanceManager<'_> {
             write_applied(layout, &marker, self.run_as)?;
         }
 
+        if let Some(fs) = quota::detected() {
+            quota::apply(
+                fs,
+                &layout.dir,
+                &instance.id(),
+                instance.resources.storage_gb,
+            )
+            .await?;
+        }
         let nodes = self.node_addresses(instance).await?;
         self.apply_firewall(instance, &nodes).await?;
         self.prepare_repository(instance)?;
@@ -253,7 +295,9 @@ impl InstanceManager<'_> {
             postgres.close().await.ok();
         }
 
-        self.wait_for_proxy(instance).await?;
+        if !instance.is_replica() {
+            self.wait_for_proxy(instance).await?;
+        }
         if first_start {
             self.client
                 .log(instance.operation_id.as_deref(), "instance is ready")
@@ -282,30 +326,40 @@ impl InstanceManager<'_> {
         false
     }
 
-    /// The time every commit before it had reached the WAL archive, by comparing
-    /// `samples` of the WAL position with what the archiver has finished.
-    pub async fn archived_until(
+    /// The release the server runs, and the time every commit before it had
+    /// reached the WAL archive, by comparing `samples` of the WAL position with
+    /// what the archiver has finished. Only a primary knows the second.
+    pub async fn observe(
         &self,
         instance: &Instance,
         samples: &mut WalSamples,
-    ) -> Option<DateTime<Utc>> {
+    ) -> (Option<String>, Option<DateTime<Utc>>) {
         let password = self.passwords(instance)[0];
         let options = self.connect_options(instance, "postgres", password);
-        let mut postgres = PgConnection::connect_with(&options).await.ok()?;
+        let Ok(mut postgres) = PgConnection::connect_with(&options).await else {
+            return (None, None);
+        };
         let row: Result<WalPosition, _> = sqlx::query_as(
             "SELECT now(), pg_current_wal_insert_lsn()::text, a.last_archived_wal, \
-                    pg_size_bytes(current_setting('wal_segment_size')), pg_is_in_recovery() \
+                    pg_size_bytes(current_setting('wal_segment_size')), pg_is_in_recovery(), \
+                    current_setting('server_version') \
              FROM pg_stat_archiver a",
         )
         .fetch_one(&mut postgres)
         .await;
         postgres.close().await.ok();
-        let (now, lsn, archived, segment_size, in_recovery) = row.ok()?;
+        let Ok((now, lsn, archived, segment_size, in_recovery, version)) = row else {
+            return (None, None);
+        };
+        let version = release(&version);
         if in_recovery {
-            return None;
+            return (version, None);
         }
-        samples.record(now, crate::postgres::parse_lsn(&lsn).ok()?);
-        samples.covered_by(archived_end(archived.as_deref()?, segment_size as u64)?)
+        let until = (|| {
+            samples.record(now, crate::postgres::parse_lsn(&lsn).ok()?);
+            samples.covered_by(archived_end(archived.as_deref()?, segment_size as u64)?)
+        })();
+        (version, until)
     }
 
     /// Whether this node has become the primary with changes left to apply.
@@ -398,6 +452,10 @@ impl InstanceManager<'_> {
             write_private_if_changed(&tls.join("ca.crt"), &secrets.ca_cert_pem, self.run_as)?;
         reload |= write_private_if_changed(&tls.join("node.key"), &secrets.key_pem, self.run_as)?;
         reload |= write_private_if_changed(&tls.join("node.crt"), &secrets.cert_pem, self.run_as)?;
+        if let (Some(cert), Some(key)) = (&secrets.proxy_cert_pem, &secrets.proxy_key_pem) {
+            reload |= write_private_if_changed(&tls.join("proxy.key"), key, self.run_as)?;
+            reload |= write_private_if_changed(&tls.join("proxy.crt"), cert, self.run_as)?;
+        }
         reload |= write_private_if_changed(
             &layout.agent_config(),
             &render::agent_toml(instance, layout, pg_bin),
@@ -771,6 +829,11 @@ impl InstanceManager<'_> {
         let processes = self.processes(id, &version)?;
         self.runner.remove(&processes).await?;
         firewall::remove(self.config.firewall, id).await?;
+        if let Some(fs) = quota::detected() {
+            if let Err(e) = quota::remove(fs, id).await {
+                tracing::warn!(id, err = format!("{e:#}"), "could not lift the disk quota");
+            }
+        }
         tokio::fs::remove_dir_all(&layout.dir)
             .await
             .with_context(|| format!("remove {}", layout.dir.display()))?;
@@ -828,6 +891,28 @@ mod tests {
         let mut samples = WalSamples::default();
         samples.record(at(9), SEGMENT + SEGMENT_HEADER);
         assert_eq!(samples.covered_by(SEGMENT), Some(at(9)));
+    }
+
+    #[test]
+    fn a_release_is_read_from_either_spelling() {
+        assert_eq!(
+            release("18.1 (Debian 18.1-1.pgdg120+1)").as_deref(),
+            Some("18.1")
+        );
+        assert_eq!(
+            release("postgres (PostgreSQL) 17.6 (Debian 17.6-1.pgdg120+1)").as_deref(),
+            Some("17.6")
+        );
+        assert_eq!(release("nothing here"), None);
+    }
+
+    #[test]
+    fn a_port_in_use_is_found() {
+        let held = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        assert!(ports_in_use(port).contains(&port));
+        drop(held);
+        assert!(!ports_in_use(port).contains(&port));
     }
 
     #[test]

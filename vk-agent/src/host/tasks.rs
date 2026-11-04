@@ -290,6 +290,53 @@ impl LocalApi {
         Ok(json!({}))
     }
 
+    /// Add an external standby to this cluster. The monitor seeds it from the
+    /// primary, and this waits until it streams.
+    async fn add_replica(&self, params: &Value) -> Result<Value> {
+        let text = |key: &str| {
+            params[key]
+                .as_str()
+                .with_context(|| format!("add_replica needs {key}"))
+        };
+        let node = text("node_id")?;
+        if !self.nodes().await?.iter().any(|n| n.node_id == node) {
+            self.post(
+                "/api/nodes/add",
+                json!({
+                    "node_id": node,
+                    "agent_addr": text("agent_addr")?,
+                    "postgres_addr": text("postgres_addr")?,
+                    "priority": 0,
+                    "external": true,
+                }),
+            )
+            .await?;
+        }
+        self.wait_for_standby(node).await?;
+        Ok(json!({}))
+    }
+
+    /// Promote an external standby and let it go. A repeat after it has gone
+    /// finds nothing to do.
+    async fn detach_replica(&self, params: &Value) -> Result<Value> {
+        let node = params["node_id"]
+            .as_str()
+            .context("detach_replica needs node_id")?;
+        if self.nodes().await?.iter().any(|n| n.node_id == node) {
+            self.post(&format!("/api/nodes/{node}/detach"), json!({}))
+                .await?;
+        }
+        Ok(json!({}))
+    }
+
+    async fn remove_replica(&self, params: &Value) -> Result<Value> {
+        let node = params["node_id"]
+            .as_str()
+            .context("remove_replica needs node_id")?;
+        self.delete(&format!("/api/nodes/{node}")).await?;
+        Ok(json!({}))
+    }
+
     async fn wait_for_standby(&self, node: &str) -> Result<()> {
         let deadline = Instant::now() + SEED_TIMEOUT;
         loop {
@@ -367,6 +414,9 @@ pub async fn run(manager: &InstanceManager<'_>, instance: &Instance, task: &Task
             api.backup(label).await
         }
         "replace_member" => api.replace_member(&task.params).await,
+        "add_replica" => api.add_replica(&task.params).await,
+        "detach_replica" => api.detach_replica(&task.params).await,
+        "remove_replica" => api.remove_replica(&task.params).await,
         "alter_passwords" => alter_passwords(manager, instance).await,
         other => bail!("unknown task {other}"),
     }

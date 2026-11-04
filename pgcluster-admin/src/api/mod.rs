@@ -1,15 +1,17 @@
 //! The admin API.
 
+pub mod audit;
 pub mod backups;
 pub mod databases;
 pub mod hosts;
+pub mod replicas;
 
 use axum::async_trait;
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{FromRequest, FromRequestParts, Query, State};
 use axum::http::request::Parts;
-use axum::http::{header, Request, StatusCode};
+use axum::http::{header, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, post, put};
@@ -18,11 +20,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::ApiError;
-use crate::state::AdminState;
+use crate::state::{AdminState, KeyName};
 
 /// The stages of the spec that are built. The contract marks later ones.
 #[cfg(test)]
-const DELIVERED_STAGE: u64 = 3;
+const DELIVERED_STAGE: u64 = 5;
 
 const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 500;
@@ -31,6 +33,10 @@ pub fn router(state: AdminState) -> Router {
     let protected = Router::new()
         .route("/v1/hosts", post(hosts::create).get(hosts::list))
         .route("/v1/hosts/:id", get(hosts::get).delete(hosts::delete))
+        .route(
+            "/v1/hosts/:id/drain",
+            post(hosts::drain).delete(hosts::undrain),
+        )
         .route(
             "/v1/databases",
             post(databases::create).get(databases::list),
@@ -50,6 +56,7 @@ pub fn router(state: AdminState) -> Router {
                 .delete(databases::delete),
         )
         .route("/v1/databases/:id/restart", post(databases::restart))
+        .route("/v1/databases/:id/upgrade", post(databases::upgrade))
         .route("/v1/databases/:id/switchover", post(databases::switchover))
         .route("/v1/databases/:id/rotate-ca", post(databases::rotate_ca))
         .route(
@@ -68,6 +75,19 @@ pub fn router(state: AdminState) -> Router {
             post(databases::replace_node),
         )
         .route("/v1/events", get(databases::list_events))
+        .route("/v1/audit-log", get(audit::list))
+        .route(
+            "/v1/databases/:id/replicas",
+            post(replicas::create).get(replicas::list),
+        )
+        .route(
+            "/v1/databases/:id/replicas/:replica_id",
+            delete(replicas::delete),
+        )
+        .route(
+            "/v1/databases/:id/replicas/:replica_id/promote",
+            post(replicas::promote),
+        )
         .route("/v1/admin-ca", get(admin_ca))
         .route("/v1/admin-ca/rotate", post(rotate_admin_ca))
         .route(
@@ -83,6 +103,10 @@ pub fn router(state: AdminState) -> Router {
             put(databases::put_extensions).get(databases::get_extensions),
         )
         .route("/v1/databases/:id/nodes", get(databases::list_nodes))
+        .route(
+            "/v1/databases/:id/certificate",
+            put(databases::put_certificate),
+        )
         .route(
             "/v1/databases/:id/operations",
             get(databases::list_operations),
@@ -107,22 +131,30 @@ pub fn router(state: AdminState) -> Router {
         .with_state(state)
 }
 
+/// Authenticate, and record every change with the key that made it. Reads are
+/// not recorded.
 async fn require_api_key(
     State(state): State<AdminState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let authorized = request
+    let name = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|key| state.accepts_key(key.trim()));
-    if authorized {
-        Ok(next.run(request).await)
-    } else {
-        Err(ApiError::unauthorized("a valid API key is required"))
+        .and_then(|key| state.identify(key.trim()));
+    let Some(name) = name else {
+        return Err(ApiError::unauthorized("a valid API key is required"));
+    };
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    request.extensions_mut().insert(KeyName(name.clone()));
+    let response = next.run(request).await;
+    if method != Method::GET && method != Method::HEAD {
+        audit::record(&state, &name, method.as_str(), &path, response.status()).await;
     }
+    Ok(response)
 }
 
 async fn admin_ca(

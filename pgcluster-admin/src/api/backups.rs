@@ -199,8 +199,9 @@ pub async fn backup_now(
 ) -> Result<(StatusCode, Json<Operation>), ApiError> {
     let label = format!("api-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     let mut tx = state.pool.begin().await?;
-    let (status, _) = lock(&mut tx, &id).await?;
+    let (status, spec) = lock(&mut tx, &id).await?;
     super::databases::require_serving(&status)?;
+    super::databases::not_a_replica(&spec)?;
     let generation: i64 = sqlx::query_scalar("SELECT generation FROM databases WHERE id = $1")
         .bind(&id)
         .fetch_one(&mut *tx)
@@ -313,6 +314,7 @@ pub async fn restore(
     }
     let mut spec = source;
     spec.hosts = request.hosts;
+    spec.replica_of = None;
     spec.restore = Some(RestoreSource {
         database_id: id.clone(),
         database_name: source_name,
