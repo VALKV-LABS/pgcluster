@@ -106,6 +106,8 @@ pgcluster database allow <id> 198.51.100.0/24 203.0.113.4/32 --wait   # Replaces
 pgcluster database extensions <id> vector pg_trgm --wait              # Replaces the whole list
 pgcluster database mode <id> sync_strict --wait
 pgcluster database retention <id> 14 --wait
+pgcluster database create scratch --no-backup --wait     # No repository, no WAL archive, no restore
+pgcluster database enable-backups <id> --wait          # Turn them on later
 pgcluster database resize <id> --vcpu 2 --memory-gb 4 --storage-gb 50 --wait
 pgcluster database upgrade <id> --wait                # Onto the minor release the hosts have
 pgcluster database switchover <id> --wait

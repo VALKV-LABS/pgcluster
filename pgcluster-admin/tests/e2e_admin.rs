@@ -439,6 +439,72 @@ async fn e2e_admin_one_node_database() {
     assert!(endpoint.connect(&password).await.is_err());
 }
 
+/// A database created without backups opens with no repository and archives
+/// nothing, and turning backups on later starts archiving and a restore window
+/// with no restart.
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn e2e_admin_backups_can_start_off_and_turn_on() {
+    let _stack = Stack::up(&[HOST]);
+    let client = admin_client();
+    wait_online(&client, HOST).await;
+
+    // No repository exists yet, and none is needed.
+    let output = cli(
+        HOST,
+        "database create scratch --allow 0.0.0.0/0 --no-backup --wait",
+    );
+    let created = parse_created(&output);
+    let id = created.id.as_str();
+    let path = format!("/v1/databases/{id}");
+    let database = api(&client, "GET", &path, None).await;
+    assert_eq!(database["status"], "active", "{database}");
+    assert_eq!(database["backup"], Value::Null);
+    let window = api_call(&client, "GET", &format!("{path}/restore-window"), None).await;
+    assert_eq!(window.0, 409, "{}", window.1);
+
+    // WAL is dropped, not kept for an archive.
+    let dir = instance_dir(id);
+    let conf = sh(HOST, &format!("cat {dir}/postgresql.conf"));
+    assert!(conf.contains("archive_command = '/bin/true'"), "{conf}");
+    let endpoint = endpoint(&client, id).await;
+    let mut owner = endpoint.wait_connectable(&created.password).await;
+    sqlx::query("CREATE TABLE t AS SELECT 'kept' AS v")
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    wait_for("WAL to be let go", Duration::from_secs(90), async || {
+        sh(
+            HOST,
+            &format!("ls {dir}/pgdata/pg_wal/archive_status | grep -c ready || true"),
+        ) == "0"
+            && !sh(HOST, &format!("ls {dir}/pgdata/pg_wal/archive_status")).is_empty()
+    })
+    .await;
+
+    // Turning backups on takes a first backup and opens the window.
+    add_repository(&client).await;
+    let postmaster = postmaster_pid(HOST, id);
+    cli(HOST, &format!("database enable-backups {id} --wait"));
+    let database = api(&client, "GET", &path, None).await;
+    assert_eq!(database["backup"]["retention_days"], 7, "{database}");
+    wait_for_backups(&client, id, 1).await;
+    wait_for("a restore window", Duration::from_secs(120), async || {
+        api_call(&client, "GET", &format!("{path}/restore-window"), None)
+            .await
+            .0
+            == 200
+    })
+    .await;
+    assert!(!sh(HOST, &format!("ls /backups/{id}")).is_empty());
+    assert_eq!(postmaster_pid(HOST, id), postmaster, "no restart");
+    let kept: String = sqlx::query_scalar("SELECT v FROM t")
+        .fetch_one(&mut owner)
+        .await
+        .expect("clients stay connected while backups turn on");
+    assert_eq!(kept, "kept");
+}
+
 async fn host_ids(client: &reqwest::Client) -> (String, String) {
     let hosts = api(client, "GET", "/v1/hosts", None).await;
     let host = hosts["items"]
@@ -1514,6 +1580,21 @@ async fn e2e_admin_ha_suite_in_every_mode() {
             assert_eq!(missing, 0, "{mode} lost {missing} commits");
         }
 
+        // The host counts as gone only after a while away. Wait for that, so
+        // the event feed's record of it does not depend on how fast this
+        // machine failed over.
+        wait_for(
+            "the old node to be reported offline",
+            Duration::from_secs(150),
+            async || {
+                let events = api(&client, "GET", "/v1/events?limit=500", None).await;
+                events["items"].as_array().unwrap().iter().any(|e| {
+                    e["type"] == "node_offline" && e["database_id"] == database.id.as_str()
+                })
+            },
+        )
+        .await;
+
         // It rejoins with no help, and diverged writes do not come back.
         compose(&["start", &old_host]);
         wait_online(&client, &old_host).await;
@@ -1591,6 +1672,20 @@ async fn e2e_admin_ha_suite_in_every_mode() {
         assert_eq!(nodes.len(), 3, "{nodes:?}");
         assert!(nodes.iter().any(|(_, host)| host == spare), "{nodes:?}");
         assert!(!nodes.iter().any(|(name, _)| name == leaving), "{nodes:?}");
+        // The database has a backup, so the new node came from the
+        // repository rather than from a base backup of the primary.
+        let (arrived, _) = nodes.iter().find(|(_, host)| host == spare).unwrap();
+        let auto_conf = sh(
+            spare,
+            &format!(
+                "cat /var/lib/pgcluster/instances/{}-{arrived}/pgdata/postgresql.auto.conf",
+                database.id
+            ),
+        );
+        assert!(
+            auto_conf.contains("wal-fetch"),
+            "{mode}: the replacement did not seed from a backup:\n{auto_conf}"
+        );
         database.wait_healthy(&client, 3).await;
         database.wait_active(&client).await;
 

@@ -174,13 +174,14 @@ fn members(instance: &Instance) -> (Vec<Value>, Vec<Value>) {
     (raft, nodes)
 }
 
-/// `pgcluster`'s `[backup]`.
-fn backup_section(instance: &Instance) -> Value {
-    let target: &BackupTarget = &instance.backup.target;
+/// `pgcluster`'s `[backup]`, if the database has backups.
+fn backup_section(instance: &Instance) -> Option<Value> {
+    let backup = instance.backup.as_ref()?;
+    let target: &BackupTarget = &backup.target;
     let mut section = json!({
         "interval_seconds": BACKUP_INTERVAL_SECONDS,
         "delta_steps": DELTA_STEPS,
-        "retain_full": instance.backup.retain_full,
+        "retain_full": backup.retain_full,
         "encryption_key_env": BACKUP_KEY_ENV,
     });
     if let Some(path) = &target.path {
@@ -200,7 +201,7 @@ fn backup_section(instance: &Instance) -> Value {
         }
         section["s3"] = s3;
     }
-    section
+    Some(section)
 }
 
 fn path(p: PathBuf) -> String {
@@ -253,8 +254,11 @@ pub fn pgcluster_toml(instance: &Instance, layout: &Layout) -> String {
             "listen_addr": local(instance, REST_API),
             "api_keys": api_keys,
         },
-        "backup": backup_section(instance),
     });
+    let mut config = config;
+    if let Some(section) = backup_section(instance) {
+        config["backup"] = section;
+    }
     toml::to_string(&config).expect("a JSON object serializes to TOML")
 }
 
@@ -285,19 +289,21 @@ pub fn agent_toml(instance: &Instance, layout: &Layout, pg_bin: &str) -> String 
 /// it again, so none of these need a restart to change.
 pub fn env_file(instance: &Instance) -> String {
     let secrets = &instance.secrets;
-    let target = &instance.backup.target;
     let mut text = format!(
         "PGCLUSTER_AUTH_PASSWORD={}\nPG_REPLICATION_PASSWORD={}\n",
         secrets.auth_password, secrets.replication_password
     );
-    let optional = [
-        (BACKUP_KEY_ENV, &target.encryption_key),
-        ("AWS_ACCESS_KEY_ID", &target.access_key_id),
-        ("AWS_SECRET_ACCESS_KEY", &target.secret_access_key),
-    ];
-    for (name, value) in optional {
-        if let Some(value) = value {
-            text.push_str(&format!("{name}={value}\n"));
+    if let Some(backup) = &instance.backup {
+        let target = &backup.target;
+        let optional = [
+            (BACKUP_KEY_ENV, &target.encryption_key),
+            ("AWS_ACCESS_KEY_ID", &target.access_key_id),
+            ("AWS_SECRET_ACCESS_KEY", &target.secret_access_key),
+        ];
+        for (name, value) in optional {
+            if let Some(value) = value {
+                text.push_str(&format!("{name}={value}\n"));
+            }
         }
     }
     if let Some(next) = &secrets.next {
@@ -367,7 +373,32 @@ pub fn managed_conf(instance: &Instance, layout: &Layout) -> String {
             instance.database_name
         ));
     }
+    // With no backups, each WAL segment is dropped once done with, rather than
+    // kept for an archive that never comes. Archiving stays on, so turning
+    // backups on needs no restart: the agent's own `archive_command`, set with
+    // ALTER SYSTEM, takes the place of this one.
+    if instance.backup.is_none() {
+        conf.push_str("archive_command = '/bin/true'\n");
+    }
     conf
+}
+
+/// Settings in the managed config that Postgres takes on a reload.
+const RELOADABLE: &[&str] = &["archive_command"];
+
+/// Whether moving from config `before` to `after` takes a restart, rather
+/// than a reload.
+pub fn needs_restart(before: &str, after: &str) -> bool {
+    let restart_lines = |conf: &str| -> Vec<String> {
+        conf.lines()
+            .filter(|line| {
+                let name = line.split('=').next().unwrap_or_default().trim();
+                !RELOADABLE.contains(&name)
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    restart_lines(before) != restart_lines(after)
 }
 
 /// Postgres accepts only this node's proxy and agent, and those of its peers:
@@ -545,6 +576,31 @@ mod tests {
             "{conf}"
         );
         assert!(agent_toml(&instance(), &l, "/bin").contains("postgres_config_file"));
+    }
+
+    #[test]
+    fn a_database_without_backups_discards_wal_and_names_no_repository() {
+        let (mut i, l) = (instance(), layout());
+        i.backup = None;
+        let conf = managed_conf(&i, &l);
+        assert!(conf.contains("archive_mode = on"), "{conf}");
+        assert!(conf.contains("archive_command = '/bin/true'"), "{conf}");
+        let config: toml::Value = toml::from_str(&pgcluster_toml(&i, &l)).unwrap();
+        assert!(config.get("backup").is_none());
+        assert!(!env_file(&i).contains(BACKUP_KEY_ENV));
+        assert!(!managed_conf(&instance(), &l).contains("archive_command"));
+    }
+
+    #[test]
+    fn turning_backups_on_reloads_and_other_changes_restart() {
+        let (with, l) = (instance(), layout());
+        let mut without = instance();
+        without.backup = None;
+        let (on, off) = (managed_conf(&with, &l), managed_conf(&without, &l));
+        assert!(!needs_restart(&off, &on));
+        let mut bigger = instance();
+        bigger.resources.memory_gb *= 2.0;
+        assert!(needs_restart(&on, &managed_conf(&bigger, &l)));
     }
 
     #[test]

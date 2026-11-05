@@ -58,7 +58,8 @@ pub struct DatabaseSpec {
     pub allowed_cidrs: Vec<String>,
     pub extensions: Vec<String>,
     pub owner: Owner,
-    pub backup: BackupSettings,
+    /// `None` for a database created without backups, until they are turned on.
+    pub backup: Option<BackupSettings>,
     /// Set when this database begins as a copy of another's backups.
     #[serde(default)]
     pub restore: Option<RestoreSource>,
@@ -130,9 +131,46 @@ pub struct CreateDatabase {
     pub allowed_cidrs: Vec<String>,
     #[serde(default)]
     pub extensions: Vec<String>,
-    /// A database becomes active only once it has a restorable backup, so this
-    /// is required.
-    pub backup: BackupSettings,
+    /// A database with backups becomes active only once it has a restorable
+    /// backup. Required, so that opting out is always explicit.
+    pub backup: BackupRequest,
+}
+
+/// A backup policy, or `{ "enabled": false }` for none.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    #[serde(default)]
+    pub retention_days: Option<u32>,
+}
+
+impl BackupRequest {
+    /// The policy asked for, or `None` when backups are off.
+    pub fn into_settings(self) -> Result<Option<BackupSettings>, ApiError> {
+        if self.enabled == Some(false) {
+            if self.repository_id.is_some() || self.retention_days.is_some() {
+                return Err(ApiError::invalid(
+                    "backup with enabled false takes no repository_id or retention_days",
+                ));
+            }
+            return Ok(None);
+        }
+        let (Some(repository_id), Some(retention_days)) = (self.repository_id, self.retention_days)
+        else {
+            return Err(ApiError::invalid(
+                "backup needs repository_id and retention_days, or enabled false",
+            ));
+        };
+        check_retention(retention_days)?;
+        Ok(Some(BackupSettings {
+            repository_id,
+            retention_days,
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -144,6 +182,9 @@ pub struct UpdateDatabase {
     pub replication_mode: Option<String>,
     #[serde(default)]
     pub retention_days: Option<u32>,
+    /// Turns backups on for a database created without them.
+    #[serde(default)]
+    pub backup: Option<BackupRequest>,
 }
 
 impl CreateDatabase {
@@ -159,7 +200,7 @@ impl CreateDatabase {
         let mode = self.replication_mode.as_deref().unwrap_or("async");
         check_replication_mode(mode, self.ha)?;
         check_hosts(&self.hosts, self.ha)?;
-        check_retention(self.backup.retention_days)?;
+        let backup = self.backup.into_settings()?;
         let r = &self.resources;
         if !(r.vcpu > 0.0 && r.memory_gb > 0.0 && r.storage_gb > 0.0) {
             return Err(ApiError::invalid("resources must all be above zero"));
@@ -176,7 +217,7 @@ impl CreateDatabase {
             allowed_cidrs: self.allowed_cidrs,
             extensions: self.extensions,
             owner: self.owner,
-            backup: self.backup,
+            backup,
             restore: None,
             replica_of: None,
             data_name: None,
@@ -538,7 +579,8 @@ pub struct Instance {
     pub peers: Vec<Peer>,
     pub bootstrap: String,
     pub restore: Option<InstanceRestore>,
-    pub backup: InstanceBackup,
+    /// `None` when the database has no backups: nothing is archived.
+    pub backup: Option<InstanceBackup>,
     pub tasks: Vec<Task>,
     pub replication_mode: String,
     pub allowed_cidrs: Vec<String>,
@@ -699,9 +741,10 @@ mod tests {
             },
             allowed_cidrs: vec!["198.51.100.0/24".into()],
             extensions: vec!["vector".into()],
-            backup: BackupSettings {
-                repository_id: "repo-1".into(),
-                retention_days: 7,
+            backup: BackupRequest {
+                enabled: None,
+                repository_id: Some("repo-1".into()),
+                retention_days: Some(7),
             },
         }
     }

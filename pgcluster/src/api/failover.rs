@@ -49,8 +49,7 @@ pub async fn trigger_failover(
 
     // Resolve credentials from config at call time.
     let repl_user = s.config.replication.replication_user.clone();
-    let repl_password =
-        std::env::var(&s.config.replication.replication_password_env).unwrap_or_default();
+    let repl_password = crate::credentials::get(&s.config.replication.replication_password_env);
     let slot_prefix = s.config.replication.slot_prefix.clone();
 
     // Spawn the failover in a background task so the REST call returns immediately.

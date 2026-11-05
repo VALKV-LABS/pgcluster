@@ -53,7 +53,7 @@ Each instance is two processes: `vk-agent`, which owns Postgres, and `pgcluster`
 | Change | Effect |
 |---|---|
 | New first node | Writes its files, runs `initdb --data-checksums`, starts it, then creates the roles, the database and the extensions |
-| New seeded node | Writes its files and starts its processes with no data. It reports `seeding`, and the host moves on, until the Raft leader has filled it from the primary |
+| New seeded node | Writes its files and starts its processes with no data. It reports `seeding`, and the host moves on, until the Raft leader has filled it, from the latest backup if there is one, or from the primary |
 | New restored node | Fills the data directory from the source's repository, finishes recovery in a private server, then starts it. See below |
 | `allowed_cidrs` | Rewrites `pgcluster.toml` and sends SIGHUP. Connected clients stay connected |
 | Certificates, CAs, passwords, peers | Replaces the files, sends SIGHUP to `vk-agent` and `pgcluster`, and runs `pg_ctl reload`. Nothing restarts, and connected clients stay connected |

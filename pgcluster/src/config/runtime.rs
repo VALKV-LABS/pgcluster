@@ -1,17 +1,16 @@
 //! Settings that change with no restart. SIGHUP reads them again, because
 //! restarting `pgcluster` would drop the clients of its proxy.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 
-use super::PgClusterConfig;
+use super::{BackupConfig, PgClusterConfig};
 
 pub struct Runtime {
     api_keys: ArcSwap<Vec<String>>,
-    /// 0 when no `[backup]` is configured.
-    retain_full: AtomicU32,
+    /// `[backup]`, so a section added later starts backups with no restart.
+    backup: ArcSwapOption<BackupConfig>,
     /// The label and error of the last backup, if it failed.
     backup_failure: Mutex<Option<(String, String)>>,
 }
@@ -20,7 +19,7 @@ impl Runtime {
     pub fn new(config: &PgClusterConfig) -> Self {
         let runtime = Self {
             api_keys: ArcSwap::from_pointee(Vec::new()),
-            retain_full: AtomicU32::new(0),
+            backup: ArcSwapOption::empty(),
             backup_failure: Mutex::new(None),
         };
         runtime.apply(config);
@@ -29,20 +28,19 @@ impl Runtime {
 
     pub fn apply(&self, config: &PgClusterConfig) {
         self.api_keys.store(config.api.api_keys.clone().into());
-        let retain_full = config.backup.as_ref().map_or(0, |b| b.retain_full);
-        self.retain_full.store(retain_full, Ordering::SeqCst);
+        self.backup.store(config.backup.clone().map(Into::into));
     }
 
     pub fn api_keys(&self) -> Vec<String> {
         self.api_keys.load().to_vec()
     }
 
-    /// The current retention, or `configured` if there is none yet.
-    pub fn retain_full(&self, configured: u32) -> u32 {
-        match self.retain_full.load(Ordering::SeqCst) {
-            0 => configured,
-            current => current,
-        }
+    /// The current `[backup]` section, if backups are on.
+    pub fn backup(&self) -> Option<BackupConfig> {
+        self.backup
+            .load_full()
+            .map(|b| (*b).clone())
+            .filter(|b| b.enabled)
     }
 
     pub fn record_backup(&self, failure: Option<(String, String)>) {

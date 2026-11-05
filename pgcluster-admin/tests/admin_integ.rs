@@ -2870,3 +2870,128 @@ async fn a_one_node_database_has_no_replicas() {
         .await;
     assert_eq!(status, 409, "{body}");
 }
+
+// ── Databases without backups ─────────────────────────────────────────────────
+
+/// A database created without backups opens with no repository and no first
+/// backup, and backups can be turned on later.
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_database_without_backups_opens_and_can_turn_them_on() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (host_id, secret) = f.add_host("a").await;
+    let host = f.enroll(&secret).await;
+    f.report(&host, 0, json!([])).await;
+
+    // Opting out names nothing else.
+    let mut request = database_request("scratch");
+    request["backup"] = json!({ "enabled": false, "retention_days": 7 });
+    let (status, _) = f.api("POST", "/v1/databases", Some(request)).await;
+    assert_eq!(status, 422);
+    let mut request = database_request("scratch");
+    request["backup"] = json!({ "repository_id": "repo-1" });
+    let (status, _) = f.api("POST", "/v1/databases", Some(request)).await;
+    assert_eq!(status, 422, "a policy needs retention_days");
+
+    let mut request = database_request("scratch");
+    request["backup"] = json!({ "enabled": false });
+    let (status, body) = f.api("POST", "/v1/databases", Some(request)).await;
+    assert_eq!(status, 202, "{body}");
+    let database_id = body["database_id"].as_str().unwrap().to_string();
+    let (_, state) = {
+        f.drain().await;
+        f.desired(&host, -1).await
+    };
+    assert_eq!(state["instances"][0]["backup"], Value::Null);
+
+    // No backup task is needed to open it.
+    f.bring_up(&host, &host_id, &database_id).await;
+    let path = format!("/v1/databases/{database_id}");
+    let (_, body) = f.api("GET", &path, None).await;
+    assert_eq!(body["status"], "active", "{body}");
+    assert_eq!(body["backup"], Value::Null);
+
+    let (status, body) = f.api("GET", &format!("{path}/restore-window"), None).await;
+    assert_eq!(status, 409);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no backups"),
+        "{body}"
+    );
+    let (status, _) = f.api("POST", &format!("{path}/backup"), None).await;
+    assert_eq!(status, 409);
+    let restore = json!({ "name": "copy", "target_time": "2026-01-01T00:00:00Z" });
+    let (status, _) = f
+        .api("POST", &format!("{path}/restore"), Some(restore))
+        .await;
+    assert_eq!(status, 409);
+    let (status, _) = f
+        .api("PATCH", &path, Some(json!({ "retention_days": 3 })))
+        .await;
+    assert_eq!(status, 409);
+    let (_, backups) = f.api("GET", &format!("{path}/backups"), None).await;
+    assert_eq!(backups["items"], json!([]));
+
+    // Backups cannot be turned off through PATCH, nor on alongside other changes.
+    let (status, _) = f
+        .api(
+            "PATCH",
+            &path,
+            Some(json!({ "backup": { "enabled": false } })),
+        )
+        .await;
+    assert_eq!(status, 422);
+    let both = json!({
+        "backup": { "repository_id": "repo-1", "retention_days": 7 },
+        "retention_days": 7,
+    });
+    let (status, _) = f.api("PATCH", &path, Some(both)).await;
+    assert_eq!(status, 422);
+
+    // Turning them on hands hosts the policy, then takes a first backup.
+    let on = json!({ "backup": { "repository_id": "repo-1", "retention_days": 7 } });
+    let (status, operation) = f.api("PATCH", &path, Some(on.clone())).await;
+    assert_eq!(status, 202, "{operation}");
+    assert_eq!(operation["kind"], "enable_backup");
+    let (_, body) = f.api("GET", &path, None).await;
+    assert_eq!(body["backup"]["repository_id"], "repo-1");
+
+    f.drain().await;
+    let (_, state) = f.desired(&host, -1).await;
+    let instance = &state["instances"][0];
+    assert_eq!(instance["backup"]["retain_full"], 2, "{instance}");
+    let generation = instance["generation"].as_i64().unwrap();
+    f.report(
+        &host,
+        f.generation(&host_id).await,
+        running(&database_id, generation),
+    )
+    .await;
+    f.hurry().await;
+    f.drain().await;
+    let (_, state) = f.desired(&host, -1).await;
+    let tasks = state["instances"][0]["tasks"].as_array().unwrap().clone();
+    assert!(
+        tasks.iter().any(|t| t["kind"] == "backup"),
+        "a first backup is asked for: {tasks:?}"
+    );
+    f.finish_tasks(&host).await;
+    f.hurry().await;
+    f.drain().await;
+    let (_, done) = f
+        .api(
+            "GET",
+            &format!("{path}/operations/{}", operation["id"].as_str().unwrap()),
+            None,
+        )
+        .await;
+    assert_eq!(done["status"], "succeeded", "{done}");
+
+    // Once on, they stay on.
+    let (status, _) = f.api("PATCH", &path, Some(on)).await;
+    assert_eq!(status, 409);
+}

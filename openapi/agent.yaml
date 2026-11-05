@@ -574,7 +574,10 @@ components:
             - $ref: "#/components/schemas/Restore"
             - type: "null"
         backup:
-          $ref: "#/components/schemas/BackupPolicy"
+          description: "`null` when the database has no backups. WAL is then discarded, not archived."
+          oneOf:
+            - $ref: "#/components/schemas/BackupPolicy"
+            - type: "null"
         tasks:
           type: array
           items:

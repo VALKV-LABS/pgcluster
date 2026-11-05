@@ -24,7 +24,7 @@ fn instance(allowed_cidrs: &[&str], extensions: &[&str]) -> Instance {
         peers: vec![],
         bootstrap: "initdb".into(),
         restore: None,
-        backup: BackupPolicy {
+        backup: Some(BackupPolicy {
             target: BackupTarget {
                 kind: "posix".into(),
                 path: Some("/backups/db".into()),
@@ -32,7 +32,7 @@ fn instance(allowed_cidrs: &[&str], extensions: &[&str]) -> Instance {
                 ..Default::default()
             },
             retain_full: 2,
-        },
+        }),
         tasks: vec![],
         replication_mode: "async".into(),
         allowed_cidrs: allowed_cidrs.iter().map(|c| c.to_string()).collect(),

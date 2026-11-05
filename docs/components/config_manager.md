@@ -19,7 +19,7 @@ Restarting `pgcluster` would drop the clients of its proxy, so everything that c
 | `[tls]` | `ca_cert`, `cert`, `key`, an optional `proxy_cert` and `proxy_key`, and `insecure_plaintext` | Every file and path, on SIGHUP. See [tls_manager.md](tls_manager.md#reloading-certificates) |
 | `[metrics]` | Listen address | No |
 | `[api]` | Listen address, `api_keys` | `api_keys`, on SIGHUP |
-| `[backup]` | Schedule, retention, encryption key variable, repository | `retain_full`, on SIGHUP |
+| `[backup]` | Schedule, retention, encryption key variable, repository | The whole section, on SIGHUP. Adding it starts backups and archiving, and the leader seeds new nodes from backup once one exists |
 
 Passwords never sit in the config itself: it names the environment variables that hold them, and `secrets_file` can hold those variables in a file only the instance's user can read.
 
@@ -45,7 +45,7 @@ Validation checks the config as a whole, not only each value:
 pgcluster/src/config/
   mod.rs        # PgClusterConfig and its sections, with serde defaults
   validate.rs   # Checks across sections, run at startup and by `config validate`
-  runtime.rs    # API keys and retention that SIGHUP replaces
+  runtime.rs    # API keys and the backup section that SIGHUP replaces
 pgcluster/src/proxy/allowlist.rs   # The allowlist that SIGHUP replaces
 pgcluster/src/lib.rs               # SIGHUP handlers for settings and certificates
 ```

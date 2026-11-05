@@ -72,6 +72,9 @@ health_listen_addr = "0.0.0.0:8008"
 [proxy.pool]
 max_connections_per_db_user = 25
 idle_timeout_seconds        = 600
+# Named prepared statements kept on each backend connection, so clients can
+# reuse them across transactions. 0 turns this off.
+max_prepared_statements     = 200
 
 [proxy.read_routing]
 # Route reads to replicas within the lag threshold. Off by default, because a

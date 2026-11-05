@@ -202,6 +202,9 @@ pub async fn backup_now(
     let (status, spec) = lock(&mut tx, &id).await?;
     super::databases::require_serving(&status)?;
     super::databases::not_a_replica(&spec)?;
+    if spec.backup.is_none() {
+        return Err(no_backups());
+    }
     let generation: i64 = sqlx::query_scalar("SELECT generation FROM databases WHERE id = $1")
         .bind(&id)
         .fetch_one(&mut *tx)
@@ -271,11 +274,19 @@ async fn window(state: &AdminState, id: &str) -> Result<Option<RestoreWindow>, A
     })
 }
 
+/// What a database created without backups answers to a backup or restore.
+fn no_backups() -> ApiError {
+    ApiError::conflict("the database has no backups, so there is nothing to restore")
+}
+
 pub async fn restore_window(
     State(state): State<AdminState>,
     Path(id): Path<String>,
 ) -> Result<Json<RestoreWindow>, ApiError> {
-    spec_of(&state, &id).await?;
+    let (_, spec) = spec_of(&state, &id).await?;
+    if spec.backup.is_none() {
+        return Err(no_backups());
+    }
     window(&state, &id)
         .await?
         .map(Json)
@@ -300,6 +311,9 @@ pub async fn restore(
 ) -> Result<(StatusCode, Json<Operation>), ApiError> {
     check_database_name(&request.name)?;
     let (source_name, source): (String, DatabaseSpec) = spec_of(&state, &id).await?;
+    if source.backup.is_none() {
+        return Err(no_backups());
+    }
     check_hosts(&request.hosts, source.ha)?;
     let Some(window) = window(&state, &id).await? else {
         return Err(ApiError::conflict(

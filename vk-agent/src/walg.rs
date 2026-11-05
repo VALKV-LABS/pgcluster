@@ -413,18 +413,7 @@ impl Repository {
 }
 
 async fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
-    let temporary = path.with_extension("tmp");
-    tokio::fs::write(&temporary, contents)
-        .await
-        .with_context(|| format!("write {}", temporary.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).await?;
-    }
-    tokio::fs::rename(&temporary, path)
-        .await
-        .with_context(|| format!("replace {}", path.display()))
+    crate::host::fsutil::write_private(path, contents)
 }
 
 #[cfg(test)]
