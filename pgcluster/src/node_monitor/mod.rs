@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::agent_clients::AgentClientPool;
+use crate::config::runtime::Runtime;
 use crate::config::{FailoverConfig, ReplicationConfig};
 use crate::failover::seed::SeedPlan;
 use crate::metrics_registry::Metrics;
@@ -52,7 +53,8 @@ pub struct NodeMonitor {
     /// The role the proxy reads verifiers with, and a version for its settings.
     auth_role: AuthRole,
     /// The backup tool's settings and their version, when backups are on.
-    backup_settings: Option<(HashMap<String, String>, String)>,
+    /// Holds `[backup]`, which SIGHUP may add or change.
+    runtime: Arc<Runtime>,
     /// How many health-check ticks between orphaned-slot audits on the primary.
     /// Default: 120 ticks × 500 ms interval ≈ once per minute.
     slot_audit_ticks: u64,
@@ -68,7 +70,7 @@ impl NodeMonitor {
         metrics: Arc<Metrics>,
         replication: &ReplicationConfig,
         auth_role: &AuthRole,
-        backup_settings: Option<HashMap<String, String>>,
+        runtime: Arc<Runtime>,
         op_in_progress: Arc<AtomicBool>,
         quorum: Arc<QuorumLease>,
     ) -> Self {
@@ -87,12 +89,16 @@ impl NodeMonitor {
             max_slot_wal_keep_size_mb: replication.max_slot_wal_keep_size_mb,
             replication: replication.clone(),
             auth_role: auth_role.clone(),
-            backup_settings: backup_settings.map(|settings| {
-                let version = crate::backup::walg::version(&settings);
-                (settings, version)
-            }),
+            runtime,
             slot_audit_ticks: 120,
         }
+    }
+
+    /// WAL-G settings for the current `[backup]`, and their version.
+    fn backup_settings(&self) -> Option<(HashMap<String, String>, String)> {
+        let settings = crate::backup::walg::settings(&self.runtime.backup()?);
+        let version = crate::backup::walg::version(&settings);
+        Some((settings, version))
     }
 
     fn repl_password(&self) -> String {
@@ -210,18 +216,14 @@ impl NodeMonitor {
         agent_addr: &str,
         result: &HealthCheckResult,
     ) {
-        let Some((settings, version)) = &self.backup_settings else {
+        let Some((settings, version)) = self.backup_settings() else {
             return;
         };
-        if result.backup_config_version == *version {
+        if result.backup_config_version == version {
             return;
         }
         let pushed = match self.pool.get_or_connect(node_id, agent_addr).await {
-            Ok(mut client) => {
-                client
-                    .configure_backups(settings.clone(), version.clone())
-                    .await
-            }
+            Ok(mut client) => client.configure_backups(settings, version).await,
             Err(e) => Err(e),
         };
         match pushed {
@@ -233,7 +235,10 @@ impl NodeMonitor {
         }
     }
 
-    /// Seed an empty node in the background, which can take hours.
+    /// Seed an empty node in the background, which can take hours. With a
+    /// completed backup it restores that and follows the primary, which spares
+    /// the primary a base backup, and falls back to the primary if the
+    /// restore fails.
     fn spawn_seed(&self, node_id: &str) {
         let topology = self.topology_rx.current();
         let plan = match SeedPlan::new(&topology, node_id, &self.replication) {
@@ -243,11 +248,30 @@ impl NodeMonitor {
                 return;
             }
         };
-        info!(node_id, "seeding an empty node from the primary");
+        let from_backup = self
+            .backup_settings()
+            .filter(|_| has_completed_backup(&topology))
+            .map(|(settings, _)| settings);
         let node_id = node_id.to_string();
         let pool = self.pool.clone();
         tokio::spawn(async move {
-            match plan.run(&pool, false).await {
+            let mut force = false;
+            if let Some(settings) = from_backup {
+                info!(node_id, "seeding an empty node from the latest backup");
+                match plan.run_from_backup(&pool, settings, false).await {
+                    Ok(()) => {
+                        info!(node_id, "node seeded from a backup");
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(node_id, err = %e, "seeding from a backup failed, seeding from the primary");
+                        // The failed restore may have left files behind.
+                        force = true;
+                    }
+                }
+            }
+            info!(node_id, "seeding an empty node from the primary");
+            match plan.run(&pool, force).await {
                 Ok(()) => info!(node_id, "node seeded from the primary"),
                 Err(e) => error!(node_id, err = %e, "seeding failed"),
             }
@@ -572,6 +596,14 @@ impl NodeMonitor {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Whether a backup exists that a node could be seeded from.
+fn has_completed_backup(topology: &ClusterTopology) -> bool {
+    topology
+        .backups
+        .iter()
+        .any(|b| b.status == crate::raft::topology::BackupStatus::Completed)
+}
 
 #[cfg(test)]
 mod tests {

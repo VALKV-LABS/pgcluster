@@ -54,7 +54,7 @@ A standby can refuse a backup, for example when an idle cluster has written no n
 
 With a target time, it starts from the newest backup that finished before that time. The restored database drops `archive_command`, so it cannot write into the source's repository, and `synchronous_standby_names`, because it has no standbys. `GET /api/backups/restore` reports how it went.
 
-`POST /api/nodes/:id/seed` with `{"from_backup": true}` restores a cluster node from the latest backup, then has it follow the primary. That spares the primary the load of a base backup.
+`POST /api/nodes/:id/seed` with `{"from_backup": true}` restores a cluster node from the latest backup, then has it follow the primary. That spares the primary the load of a base backup. The leader's monitor does the same, unasked, for a node it finds empty when backups are configured and one has completed, and seeds from the primary if the restore fails.
 
 ## Verification
 

@@ -228,6 +228,10 @@ pub struct PoolConfig {
     pub idle_timeout_seconds: u64,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_seconds: u64,
+    /// Named prepared statements the proxy keeps on each backend connection,
+    /// so clients can reuse them across transactions. `0` turns this off.
+    #[serde(default = "default_max_prepared_statements")]
+    pub max_prepared_statements: usize,
 }
 
 impl Default for PoolConfig {
@@ -236,6 +240,7 @@ impl Default for PoolConfig {
             max_connections_per_db_user: default_max_conn(),
             idle_timeout_seconds: default_idle_timeout(),
             connect_timeout_seconds: default_connect_timeout(),
+            max_prepared_statements: default_max_prepared_statements(),
         }
     }
 }
@@ -248,6 +253,9 @@ fn default_idle_timeout() -> u64 {
 }
 fn default_connect_timeout() -> u64 {
     5
+}
+fn default_max_prepared_statements() -> usize {
+    200
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

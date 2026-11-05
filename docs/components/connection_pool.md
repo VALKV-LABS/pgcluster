@@ -34,6 +34,21 @@ Each `Pool` is a fixed-size set of `BackendConnection` objects. A connection can
 
 Default: **transaction mode** (matches PgBouncer's recommended default for most apps).
 
+### Prepared Statements
+
+In transaction mode a client's next transaction may run on another backend, or on one another client has used. The proxy keeps named prepared statements working across that, as PgBouncer 1.21 and later do:
+
+- It remembers each client's `Parse` messages. On the backend it names a statement `pgcluster_` plus a hash of its text and parameter types, so clients that prepare the same query share one backend statement, and two clients may use the same name for different queries.
+- When a client binds or describes a statement the backend it now holds lacks, the proxy sends that backend the `Parse` first and drops its reply.
+- A `Parse` the backend already holds, and a client's `Close` of a statement, are answered by the proxy. The backend keeps the statement for other clients.
+- Each backend keeps at most `[proxy.pool] max_prepared_statements` statements, 200 by default. Past that the proxy closes the least recently used one that no request in flight needs. `0` turns all of this off, and statement names then reach the backend unchanged.
+
+Limits:
+
+- `DEALLOCATE name` and `DEALLOCATE ALL` sent as simple queries are answered by the proxy for protocol-level statements, and `DISCARD ALL` clears what the proxy remembers once it succeeds. Each must be the only statement in its query.
+- Statements made with SQL `PREPARE` and run with `EXECUTE` live on one backend only, so they work only inside one transaction. Use your driver's protocol-level prepared statements instead.
+- A failed `Parse` is forgotten, so a later `Bind` to the same name reports the parse error again, where Postgres would report a missing statement.
+
 ### Connection Lifecycle
 
 ```

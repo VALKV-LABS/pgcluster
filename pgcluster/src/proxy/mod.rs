@@ -7,6 +7,7 @@ pub mod backend;
 pub mod connection;
 pub mod limits;
 pub mod pool;
+pub mod prepared;
 pub mod protocol;
 pub mod router;
 pub mod scram;

@@ -184,6 +184,18 @@ enum DatabaseCommand {
         #[arg(long)]
         wait: bool,
     },
+    /// Turn backups on for a database created with --no-backup
+    EnableBackups {
+        id: String,
+        /// Backup repository. With only one registered, that one
+        #[arg(long)]
+        repository: Option<String>,
+        /// Days of restore window to keep
+        #[arg(long, default_value_t = 7)]
+        retention_days: u32,
+        #[arg(long)]
+        wait: bool,
+    },
     /// Change how many days of restore window to keep
     Retention {
         id: String,
@@ -344,11 +356,15 @@ struct CreateArgs {
     #[arg(long = "host")]
     hosts: Vec<String>,
     /// Backup repository. With only one registered, that one
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_backup")]
     repository: Option<String>,
     /// Days of restore window to keep
-    #[arg(long, default_value_t = 7)]
+    #[arg(long, default_value_t = 7, conflicts_with = "no_backup")]
     retention_days: u32,
+    /// No backups: no repository, no WAL archive and no point-in-time restore.
+    /// `enable-backups` turns them on later
+    #[arg(long)]
+    no_backup: bool,
     /// Opaque label for grouping databases
     #[arg(long)]
     workspace: Option<String>,
@@ -539,7 +555,12 @@ async fn choose_repository(client: &AdminClient, named: Option<String>) -> Resul
 }
 
 async fn create_database(client: &AdminClient, args: CreateArgs) -> Result<()> {
-    let repository = choose_repository(client, args.repository).await?;
+    let backup = if args.no_backup {
+        json!({ "enabled": false })
+    } else {
+        let repository = choose_repository(client, args.repository).await?;
+        json!({ "repository_id": repository, "retention_days": args.retention_days })
+    };
     let (password, verifier) = generate_password();
     let mut body = json!({
         "name": args.name,
@@ -553,7 +574,7 @@ async fn create_database(client: &AdminClient, args: CreateArgs) -> Result<()> {
         "allowed_cidrs": args.allowed_cidrs,
         "extensions": args.extensions,
         "ha": args.ha,
-        "backup": { "repository_id": repository, "retention_days": args.retention_days },
+        "backup": backup,
     });
     if !args.hosts.is_empty() {
         body["hosts"] = json!(args.hosts);
@@ -648,6 +669,20 @@ pub async fn run_database(args: DatabaseArgs) -> Result<()> {
         }
         DatabaseCommand::Mode { id, mode, wait } => {
             let body = json!({ "replication_mode": mode });
+            let path = format!("/v1/databases/{id}");
+            let operation = client.send("PATCH", &path, Some(body)).await?;
+            client.finish(&operation, wait).await
+        }
+        DatabaseCommand::EnableBackups {
+            id,
+            repository,
+            retention_days,
+            wait,
+        } => {
+            let repository = choose_repository(&client, repository).await?;
+            let body = json!({
+                "backup": { "repository_id": repository, "retention_days": retention_days },
+            });
             let path = format!("/v1/databases/{id}");
             let operation = client.send("PATCH", &path, Some(body)).await?;
             client.finish(&operation, wait).await

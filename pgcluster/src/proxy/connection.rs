@@ -18,6 +18,7 @@ use super::{
     backend::{BackendConnection, BackendStream},
     limits::LoginGuard,
     pool::{ConnectionPool, Login},
+    prepared::{encode_empty, ClientStatements},
     protocol::{
         self, read_frontend_frame, read_startup_message, write_error_response, FrontendMessage,
         PROTOCOL_V3,
@@ -199,6 +200,7 @@ impl ProxyConnection {
         .await;
 
         let mut current: Option<(Arc<BackendConnection>, String, String)> = None;
+        let mut statements = ClientStatements::new(pool.max_prepared_statements());
 
         loop {
             let (msg, raw) = match read_frontend_frame(&mut client).await {
@@ -223,6 +225,15 @@ impl ProxyConnection {
 
                 // ── Simple query ──────────────────────────────────────────
                 FrontendMessage::Query(ref sql) => {
+                    if let Some(tag) = statements.answer_locally(sql) {
+                        let mut body = tag.as_bytes().to_vec();
+                        body.push(0);
+                        protocol::write_message(&mut client, b'C', &body).await?;
+                        protocol::write_ready_for_query(&mut client, session.txn_status_byte())
+                            .await?;
+                        continue;
+                    }
+
                     let intent = protocol::classify_statement(sql);
                     let target = session.route_intent(&intent);
 
@@ -282,7 +293,8 @@ impl ProxyConnection {
                         }
                     };
 
-                    let rfq = forward_and_pipe(&mut client, &conn, &raw).await?;
+                    statements.query(sql);
+                    let rfq = forward_and_relay(&mut client, &conn, &raw, &mut statements).await?;
                     session.update_from_ready_for_query(rfq);
 
                     if session.txn_state == TxnState::Idle {
@@ -340,19 +352,27 @@ impl ProxyConnection {
                         }
                     };
 
+                    // Named statements are renamed for the backend, and sent
+                    // again to a backend that lacks them.
+                    let out = {
+                        let mut held = conn.statements.lock().expect("statements lock");
+                        statements.outgoing(&msg, &raw, &mut held)
+                    };
+
                     // A backend answers a pipeline only at Sync, and an open
                     // COPY only at its end. Waiting after any other message
                     // would hang, because the client is still sending.
                     if answers_now(&msg) {
-                        let rfq = forward_and_pipe(&mut client, &conn, &raw).await?;
+                        let rfq =
+                            forward_and_relay(&mut client, &conn, &out, &mut statements).await?;
                         session.update_from_ready_for_query(rfq);
                         if session.txn_state == TxnState::Idle {
                             if let Some((c, nid, a)) = current.take() {
                                 pool.release(&database, &user, &a, &nid, c).await;
                             }
                         }
-                    } else {
-                        forward(&conn, &raw).await?;
+                    } else if !out.is_empty() {
+                        forward(&conn, &out).await?;
                     }
                 }
 
@@ -421,24 +441,27 @@ async fn ensure_backend(
 
 // ── I/O helpers ───────────────────────────────────────────────────────────────
 
-/// Forward `raw_msg` to `backend`, then pipe all response messages back to
-/// `client` until we see a `ReadyForQuery`.
+/// Forward `raw_msg` to `backend`, then relay its replies to `client` until
+/// a `ReadyForQuery`.
 ///
 /// Returns the transaction status byte from the `ReadyForQuery`.
-async fn forward_and_pipe(
+async fn forward_and_relay(
     client: &mut MaybeTlsStream,
     conn: &Arc<BackendConnection>,
     raw_msg: &[u8],
+    statements: &mut ClientStatements,
 ) -> Result<u8> {
     let mut backend = conn.stream.lock().await;
 
-    backend
-        .write_all(raw_msg)
-        .await
-        .context("forward message to backend")?;
-    backend.flush().await.context("flush to backend")?;
+    if !raw_msg.is_empty() {
+        backend
+            .write_all(raw_msg)
+            .await
+            .context("forward message to backend")?;
+        backend.flush().await.context("flush to backend")?;
+    }
 
-    pipe_until_ready_for_query(client, &mut backend).await
+    relay_until_ready_for_query(client, &mut backend, conn, statements).await
 }
 
 /// Forward `raw_msg` to the backend without waiting for a reply.
@@ -451,68 +474,108 @@ async fn forward(conn: &Arc<BackendConnection>, raw_msg: &[u8]) -> Result<()> {
     backend.flush().await.context("flush to backend")
 }
 
-/// Pipe backend response messages to `client` until a `ReadyForQuery` is seen.
+/// Relay backend messages to `client` until a `ReadyForQuery` is seen.
 ///
-/// Uses an accumulating buffer so a `ReadyForQuery` that spans two TCP reads
-/// is still detected rather than causing an infinite read loop.
-async fn pipe_until_ready_for_query(
+/// Replies to requests the proxy made itself are dropped, and replies it
+/// owes the client for requests it did not send are added in their place.
+/// Large messages, such as wide rows, stream through as they arrive.
+async fn relay_until_ready_for_query(
     client: &mut MaybeTlsStream,
     backend: &mut BackendStream,
+    conn: &BackendConnection,
+    statements: &mut ClientStatements,
 ) -> Result<u8> {
     let mut acc: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 65536];
+    let mut out: Vec<u8> = Vec::new();
+    // Bytes of a message still to arrive, and whether they go to the client.
+    let mut body_left = 0usize;
+    let mut body_forward = true;
 
     loop {
+        while let Some(kind) = statements.next_synthetic() {
+            out.extend_from_slice(&encode_empty(kind));
+        }
+        if !out.is_empty() {
+            client
+                .write_all(&out)
+                .await
+                .context("forward response to client")?;
+            client.flush().await.context("flush to client")?;
+            out.clear();
+        }
+
         let n = backend
             .read(&mut buf)
             .await
             .context("read backend response")?;
-
         if n == 0 {
             bail!("backend closed connection unexpectedly");
         }
 
-        client
-            .write_all(&buf[..n])
-            .await
-            .context("forward response to client")?;
-        client.flush().await.context("flush to client")?;
+        let mut chunk = &buf[..n];
+        if body_left > 0 {
+            let take = body_left.min(chunk.len());
+            if body_forward {
+                out.extend_from_slice(&chunk[..take]);
+            }
+            body_left -= take;
+            chunk = &chunk[take..];
+        }
+        acc.extend_from_slice(chunk);
 
-        acc.extend_from_slice(&buf[..n]);
-
-        // Scan acc for ReadyForQuery, properly advancing past complete messages.
         let mut pos = 0usize;
-        let mut last_complete = 0usize;
-
-        while pos + 5 <= acc.len() {
-            let msg_type = acc[pos];
+        let mut status = None;
+        while status.is_none() && body_left == 0 && pos + 5 <= acc.len() {
+            let kind = acc[pos];
             let length =
                 u32::from_be_bytes([acc[pos + 1], acc[pos + 2], acc[pos + 3], acc[pos + 4]])
                     as usize;
-
-            if msg_type == b'Z' && length == 5 && pos + 6 <= acc.len() {
-                return Ok(acc[pos + 5]);
+            if length < 4 {
+                bail!("backend sent a malformed message");
             }
-
-            // CopyInResponse: the backend now waits for the client's data, so
-            // report a transaction in progress to stay on this connection.
-            if msg_type == b'G' {
-                return Ok(b'T');
-            }
-
-            let next = pos + 1 + length;
-            if next <= pos || next > acc.len() {
-                // Malformed or incomplete message — wait for more data.
+            let total = 1 + length;
+            let available = total.min(acc.len() - pos);
+            // ReadyForQuery and CopyInResponse end the relay, so wait for
+            // all of them.
+            if matches!(kind, b'Z' | b'G') && available < total {
                 break;
             }
-            last_complete = next;
-            pos = next;
-        }
 
-        // Discard fully-scanned bytes; keep only the unscanned tail so the
-        // next iteration continues where we left off.
-        if last_complete > 0 {
-            acc.drain(0..last_complete);
+            while let Some(synthetic) = statements.next_synthetic() {
+                out.extend_from_slice(&encode_empty(synthetic));
+            }
+            let forward = {
+                let mut held = conn.statements.lock().expect("statements lock");
+                statements.on_reply(kind, &mut held)
+            };
+            if forward {
+                out.extend_from_slice(&acc[pos..pos + available]);
+            }
+
+            match kind {
+                b'Z' => status = Some(acc[pos + 5]),
+                // CopyInResponse: the backend now waits for the client's data,
+                // so report a transaction in progress to stay on this connection.
+                b'G' => status = Some(b'T'),
+                _ => {}
+            }
+            body_left = total - available;
+            body_forward = forward;
+            pos += available;
+        }
+        acc.drain(..pos);
+
+        if !out.is_empty() {
+            client
+                .write_all(&out)
+                .await
+                .context("forward response to client")?;
+            client.flush().await.context("flush to client")?;
+            out.clear();
+        }
+        if let Some(status) = status {
+            return Ok(status);
         }
     }
 }

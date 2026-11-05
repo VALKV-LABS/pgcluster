@@ -101,6 +101,11 @@ impl ConnectionPool {
         }
     }
 
+    /// Named prepared statements to keep on each backend connection.
+    pub fn max_prepared_statements(&self) -> usize {
+        self.config.max_prepared_statements
+    }
+
     /// Open a new connection and log in as the session's user, outside the
     /// pool's accounting. Returns what the backend sent after authenticating.
     pub async fn login(

@@ -170,8 +170,8 @@ pub async fn seed_node(
     let topology = s.topology.borrow();
     let plan = SeedPlan::new(&topology, &node_id, &s.config.replication)
         .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
-    let settings = match (req.from_backup, &s.config.backup) {
-        (true, Some(backup)) => Some(crate::backup::walg::settings(backup)),
+    let settings = match (req.from_backup, s.runtime.backup()) {
+        (true, Some(backup)) => Some(crate::backup::walg::settings(&backup)),
         (true, None) => {
             return Err((StatusCode::NOT_FOUND, "backup not configured".to_string()));
         }

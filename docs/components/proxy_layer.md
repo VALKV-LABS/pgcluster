@@ -99,7 +99,8 @@ src/
     backend.rs        # BackendConnection — pooled Postgres connection
     pool.rs           # ConnectionPool — per-(db, user) pool
     protocol.rs       # Postgres wire protocol framing (read/write packets)
-    session.rs        # Session state: txn mode, SET vars, prepared stmts
+    session.rs        # Session state: txn mode, SET vars
+    prepared.rs       # Named prepared statements across pooled backends
     ssl.rs            # TLS upgrade for client connections
     auth.rs           # Reads SCRAM verifiers through the auth role
     scram.rs          # SCRAM with clients, and logging in to backends as them

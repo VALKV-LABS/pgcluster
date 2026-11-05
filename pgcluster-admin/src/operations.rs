@@ -32,6 +32,8 @@ pub enum Kind {
     CreateReplica,
     /// A replica detached into a database of its own.
     PromoteReplica,
+    /// Backups turned on for a database created without them.
+    EnableBackup,
 }
 
 impl Kind {
@@ -52,6 +54,7 @@ impl Kind {
             Self::Upgrade => "upgrade",
             Self::CreateReplica => "create_replica",
             Self::PromoteReplica => "promote_replica",
+            Self::EnableBackup => "enable_backup",
         }
     }
 
@@ -72,6 +75,7 @@ impl Kind {
             "upgrade" => Some(Self::Upgrade),
             "create_replica" => Some(Self::CreateReplica),
             "promote_replica" => Some(Self::PromoteReplica),
+            "enable_backup" => Some(Self::EnableBackup),
             _ => None,
         }
     }
@@ -147,6 +151,9 @@ impl Kind {
                 "activate",
             ],
             Self::Upgrade => &["upgrade_check", "rolling_restart", "wait_version", "settle"],
+            // Every node archives, and the leader backs up, once hosts apply
+            // the policy. The restore window starts with this backup.
+            Self::EnableBackup => &["wait_applied", "first_backup", "settle"],
         }
     }
 
@@ -159,7 +166,8 @@ impl Kind {
             | Self::Resize
             | Self::Upgrade
             | Self::CreateReplica
-            | Self::PromoteReplica => DATA_OPERATION_TIMEOUT_SECONDS,
+            | Self::PromoteReplica
+            | Self::EnableBackup => DATA_OPERATION_TIMEOUT_SECONDS,
             _ => OPERATION_TIMEOUT_SECONDS,
         }
     }

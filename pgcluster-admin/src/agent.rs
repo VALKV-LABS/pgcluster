@@ -357,22 +357,29 @@ pub async fn build_desired_state(
             .database_secrets
             .ok_or_else(|| anyhow::anyhow!("database {} has no secrets", row.database_id))?;
         let database: DatabaseSecrets = state.secrets.open(&row.database_id, &sealed)?;
-        let (kind, config, credentials) = repository(state, &spec.backup.repository_id).await?;
-        let target = |id: &str, key: String| {
-            BackupTarget::for_database(&kind, config.clone(), credentials.clone(), id, key)
+        // A restored database keeps its source's policy, so it always has one.
+        let (backup, restore) = match &spec.backup {
+            Some(policy) => {
+                let (kind, config, credentials) = repository(state, &policy.repository_id).await?;
+                let target = |id: &str, key: String| {
+                    BackupTarget::for_database(&kind, config.clone(), credentials.clone(), id, key)
+                };
+                let backup = InstanceBackup {
+                    target: target(&row.database_id, database.backup_key.clone()),
+                    retain_full: policy.retain_full(),
+                };
+                let restore = spec.restore.as_ref().map(|source| InstanceRestore {
+                    source: target(
+                        &source.database_id,
+                        database.source_backup_key.clone().unwrap_or_default(),
+                    ),
+                    target_time: Some(source.target_time.clone()),
+                    source_database: source.database_name.clone(),
+                });
+                (Some(backup), restore)
+            }
+            None => (None, None),
         };
-        let backup = InstanceBackup {
-            target: target(&row.database_id, database.backup_key.clone()),
-            retain_full: spec.backup.retain_full(),
-        };
-        let restore = spec.restore.as_ref().map(|source| InstanceRestore {
-            source: target(
-                &source.database_id,
-                database.source_backup_key.clone().unwrap_or_default(),
-            ),
-            target_time: Some(source.target_time.clone()),
-            source_database: source.database_name.clone(),
-        });
         // A replica's peers are its source's nodes, which it follows and
         // whose leader reaches its agent.
         let (peer_database, peer_node) = match &spec.replica_of {

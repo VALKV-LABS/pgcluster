@@ -63,7 +63,7 @@ Each instance takes a block of ten ports from its `port_base`, allocated by the 
 
 | Offset | Service | Bound to | Reachable from |
 |---|---|---|---|
-| 0 | Proxy, for clients | All addresses | The database's allowlist, once it has a backup |
+| 0 | Proxy, for clients | All addresses | The database's allowlist, once it has a backup or was created without backups |
 | 1 | Proxy admin | Loopback | The host |
 | 2 | Postgres | All addresses with peers, else loopback | The database's own nodes and replicas |
 | 3 | Raft | All addresses with peers, else loopback | The database's own nodes |
@@ -139,9 +139,9 @@ The host of the Raft leader also reports what the cluster knows through `POST /a
 
 1. `POST /v1/databases` checks the request, and the scheduler checks the fleet can hold it. See [scheduler.md](components/scheduler.md).
 2. `place` chooses hosts, allocates port blocks, generates the database's CA, node certificates, internal passwords and backup key, and publishes the instances.
-3. Each host writes the instance's files, applies its slice, quota and firewall, and starts `vk-agent` and `pgcluster`. The first node runs `initdb --data-checksums`. Other nodes start empty, and the Raft leader's monitor seeds them from the primary with `pg_basebackup` through their agents.
+3. Each host writes the instance's files, applies its slice, quota and firewall, and starts `vk-agent` and `pgcluster`. The first node runs `initdb --data-checksums`. Other nodes start empty, and the Raft leader's monitor seeds them through their agents: from the primary with `pg_basebackup`, since a new database has no backup yet. A node that starts empty later, such as a replacement, is seeded from the latest backup.
 4. The first node's host creates the owner role from its SCRAM verifier, the database and the extensions.
-5. `first_backup` runs a backup task on the Raft leader, which has a standby's agent run `wal-g backup-push`.
+5. `first_backup` runs a backup task on the Raft leader, which has a standby's agent run `wal-g backup-push`. A database created without backups skips it, and archives nothing until backups are turned on.
 6. `open_access` publishes the allowlist, and the proxy and the firewall let clients in. `activate` marks the database `active`.
 
 ### Change settings
@@ -165,7 +165,7 @@ The host of the Raft leader also reports what the cluster knows through `POST /a
 ### Replace a node, drain a host
 
 1. A new node is published on the new host as `seed`, and every peer learns of it.
-2. A `replace_member` task on the leader adds it as a Raft learner and a cluster node. The monitor seeds it from the primary.
+2. A `replace_member` task on the leader adds it as a Raft learner and a cluster node. The monitor seeds it from the latest backup, which spares the primary, or from the primary if there is no backup or the restore fails.
 3. Once it streams, the leader promotes it to a voter, switches over if the old node is primary, and removes the old node and its slot.
 4. The old node is retracted from its host's desired state, and the host stops and deletes it.
 
@@ -231,7 +231,7 @@ A primary that loses its heartbeat from the leader fences itself, so two primari
 | State | Owner | Where |
 |---|---|---|
 | What a database should look like, operations, events, audit log | `pgcluster-admin` | The metadata Postgres |
-| Instance secrets | `pgcluster-admin` | Sealed in the metadata Postgres, and on each host in files only the instance's user can read |
+| Instance secrets | `pgcluster-admin` | Sealed in the metadata Postgres, and on each host in files only root and the instance's user can read. See [SECURITY.md](../SECURITY.md#deployment-security-model) |
 | What a host runs | `vk-agent host` | Its `state_dir`, including the last desired state, so it carries on while `pgcluster-admin` is away |
 | Primary, membership, failover history, backup manifests, replication mode | The cluster's Raft group | Each `pgcluster` instance's Raft log |
 | Data and WAL | Postgres | Each node's data directory, and the backup repository |

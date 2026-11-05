@@ -57,7 +57,8 @@ pub struct Database {
     endpoint: Option<Endpoint>,
     /// Every node's proxy, so a client can list them all.
     endpoints: Vec<NodeAddress>,
-    backup: crate::model::BackupSettings,
+    /// `null` when the database has no backups.
+    backup: Option<crate::model::BackupSettings>,
     primary: Option<String>,
     /// The release every node runs, or nothing while they differ.
     server_version: Option<String>,
@@ -159,7 +160,9 @@ pub async fn create(
     JsonBody(request): JsonBody<CreateDatabase>,
 ) -> Result<(StatusCode, Json<Operation>), ApiError> {
     let (name, workspace, spec) = request.into_spec()?;
-    super::backups::check_repository(&state, &spec.backup.repository_id).await?;
+    if let Some(backup) = &spec.backup {
+        super::backups::check_repository(&state, &backup.repository_id).await?;
+    }
     check_placement(&state, &spec.hosts).await?;
     check_capacity(&state, &spec).await?;
 
@@ -387,8 +390,22 @@ pub async fn update(
     JsonBody(request): JsonBody<UpdateDatabase>,
 ) -> Result<(StatusCode, Json<Operation>), ApiError> {
     let (_, spec) = spec_of(&state, &id).await?;
+    if let Some(backup) = request.backup {
+        if request.resources.is_some()
+            || request.replication_mode.is_some()
+            || request.retention_days.is_some()
+        {
+            return Err(ApiError::invalid("turn backups on in a request of its own"));
+        }
+        return enable_backup(&state, &id, &spec, backup).await;
+    }
     if let Some(days) = request.retention_days {
         check_retention(days)?;
+        if spec.backup.is_none() {
+            return Err(ApiError::conflict(
+                "the database has no backups; turn them on with a backup policy",
+            ));
+        }
     }
     if let Some(resources) = request.resources {
         if request.replication_mode.is_some() {
@@ -404,9 +421,7 @@ pub async fn update(
             let params = json!({ "mode": mode });
             change_spec_as(&state, &id, Kind::ReplicationMode, params, |spec| {
                 spec.replication_mode = mode;
-                if let Some(days) = request.retention_days {
-                    spec.backup.retention_days = days;
-                }
+                set_retention(spec, request.retention_days);
             })
             .await
         }
@@ -414,9 +429,39 @@ pub async fn update(
             let Some(days) = request.retention_days else {
                 return Err(ApiError::invalid("name something to change"));
             };
-            change_spec(&state, &id, |spec| spec.backup.retention_days = days).await
+            change_spec(&state, &id, |spec| set_retention(spec, Some(days))).await
         }
     }
+}
+
+fn set_retention(spec: &mut DatabaseSpec, days: Option<u32>) {
+    if let (Some(backup), Some(days)) = (spec.backup.as_mut(), days) {
+        backup.retention_days = days;
+    }
+}
+
+/// Turn backups on for a database created without them. Hosts start
+/// archiving with no restart, and the first backup opens the restore window.
+async fn enable_backup(
+    state: &AdminState,
+    id: &str,
+    spec: &DatabaseSpec,
+    request: crate::model::BackupRequest,
+) -> Result<(StatusCode, Json<Operation>), ApiError> {
+    if spec.backup.is_some() {
+        return Err(ApiError::conflict(
+            "backups are already on; change retention_days instead",
+        ));
+    }
+    let Some(policy) = request.into_settings()? else {
+        return Err(ApiError::invalid("backups cannot be turned off"));
+    };
+    super::backups::check_repository(state, &policy.repository_id).await?;
+    let params = json!({ "repository_id": policy.repository_id });
+    change_spec_as(state, id, Kind::EnableBackup, params, |spec| {
+        spec.backup = Some(policy);
+    })
+    .await
 }
 
 /// Give every node new resources. Each node's host must have room for the
@@ -484,9 +529,7 @@ async fn resize(
     // restarts itself when its host applies the change.
     let restart = spec.ha && resources.memory_gb != old.memory_gb;
     spec.resources = resources.clone();
-    if let Some(days) = retention_days {
-        spec.backup.retention_days = days;
-    }
+    set_retention(&mut spec, retention_days);
     let generation: i64 = sqlx::query_scalar(
         "UPDATE databases SET spec = $2, generation = generation + 1, updated_at = now() \
          WHERE id = $1 RETURNING generation",

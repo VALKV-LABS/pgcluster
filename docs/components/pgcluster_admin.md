@@ -89,7 +89,8 @@ A change stores the new spec, raises the database's `generation`, and records an
 
 | Operation | Steps |
 |---|---|
-| Create | `place`, `wait_applied`, `first_backup`, `open_access`, `wait_applied`, `activate` |
+| Create | `place`, `wait_applied`, `first_backup`, `open_access`, `wait_applied`, `activate`. `first_backup` does nothing for a database without backups |
+| Turn backups on | `wait_applied`, `first_backup`, `settle` |
 | Change | `wait_applied`, `settle` |
 | Change a preload extension on three nodes | `wait_applied`, `rolling_restart`, `new_generation`, `wait_applied`, `settle` |
 | Change the replication mode | `wait_applied`, `set_replication_mode`, `settle` |
@@ -119,7 +120,7 @@ The host of the Raft leader also reports what the cluster knows: the primary, sy
 
 `endpoint` is the first node on an online host, and `endpoints` lists every node's proxy. Each proxy routes writes to the primary, wherever it is.
 
-`POST .../nodes/{node}/replace` adds the new node, seeds it, promotes it to a voter, and only then lets the old node go, so the cluster never runs short of voters. If the node leaving is the primary, it switches over first. The old host may be gone: nothing waits for it, and if it returns it removes the instance.
+`POST .../nodes/{node}/replace` adds the new node, seeds it from the latest backup (or from the primary if the restore fails), promotes it to a voter, and only then lets the old node go, so the cluster never runs short of voters. If the node leaving is the primary, it switches over first. The old host may be gone: nothing waits for it, and if it returns it removes the instance.
 
 ## Events
 
@@ -139,9 +140,11 @@ The host of the Raft leader also reports what the cluster knows: the primary, sy
 
 `POST /v1/backup-repositories` registers an S3-compatible store or a directory every host can reach. The request waits while an online host writes to it through WAL-G, and fails with the host's reason if it cannot. S3 credentials are optional, because hosts can use an instance role, and are encrypted at rest and never returned. A repository in use cannot be removed.
 
-Every database names a repository, so `backup` is required on create. Each gets its own prefix and its own encryption key, and data is encrypted on the node before upload. `retention_days` becomes a number of weekly full backups: enough to cover the period, and one more, so the window survives the deletion of the oldest.
+`backup` is required on create: a repository and `retention_days`, or `{"enabled": false}` for none. Each database with backups gets its own prefix and its own encryption key, and data is encrypted on the node before upload. `retention_days` becomes a number of weekly full backups: enough to cover the period, and one more, so the window survives the deletion of the oldest.
 
-A database stays `provisioning`, with an empty allowlist, until its first backup exists. A create whose backup fails ends in `error`, and no client has ever reached it.
+A database with backups stays `provisioning`, with an empty allowlist, until its first backup exists. A create whose backup fails ends in `error`, and no client has ever reached it.
+
+A database created with `{"enabled": false}` opens without one. It shows `"backup": null`, archives no WAL (its `archive_command` discards each segment, so WAL does not pile up), and answers `409` to `restore-window`, `restore`, `backup` and a change of `retention_days`. `PATCH` with `{"backup": {"repository_id": ..., "retention_days": ...}}`, in a request of its own, turns backups on as an `enable_backup` operation: hosts hand `pgcluster` the policy, which it reads on SIGHUP, archiving starts with no restart, and the first backup opens the restore window. Backups cannot be turned off.
 
 `restore-window` runs from the end of the oldest backup to the last moment every commit is known to be in the WAL archive. `POST .../restore` accepts only times inside that window, and creates a new database with the source's version, owner, extensions and size. The source is not touched. Its backups stay usable while the source exists: deleting a database discards the key that decrypts them.
 
