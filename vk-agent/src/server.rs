@@ -479,7 +479,7 @@ impl AgentService for AgentServiceImpl {
             parameters,
             lost_slots,
             has_data: true,
-            backup_config_version: self.walg.config_version().await,
+            backup_config_version: self.walg.applied_version(&self.pg).await,
             proxy_auth_version: self.pg.get_proxy_auth_version().await.unwrap_or_default(),
         }))
     }
