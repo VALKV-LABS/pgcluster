@@ -41,6 +41,8 @@ pub struct LocalApi {
 struct Health {
     raft_leader: bool,
     primary: Option<String>,
+    #[serde(default)]
+    raft_term: u64,
 }
 
 #[derive(Deserialize)]
@@ -361,9 +363,11 @@ impl LocalApi {
         let failovers: Vec<Value> = self.get("/api/failover/history").await?;
         let backups: Backups = self.get("/api/backups").await?;
         let status: BackupStatus = self.get("/api/backups/status").await?;
+        let health = self.health().await?;
         Ok(ClusterReport {
             database_id: database_id.to_string(),
-            primary: self.primary().await?,
+            term: health.raft_term,
+            primary: health.primary,
             sync_degraded: replication.degraded,
             needs_reseed: replication.needs_reseed,
             failovers,

@@ -398,6 +398,8 @@ pub struct TaskResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct ClusterReport {
     pub database_id: String,
+    /// The reporting leader's Raft term.
+    pub term: u64,
     pub primary: Option<String>,
     pub sync_degraded: bool,
     pub needs_reseed: Vec<String>,

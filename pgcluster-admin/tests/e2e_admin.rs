@@ -488,7 +488,12 @@ async fn e2e_admin_backups_can_start_off_and_turn_on() {
     cli(HOST, &format!("database enable-backups {id} --wait"));
     let database = api(&client, "GET", &path, None).await;
     assert_eq!(database["backup"]["retention_days"], 7, "{database}");
-    wait_for_backups(&client, id, 1).await;
+    // The scheduler may take one of its own as soon as backups are on.
+    wait_for("a backup", Duration::from_secs(120), async || {
+        let backups = api(&client, "GET", &format!("{path}/backups"), None).await;
+        !backups["items"].as_array().unwrap().is_empty()
+    })
+    .await;
     wait_for("a restore window", Duration::from_secs(120), async || {
         api_call(&client, "GET", &format!("{path}/restore-window"), None)
             .await
@@ -1157,12 +1162,19 @@ impl HaDatabase {
             operation["database_id"].as_str().unwrap(),
             operation["id"].as_str().unwrap()
         );
-        wait_for("the operation", Duration::from_secs(300), async || {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
             let current = api(client, "GET", &path, None).await;
             assert_ne!(current["status"], "failed", "{current}");
-            current["status"] == "succeeded"
-        })
-        .await;
+            if current["status"] == "succeeded" {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the operation: {current}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     /// Status follows a sweep every few seconds, so it settles a little after
@@ -1664,7 +1676,9 @@ async fn e2e_admin_ha_suite_in_every_mode() {
             Some(serde_json::json!({ "host_id": spare })),
         )
         .await;
+        let started = Instant::now();
         database.wait_operation(&client, &operation).await;
+        eprintln!("{mode}: replacement took {:?}", started.elapsed());
         load.wait_progress().await;
         let (acked, _) = load.stop().await;
         assert_eq!(lost(&database, &client, table, &acked).await, 0);

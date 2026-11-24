@@ -28,6 +28,9 @@ use replication::{DegradeTimer, StalePrimaries};
 /// How long to wait before trying again to rejoin an old primary.
 const REJOIN_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// What an agent answers while a seed, restore or rewind is under way.
+const SEED_RUNNING: &str = "already running";
+
 // ── NodeMonitor ───────────────────────────────────────────────────────────────
 
 /// Polls every vk-agent on the Raft leader and triggers failover when the
@@ -261,6 +264,12 @@ impl NodeMonitor {
                 match plan.run_from_backup(&pool, settings, false).await {
                     Ok(()) => {
                         info!(node_id, "node seeded from a backup");
+                        return;
+                    }
+                    // A seed already under way, such as one this monitor
+                    // started a cooldown ago, must be left to finish.
+                    Err(e) if e.to_string().contains(SEED_RUNNING) => {
+                        info!(node_id, "a seed is already running on the node");
                         return;
                     }
                     Err(e) => {

@@ -679,6 +679,9 @@ pub struct RepositoryCheckResult {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClusterReport {
     pub database_id: String,
+    /// The reporting leader's Raft term. `0` from hosts that do not send it.
+    #[serde(default)]
+    pub term: u64,
     #[serde(default)]
     pub primary: Option<String>,
     #[serde(default)]

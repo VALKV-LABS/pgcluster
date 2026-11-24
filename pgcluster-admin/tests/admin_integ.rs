@@ -2995,3 +2995,45 @@ async fn a_database_without_backups_opens_and_can_turn_them_on() {
     let (status, _) = f.api("PATCH", &path, Some(on)).await;
     assert_eq!(status, 409);
 }
+
+/// A leader cut off by a partition may report once more after it heals. Its
+/// older term marks the report as stale, so it cannot undo what the current
+/// leader said.
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_stale_leader_cannot_overwrite_the_cluster_report() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let ha = f.ha().await;
+    let url = format!("{}/agent/v1/cluster", f.agent_url);
+    let report = async |host: usize, term: u64, primary: &str| {
+        let body = json!({ "database_id": ha.database_id, "term": term, "primary": primary });
+        let response = ha.hosts[host]
+            .1
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+    };
+    let primary = async || {
+        let (_, body) = f.api("GET", &ha.path, None).await;
+        body["primary"].as_str().map(str::to_string)
+    };
+
+    report(0, 5, "n1").await;
+    assert_eq!(primary().await.as_deref(), Some("n1"));
+    report(1, 4, "n2").await;
+    assert_eq!(
+        primary().await.as_deref(),
+        Some("n1"),
+        "an older term is ignored"
+    );
+    report(2, 6, "n3").await;
+    assert_eq!(primary().await.as_deref(), Some("n3"));
+    // A host that sends no term is not fenced.
+    report(1, 0, "n2").await;
+    assert_eq!(primary().await.as_deref(), Some("n2"));
+}

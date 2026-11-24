@@ -634,6 +634,19 @@ async fn cluster_report(
     let Some(before) = before.map(|b| b.0) else {
         return Err(ApiError::not_found("database"));
     };
+    // A leader cut off by a partition may report once more after it heals,
+    // before it learns it was replaced. Its term is older than the one already
+    // heard from, so what it says is stale.
+    let term = before["term"].as_u64().unwrap_or(0);
+    if report.term > 0 && report.term < term {
+        tracing::debug!(
+            database_id = id,
+            report.term,
+            term,
+            "ignored a stale cluster report"
+        );
+        return Ok(StatusCode::NO_CONTENT);
+    }
 
     let seen = before["failover_count"].as_u64().unwrap_or(0) as usize;
     for failover in report.failovers.iter().skip(seen) {
@@ -693,6 +706,7 @@ async fn cluster_report(
         .await?;
 
     let observed = serde_json::json!({
+        "term": report.term.max(term),
         "primary": report.primary,
         "sync_degraded": report.sync_degraded,
         "needs_reseed": report.needs_reseed,
