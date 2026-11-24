@@ -153,6 +153,15 @@ impl LocalPostgres {
         Ok(rows.into_iter().collect())
     }
 
+    /// The value of one setting, as the server runs with it now.
+    pub async fn get_setting(&self, name: &str) -> Result<String> {
+        sqlx::query_scalar("SELECT current_setting($1)")
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await
+            .with_context(|| format!("current_setting({name}) failed"))
+    }
+
     /// Apply `parameters` with `ALTER SYSTEM`, then reload. Only names in
     /// `MANAGED_PARAMETERS` are accepted, and the file write does not wait for
     /// a synchronous standby, so this works while commits are stalled.

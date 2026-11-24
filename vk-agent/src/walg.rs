@@ -127,6 +127,30 @@ impl WalG {
             .unwrap_or_default()
     }
 
+    /// The config version, but only while Postgres archives through this
+    /// node's config. `pg_basebackup` and `pg_rewind` copy
+    /// `postgresql.auto.conf` from the node they read, and with it that node's
+    /// `archive_command`, which names a file this host does not have. The
+    /// version file lives outside the data directory and survives the copy,
+    /// so on its own it would claim archiving works while every segment
+    /// fails. Reporting no version has the monitor configure the node again.
+    pub async fn applied_version(&self, pg: &LocalPostgres) -> String {
+        let version = self.config_version().await;
+        if version.is_empty() {
+            return version;
+        }
+        match pg.get_setting("archive_command").await {
+            Ok(command) if command != self.archive_command() => {
+                tracing::warn!(
+                    archive_command = %command,
+                    "archive_command is not this node's own, so the backup settings are applied again"
+                );
+                String::new()
+            }
+            _ => version,
+        }
+    }
+
     fn version_path(&self) -> String {
         format!("{}.version", self.config_path)
     }
