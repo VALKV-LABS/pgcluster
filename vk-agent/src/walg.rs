@@ -159,7 +159,18 @@ impl WalG {
     pub async fn backup_push(&self, data_dir: &Path) -> Result<(String, u64)> {
         let mut command = self.command();
         command.arg("backup-push").arg(data_dir);
-        self.run(command, "backup-push").await?;
+        if let Err(e) = self.run(command, "backup-push").await {
+            // After a failover that dropped the old primary's last commits,
+            // as async replication can, the newest backup may end past where
+            // this timeline is now. No delta can build on it, so take a full.
+            if !format!("{e:#}").contains(DELTA_BASE_AHEAD) {
+                return Err(e);
+            }
+            tracing::warn!("the last backup ends past this timeline, taking a full backup");
+            let mut full = self.command();
+            full.arg("backup-push").arg("--full").arg(data_dir);
+            self.run(full, "backup-push --full").await?;
+        }
         let newest = self
             .list()
             .await?
@@ -336,6 +347,9 @@ pub fn repository_settings(target: &BackupTarget) -> HashMap<String, String> {
     }
     settings
 }
+
+/// What WAL-G says when the newest backup ends past the current WAL position.
+const DELTA_BASE_AHEAD: &str = "greater than current LSN";
 
 /// A repository reached from outside any instance, by `vk-agent host`.
 pub struct Repository {

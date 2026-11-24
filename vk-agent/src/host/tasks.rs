@@ -193,8 +193,16 @@ impl LocalApi {
             Some(target) => target.to_string(),
             None => self.best_standby().await?,
         };
-        self.post("/api/switchover", json!({ "target_node_id": target }))
-            .await?;
+        // The cluster may get there on its own between the check and this,
+        // such as through a failover. The primary it ends with is what counts.
+        if let Err(e) = self
+            .post("/api/switchover", json!({ "target_node_id": target }))
+            .await
+        {
+            if self.primary().await.ok().flatten().as_deref() != Some(target.as_str()) {
+                return Err(e);
+            }
+        }
         let deadline = Instant::now() + SWITCHOVER_TIMEOUT;
         loop {
             if self.primary().await.ok().flatten().as_deref() == Some(target.as_str()) {

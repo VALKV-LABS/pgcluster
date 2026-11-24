@@ -80,6 +80,13 @@ impl BackupScheduler {
             }
 
             let topology = self.topology_rx.current();
+            // With no primary yet, as while a new cluster starts, nothing can
+            // be backed up. That is no backup failure: it would mark a new
+            // database degraded, and the cluster reports a missing primary
+            // itself.
+            if select_source(&topology, false).is_none() {
+                continue;
+            }
             // A failure, such as one while there was no primary, is retried
             // until a backup succeeds, rather than waiting for the next one due.
             let failing = self.runtime.last_backup_failure().is_some();

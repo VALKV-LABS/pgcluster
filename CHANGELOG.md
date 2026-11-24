@@ -45,6 +45,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Breaking:** the agent API's `Instance` gains `address`, `backup` and `tasks`, and `bootstrap` can be `seed` or `restore`.
 
 ### Fixed
+- A switchover task failed when the cluster reached the target on its own between the task's check and its request, with `target is already the primary`. The task now succeeds when the target ends up primary.
+- After a failover that dropped the old primary's last commits, as async replication can, every backup failed, because the newest one ended past the new timeline's position and WAL-G cannot build a delta on it. The agent now takes a full backup instead.
+- The backup scheduler counted a backup it could not start, before a new cluster had a primary, as a failure, which marked a new database `degraded` until a retry a minute later. It now waits for a primary.
 - A node whose data came from another, through `pg_rewind` after a partition or `pg_basebackup`, kept that node's `archive_command`, which names a file it does not have, so it archived nothing once it became primary. A replacement seeded from backup then replayed the old primary's diverged WAL and never streamed. The agent now reports the backup settings applied only while Postgres archives through this node's own config, so the leader configures it again.
 - A leader cut off by a partition could report once more after it healed, and overwrite what the current leader had said. Reports carry the leader's Raft term, and an older one is ignored.
 - A statement prepared on one client connection could fail with `prepared statement does not exist`, or `already exists`, once other clients had used the same pooled backend.
