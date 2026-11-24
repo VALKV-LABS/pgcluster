@@ -229,6 +229,25 @@ impl ConnectionPool {
         }
     }
 
+    /// Close a connection rather than return it, and free its place in the
+    /// pool. For one a client left mid-transaction, which must not be reused.
+    pub fn discard(
+        &self,
+        database: &str,
+        user: &str,
+        backend_addr: &str,
+        node_id: &str,
+        conn: Arc<BackendConnection>,
+    ) {
+        let key = PoolKey::new(database, user, node_id, backend_addr);
+        if let Some(bucket) = self.pools.get(&key.string_key()) {
+            bucket.decrement();
+            bucket.released.notify_one();
+        }
+        // The last reference closes the socket.
+        drop(conn);
+    }
+
     /// Donate a pre-authenticated connection to the pool.
     ///
     /// Use this after completing startup+auth on a fresh TCP connection so the

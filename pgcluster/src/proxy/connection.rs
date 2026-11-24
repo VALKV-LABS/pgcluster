@@ -220,6 +220,9 @@ impl ProxyConnection {
         let mut current: Option<(Arc<BackendConnection>, String, String)> = None;
         let mut statements = ClientStatements::new(pool.max_prepared_statements());
 
+        // Every way out of the loop, an error included, ends below, so a backend
+        // still held is never left counted in the pool or handed to another client.
+        let outcome: Result<()> = async {
         loop {
             // A client is sent away only here, between its messages, so no
             // reply is cut short and the backend goes back to the pool.
@@ -417,13 +420,19 @@ impl ProxyConnection {
                 }
             }
         }
+        Ok(())
+        }
+        .await;
 
-        // Release any remaining backend on disconnect.
+        // A backend is held only inside a transaction, or a pipeline not yet
+        // synced, so one held now may have an open transaction, locks, or a
+        // reply half read. Released, the next client would run inside it, so it
+        // is closed instead, and Postgres rolls back what it held.
         if let Some((c, nid, a)) = current.take() {
-            pool.release(&database, &user, &a, &nid, c).await;
+            pool.discard(&database, &user, &a, &nid, c);
         }
 
-        Ok(())
+        outcome
     }
 }
 
