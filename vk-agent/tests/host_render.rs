@@ -36,6 +36,7 @@ fn instance(allowed_cidrs: &[&str], extensions: &[&str]) -> Instance {
         tasks: vec![],
         replication_mode: "async".into(),
         allowed_cidrs: allowed_cidrs.iter().map(|c| c.to_string()).collect(),
+        shut_out: false,
         extensions: extensions.iter().map(|e| e.to_string()).collect(),
         owner: Owner {
             username: "app_owner".into(),

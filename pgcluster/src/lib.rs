@@ -338,7 +338,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
 
     // Proxy server + health endpoint
     {
-        let allowlist = proxy::allowlist::shared(cfg.proxy.allowed_cidrs.as_deref())?;
+        let allowlist = proxy::allowlist::shared(&cfg.proxy)?;
         proxy::allowlist::spawn_reload(config_path.to_string(), allowlist.clone())?;
         let proxy_cfg = cfg.proxy.clone();
         let proxy_metrics = metrics.clone();

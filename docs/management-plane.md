@@ -159,11 +159,13 @@ DELETE /v1/backup-repositories/{id}
 
 ```
 POST   /v1/databases
-GET    /v1/databases
+GET    /v1/databases?deleted=                   true lists deleted ones still restorable
 GET    /v1/databases/{id}
 PATCH  /v1/databases/{id}                       resources, replication_mode, retention_days, backup
-DELETE /v1/databases/{id}
+DELETE /v1/databases/{id}?final_backup=         false skips the final backup
 
+POST   /v1/databases/{id}/suspend               clients shut out, data kept
+POST   /v1/databases/{id}/resume
 POST   /v1/databases/{id}/restart
 POST   /v1/databases/{id}/upgrade               { version? } a minor release the hosts have
 POST   /v1/databases/{id}/switchover
@@ -210,6 +212,18 @@ POST     /v1/databases/{id}/replicas/{replica_id}/promote
 
 **Status** is one of `provisioning`, `active`, `degraded`, `deleting`, `deleted` or `error`, with a `status_reason`. `degraded` means the database is serving with a problem, such as a node being down, sync having fallen back to async, or backups failing.
 
+**Suspension** is separate from status: `suspended_at` is set while it lasts. Every node's proxy refuses new clients and the host ends the sessions of those connected, while nodes, data and backups stay, and failover and operations go on. An allowlist change made while suspended applies on `resume`. A replica takes no clients, so it cannot be suspended.
+
+**Deletion** shuts clients out at once, so nothing written after the final backup is lost. A database with backups that has opened to clients then takes that final backup before its nodes go, unless `final_backup=false`. Its backups, the final one included, stay restorable into a new database for `[lifecycle] deleted_backup_retention_days`, 7 by default. `GET /v1/databases?deleted=true` lists such databases with `purge_after`, and their `backups`, `restore-window` and `restore` routes keep working. Then a host is chosen to remove them from the repository with `wal-g delete everything`. The purge waits while a restore from them is under way, and a failed purge is tried again an hour later, on whichever host is online then. A delete that fails, such as on a failed final backup, leaves the database in `error`, and can be asked again.
+
+### Usage
+
+```
+GET /v1/usage?from=&to=&database_id=&workspace=
+```
+
+For each database with node time in the period, or backups held now: `node_hours`, `vcpu_hours`, `memory_gb_hours`, `storage_gb_hours` and `storage_gb_months` at the resources each node had, and `backup_bytes`, what the repository holds now. Node time is recorded by triggers in the metadata database as nodes are added, resized and removed, so no code path can skip it. A replica has `"kind": "replica"`, to bill apart. Nothing before the upgrade that added this is counted.
+
 ### Operations and events
 
 ```
@@ -221,7 +235,7 @@ GET /v1/admin-ca                                what to trust, and how far a rot
 POST /v1/admin-ca/rotate
 ```
 
-The event feed reports state changes such as `node_offline`, `failover_completed`, `backup_failed` and `replacement_needed`. It lets tooling react without polling every database. For example, a provisioning tool can respond to `replacement_needed` by bringing up a new host.
+The event feed reports state changes such as `node_offline`, `failover_completed`, `backup_failed`, `replacement_needed`, `database_suspended`, `database_resumed`, `backups_purged` and `backup_purge_failed`. It lets tooling react without polling every database. For example, a provisioning tool can respond to `replacement_needed` by bringing up a new host.
 
 ## 7. Agent API
 
@@ -343,7 +357,7 @@ Every database has point-in-time restore unless it was created without backups.
 
 The coordinator talks to `vk-agent` through backup RPCs that name no tool, and the API and topology carry nothing specific to WAL-G, so another engine can replace it.
 
-Restore always creates a new database, so the source stays up and a failed restore harms nothing. `restore-window` returns the earliest and latest restorable times: from the end of the oldest backup to the last moment every commit is known to be in the archive. Deleting a database discards the key that decrypts its backups. A database without backups archives no WAL: `archive_command` discards each segment, so WAL does not pile up, and turning backups on replaces it with no restart.
+Restore always creates a new database, so the source stays up and a failed restore harms nothing. `restore-window` returns the earliest and latest restorable times: from the end of the oldest backup to the last moment every commit is known to be in the archive. Deleting a database keeps the key that decrypts its backups until they are purged, then discards it with them. A database without backups archives no WAL: `archive_command` discards each segment, so WAL does not pile up, and turning backups on replaces it with no restart.
 
 Scheduling stays on each cluster's Raft leader, so backups continue during a management-plane outage.
 

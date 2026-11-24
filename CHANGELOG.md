@@ -5,6 +5,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Added
+- `POST /v1/databases/{id}/suspend` and `resume`, and `pgcluster database suspend` and `resume`. A suspension shuts clients out and ends their sessions, while nodes, data and backups stay.
+- A deleted database's backups, with a final one taken at delete, stay restorable into a new database for `[lifecycle] deleted_backup_retention_days`, 7 by default, then a host purges them from the repository. `GET /v1/databases?deleted=true` and `pgcluster database list --deleted` list such databases.
+- `GET /v1/usage` and `pgcluster database usage`: node, vCPU, memory and storage hours per database over a period, recorded by triggers as nodes are added, resized and removed, and the backup bytes held now.
 - A database can opt out of backups with `"backup": {"enabled": false}` or `--no-backup`: no repository, no first backup before access, no WAL archive and no restore window. `PATCH` with a backup policy, or `pgcluster database enable-backups`, turns them on later with no restart. The console does both.
 - SIGHUP reads `pgcluster`'s whole `[backup]` section, so one added later starts backups and archiving.
 - Named prepared statements work through the proxy across transactions and pooled backends. The proxy prepares a statement again on a backend that lacks it, and `[proxy.pool] max_prepared_statements` caps how many each backend keeps.
@@ -29,6 +32,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `postgres_config_file` runs Postgres from a config outside the data directory.
 
 ### Changed
+- **Breaking:** `DELETE /v1/databases/{id}` shuts clients out at once, and a database with backups that has opened to clients takes a final backup before its nodes go. `?final_backup=false`, or `--no-final-backup`, skips it. A deleted database's backup key is kept until its backups are purged.
+- A suspension or a delete sends connected clients away, through the agent API's new `Instance.shut_out`: the host sets the proxy's new `[proxy] drop_refused_clients`, which drops them between their messages, and ends their backends in Postgres. An allowlist change, even to empty, still refuses only new clients.
+- The agent API's desired state gains `repository_purges`, and `POST /agent/v1/repository-purges/{id}` reports one. The backup task's output gains `completed_at` and `size_bytes`.
 - **Breaking:** the agent API's `Instance.backup` may be `null`, and the admin API's `Database.backup` is `null` for a database without backups. Older hosts cannot run such a database.
 - The leader seeds an empty node, such as a replacement, from the latest backup when one exists, and from the primary only when there is none or the restore fails. This spares the primary a base backup.
 - **Breaking:** the agent API's `Instance` gains `role` and `replicas`, and its secrets may carry a proxy certificate. Reports gain `postgres_versions` and `server_version`. Older hosts ignore what they do not know, but cannot run replicas.
@@ -38,6 +44,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Breaking:** the agent API's `Instance` gains `address`, `backup` and `tasks`, and `bootstrap` can be `seed` or `restore`.
 
 ### Fixed
+- A node whose data came from another, through `pg_rewind` after a partition or `pg_basebackup`, kept that node's `archive_command`, which names a file it does not have, so it archived nothing once it became primary. A replacement seeded from backup then replayed the old primary's diverged WAL and never streamed. The agent now reports the backup settings applied only while Postgres archives through this node's own config, so the leader configures it again.
+- A leader cut off by a partition could report once more after it healed, and overwrite what the current leader had said. Reports carry the leader's Raft term, and an older one is ignored.
 - A statement prepared on one client connection could fail with `prepared statement does not exist`, or `already exists`, once other clients had used the same pooled backend.
 - `walg.json` and `.pgpass` are created owner-only, where before they were briefly readable by others until a `chmod`.
 - An API-triggered failover read the replication password from the environment only, ignoring `[cluster] secrets_file`.

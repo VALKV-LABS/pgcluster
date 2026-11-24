@@ -26,6 +26,25 @@ pub struct AdminConfig {
     /// How much of each host is handed out, and which ports.
     #[serde(default)]
     pub scheduler: crate::scheduler::SchedulerConfig,
+    /// What happens to a database after it is deleted.
+    #[serde(default)]
+    pub lifecycle: LifecycleConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LifecycleConfig {
+    /// Days a deleted database's backups, its final one included, stay
+    /// restorable into a new database before they are purged.
+    pub deleted_backup_retention_days: u32,
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        Self {
+            deleted_backup_retention_days: 7,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -183,6 +202,9 @@ impl AdminConfig {
             anyhow::bail!("[tls] server_names must contain at least one name");
         }
         self.scheduler.validate()?;
+        if self.lifecycle.deleted_backup_retention_days > 3650 {
+            anyhow::bail!("[lifecycle] deleted_backup_retention_days must be at most 3650");
+        }
         for host in &self.bootstrap_hosts {
             if !is_sha256(&host.token_sha256) {
                 anyhow::bail!(

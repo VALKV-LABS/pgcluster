@@ -182,6 +182,33 @@ paths:
           description: Recorded.
         "401":
           $ref: "#/components/responses/Error"
+  /agent/v1/repository-purges/{id}:
+    post:
+      operationId: reportRepositoryPurge
+      summary: Say whether this host removed a deleted database's backups
+      description: |
+        `id` is the deleted database's. Without `error`, its backups and WAL
+        are gone and it can no longer be restored. With one, another host
+        tries again later. A report from a host not chosen for the purge, or
+        after it finished, changes nothing.
+      tags: [state]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RepositoryCheckResult"
+      responses:
+        "204":
+          description: Recorded.
+        "401":
+          $ref: "#/components/responses/Error"
   /agent/v1/cluster:
     post:
       operationId: reportCluster
@@ -446,6 +473,17 @@ components:
           type: string
         target:
           $ref: "#/components/schemas/BackupTarget"
+    RepositoryPurge:
+      type: object
+      required: [database_id, target]
+      description: |
+        Remove every backup and WAL segment under `target`, with
+        `wal-g delete everything FORCE`.
+      properties:
+        database_id:
+          type: string
+        target:
+          $ref: "#/components/schemas/BackupTarget"
     RepositoryCheckResult:
       type: object
       properties:
@@ -597,6 +635,14 @@ components:
           items:
             type: string
           description: Empty means no access.
+        shut_out:
+          type: boolean
+          default: false
+          description: |
+            Set while the database is suspended or being deleted. With an
+            empty allowlist, the host also ends the sessions of connected
+            clients, except the system's own roles. An empty allowlist alone
+            refuses only new clients.
         extensions:
           type: array
           items:
@@ -622,6 +668,11 @@ components:
           description: Repositories this host should prove it can write to.
           items:
             $ref: "#/components/schemas/RepositoryCheck"
+        repository_purges:
+          type: array
+          description: Deleted databases past retention whose backups this host should remove.
+          items:
+            $ref: "#/components/schemas/RepositoryPurge"
         admin_ca:
           description: Set during a rotation of the admin CA.
           oneOf:

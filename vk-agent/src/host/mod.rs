@@ -28,7 +28,10 @@ use anyhow::{Context, Result};
 use client::{AdminClient, Poll};
 use config::HostConfig;
 use instance::{read_applied, InstanceManager, Progress, WalSamples};
-use model::{DesiredState, Instance, InstanceReport, Report, RepositoryCheck, Task, TaskResult};
+use model::{
+    DesiredState, Instance, InstanceReport, Report, RepositoryCheck, RepositoryPurge, Task,
+    TaskResult,
+};
 use render::Layout;
 use runner::{RunAs, Runner};
 
@@ -383,6 +386,39 @@ impl Worker {
     }
 }
 
+impl Worker {
+    /// Remove a deleted database's backups and WAL from its repository.
+    async fn purge_repository(&self, purge: &RepositoryPurge) {
+        let dir = Path::new(&self.config.state_dir);
+        let result = async {
+            purge.target.validate()?;
+            let user = self.run_as.map(|u| (u.uid.as_raw(), u.gid.as_raw()));
+            let repository = crate::walg::Repository::create(
+                &self.config.walg_path,
+                dir.join(format!("repository-purge-{}.json", purge.database_id)),
+                &purge.target,
+                user,
+            )
+            .await?;
+            let outcome = repository.purge().await;
+            std::fs::remove_file(&repository.config_path).ok();
+            outcome
+        }
+        .await;
+        let error = result.err().map(|e| format!("{e:#}"));
+        if let Err(e) = self
+            .client
+            .repository_purge(&purge.database_id, error.as_deref())
+            .await
+        {
+            tracing::warn!(
+                err = format!("{e:#}"),
+                "could not report a repository purge"
+            );
+        }
+    }
+}
+
 /// Run tasks as they appear, each on its own, so a long one holds up nothing.
 fn spawn_tasks(worker: Worker, desired: SharedDesired) {
     tokio::spawn(async move {
@@ -400,6 +436,16 @@ fn spawn_tasks(worker: Worker, desired: SharedDesired) {
                     tokio::spawn(async move {
                         worker.check_repository(&check).await;
                         running.lock().expect("task lock").remove(&check.id);
+                    });
+                }
+            }
+            for purge in state.repository_purges {
+                let key = format!("purge-{}", purge.database_id);
+                if claim(&key) {
+                    let (worker, running) = (worker.clone(), running.clone());
+                    tokio::spawn(async move {
+                        worker.purge_repository(&purge).await;
+                        running.lock().expect("task lock").remove(&key);
                     });
                 }
             }

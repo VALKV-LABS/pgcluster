@@ -7,6 +7,7 @@
 //!   3. SCRAM with the client, then logging in to backends as that client
 //!   4. Per-statement routing in a message loop
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -14,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::{
+    allowlist::SharedAllowlist,
     auth::AuthQuery,
     backend::{BackendConnection, BackendStream},
     limits::LoginGuard,
@@ -29,8 +31,19 @@ use super::{
     ssl::{handle_ssl_owned, MaybeTlsStream},
 };
 
+const EVICTED_MESSAGE: &str = "the database no longer accepts connections from this address";
+
 const NO_QUORUM_MESSAGE: &str =
     "proxy lost contact with the cluster majority; reconnect to another node";
+
+/// Who the client is, as the proxy admits it.
+pub struct ClientPolicy {
+    /// Refuse a client that does not negotiate TLS.
+    pub require_tls: bool,
+    /// Checked again at each reload, to send the client away.
+    pub allowlist: SharedAllowlist,
+    pub peer: IpAddr,
+}
 
 // ── ProxyConnection ───────────────────────────────────────────────────────────
 
@@ -69,9 +82,14 @@ impl ProxyConnection {
         pool: Arc<ConnectionPool>,
         tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
         auth: Arc<AuthQuery>,
-        require_tls: bool,
+        policy: ClientPolicy,
         mut pending: LoginGuard,
     ) -> Result<()> {
+        let ClientPolicy {
+            require_tls,
+            allowlist,
+            peer,
+        } = policy;
         // ── 1. SSL negotiation ────────────────────────────────────────────
         let tls_ref = tls.as_deref();
         let mut client = handle_ssl_owned(stream, tls_ref).await?;
@@ -203,7 +221,19 @@ impl ProxyConnection {
         let mut statements = ClientStatements::new(pool.max_prepared_statements());
 
         loop {
-            let (msg, raw) = match read_frontend_frame(&mut client).await {
+            // A client is sent away only here, between its messages, so no
+            // reply is cut short and the backend goes back to the pool.
+            let frame = tokio::select! {
+                frame = read_frontend_frame(&mut client) => frame,
+                () = super::allowlist::evicted(&allowlist, peer) => {
+                    tracing::debug!(%peer, "client sent away: allowed_cidrs no longer accepts it");
+                    write_error_response(&mut client, "FATAL", "57P01", EVICTED_MESSAGE)
+                        .await
+                        .ok();
+                    break;
+                }
+            };
+            let (msg, raw) = match frame {
                 Ok(frame) => frame,
                 Err(e) => {
                     tracing::debug!("client disconnected: {e}");

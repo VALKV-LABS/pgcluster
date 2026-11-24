@@ -5,6 +5,7 @@ pub mod backups;
 pub mod databases;
 pub mod hosts;
 pub mod replicas;
+pub mod usage;
 
 use axum::async_trait;
 use axum::body::Body;
@@ -56,6 +57,9 @@ pub fn router(state: AdminState) -> Router {
                 .delete(databases::delete),
         )
         .route("/v1/databases/:id/restart", post(databases::restart))
+        .route("/v1/databases/:id/suspend", post(databases::suspend))
+        .route("/v1/databases/:id/resume", post(databases::resume))
+        .route("/v1/usage", get(usage::usage))
         .route("/v1/databases/:id/upgrade", post(databases::upgrade))
         .route("/v1/databases/:id/switchover", post(databases::switchover))
         .route("/v1/databases/:id/rotate-ca", post(databases::rotate_ca))

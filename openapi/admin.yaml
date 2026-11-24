@@ -28,6 +28,8 @@ tags:
     description: External standbys in another region.
   - name: operations
     description: Long-running changes and the event feed.
+  - name: usage
+    description: What each database used, for billing by a layer above.
   - name: health
     description: Liveness.
 security:
@@ -279,6 +281,15 @@ paths:
       parameters:
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/PageToken"
+        - name: deleted
+          in: query
+          description: |
+            `true` lists deleted databases whose backups are still kept, with
+            `purge_after`, instead of live ones. Each can be restored into a
+            new database until then.
+          schema:
+            type: boolean
+            default: false
       responses:
         "200":
           description: The result.
@@ -340,8 +351,25 @@ paths:
     delete:
       operationId: deleteDatabase
       summary: "Delete a database and its data"
+      description: |
+        Clients are shut out at once and their sessions ended. A database with
+        backups that has opened to clients then takes a final backup, which
+        holds every commit, before its nodes go. Its backups stay restorable
+        into a new database for `[lifecycle] deleted_backup_retention_days`,
+        7 by default, then a host purges them from the repository. A delete
+        that fails, such as on a failed final backup, leaves the database in
+        `error`, and can be asked again, with `final_backup=false` if need be.
       tags: [databases]
       x-stage: 1
+      parameters:
+        - name: final_backup
+          in: query
+          description: |
+            Left out, a final backup is taken when the database has backups
+            and has opened to clients. `false` skips it. `true` is refused
+            with `409` for a database that cannot take one.
+          schema:
+            type: boolean
       responses:
         "202":
           description: Accepted. The operation tracks the change.
@@ -354,6 +382,108 @@ paths:
         "404":
           $ref: "#/components/responses/Error"
         "409":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/suspend:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: suspendDatabase
+      summary: "Shut clients out, keeping nodes, data and backups"
+      description: |
+        Every node's proxy refuses new clients, and the sessions of those
+        connected are ended. The database keeps running: backups, failover and
+        operations go on, and allowlist changes are kept for the resume. Not
+        for a replica, which takes no clients.
+      tags: [databases]
+      x-stage: 5
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/databases/{id}/resume:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: resumeDatabase
+      summary: "Let clients back in after a suspension"
+      tags: [databases]
+      x-stage: 5
+      responses:
+        "202":
+          description: Accepted. The operation tracks the change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+  /v1/usage:
+    get:
+      operationId: getUsage
+      summary: "What each database used over a period"
+      description: |
+        Node time is recorded as nodes are added, resized and removed, so a
+        three-node database running for an hour is three node-hours. Backup
+        bytes are what the repository holds now, so a deleted database is
+        counted for its kept backups until they are purged. Databases with
+        neither in the period are left out. Use before this API had it
+        counts from the upgrade.
+      tags: [usage]
+      x-stage: 5
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: Left out, or later than now, the period runs to now.
+          schema:
+            type: string
+            format: date-time
+        - name: database_id
+          in: query
+          schema:
+            type: string
+        - name: workspace
+          in: query
+          schema:
+            type: string
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+      responses:
+        "200":
+          description: The result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Usage"
+        "401":
+          $ref: "#/components/responses/Error"
+        "422":
           $ref: "#/components/responses/Error"
   /v1/databases/{id}/restart:
     parameters:
@@ -1444,6 +1574,17 @@ components:
           type: string
           nullable: true
           description: The database this one is a cross-region replica of.
+        suspended_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set while a suspension keeps clients out.
+        purge_after:
+          type: string
+          format: date-time
+          description: |
+            Only on a deleted database whose backups are kept: when they are
+            purged. Until then it can be restored into a new database.
         created_at:
           type: string
           format: date-time
@@ -1580,6 +1721,8 @@ components:
             - create_replica
             - promote_replica
             - enable_backup
+            - suspend
+            - resume
         status:
           type: string
           enum: [pending, running, succeeded, failed]
@@ -1796,6 +1939,66 @@ components:
         next_page_token:
           type: string
           nullable: true
+    Usage:
+      type: object
+      required: [from, to, items]
+      properties:
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/DatabaseUsage"
+        next_page_token:
+          type: string
+          nullable: true
+    DatabaseUsage:
+      type: object
+      required:
+        - database_id
+        - name
+        - kind
+        - status
+        - node_hours
+        - vcpu_hours
+        - memory_gb_hours
+        - storage_gb_hours
+        - storage_gb_months
+        - backup_bytes
+      properties:
+        database_id:
+          type: string
+        name:
+          type: string
+        workspace:
+          type: string
+          nullable: true
+        kind:
+          type: string
+          enum: [database, replica]
+          description: A cross-region replica is a database of its own, and bills apart.
+        status:
+          type: string
+        node_hours:
+          type: number
+        vcpu_hours:
+          type: number
+        memory_gb_hours:
+          type: number
+        storage_gb_hours:
+          type: number
+          description: Allocated storage, not what the data takes.
+        storage_gb_months:
+          type: number
+          description: "`storage_gb_hours` over 730."
+        backup_bytes:
+          type: integer
+          format: int64
+          description: The backups held now, as WAL-G sizes them. WAL is not counted.
     Event:
       type: object
       required: [cursor, type, at]
@@ -1804,7 +2007,10 @@ components:
           type: string
         type:
           type: string
-          description: For example `node_offline`, `failover_completed`, `backup_failed` or `replacement_needed`.
+          description: |
+            For example `node_offline`, `failover_completed`, `backup_failed`,
+            `replacement_needed`, `database_suspended`, `database_resumed`,
+            `backups_purged` or `backup_purge_failed`.
         database_id:
           type: string
           nullable: true

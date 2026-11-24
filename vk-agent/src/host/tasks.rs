@@ -16,7 +16,7 @@ use sqlx::Connection;
 
 use super::instance::{quote_literal, InstanceManager};
 use super::model::{raft_id, BackupReport, ClusterReport, Instance, Task};
-use super::render::{self, REPLICATION_USER, SUPERUSER};
+use super::render::{self, AUTH_USER, REPLICATION_USER, SUPERUSER};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Adding a learner returns once it has caught up, which is the slow part.
@@ -28,7 +28,6 @@ const BACKUP_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 const SEED_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 /// Close enough to the primary to take over from a node.
 const CAUGHT_UP_BYTES: u64 = 16 * 1024 * 1024;
-const AUTH_USER: &str = "pgcluster_auth";
 
 /// This instance's own `pgcluster`, on loopback.
 pub struct LocalApi {
@@ -232,7 +231,13 @@ impl LocalApi {
         loop {
             let backups: Backups = self.get("/api/backups").await?;
             if let Some(found) = backups.backups.iter().find(|b| b.label == label) {
-                return Ok(json!({ "backup_id": found.backup_id }));
+                // A delete records its final backup from this, since no
+                // report follows once the nodes are gone.
+                return Ok(json!({
+                    "backup_id": found.backup_id,
+                    "completed_at": found.completed_at,
+                    "size_bytes": found.size_bytes,
+                }));
             }
             let status: BackupStatus = self.get("/api/backups/status").await?;
             if status.failed_label.as_deref() == Some(label) {
