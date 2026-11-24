@@ -1660,26 +1660,32 @@ async fn e2e_proxy_authenticates_clients_and_uses_tls_to_postgres() {
     );
 
     // pgcluster-3 has read routing on, so it logs in to a replica for the client.
+    // Until it has heard how far the replicas are behind, it rightly sends
+    // reads to the primary, so a fresh stack may need a moment.
     let dsn = "host=localhost port=25432 user=app password=app-secret dbname=postgres";
-    let (pg, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
-        .await
-        .expect("connect to the routing proxy");
-    tokio::spawn(connection);
     let value = |rows: &[tokio_postgres::SimpleQueryMessage]| {
         rows.iter().find_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
             _ => None,
         })
     };
-    let rows = pg
-        .simple_query("SELECT pg_is_in_recovery()")
-        .await
-        .expect("read through the routing proxy");
-    assert_eq!(
-        value(&rows).as_deref(),
-        Some("t"),
-        "reads must reach a replica"
-    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let pg = loop {
+        let (pg, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to the routing proxy");
+        tokio::spawn(connection);
+        let rows = pg
+            .simple_query("SELECT pg_is_in_recovery()")
+            .await
+            .expect("read through the routing proxy");
+        if value(&rows).as_deref() == Some("t") {
+            break pg;
+        }
+        assert!(Instant::now() < deadline, "reads must reach a replica");
+        drop(pg);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
     let rows = pg
         .simple_query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
         .await
