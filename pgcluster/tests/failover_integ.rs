@@ -7,12 +7,14 @@ use pgcluster::agent_clients::agent_proto::{
     BackupDeleteRequest, BackupDeleteResponse, BackupPushRequest, BackupPushResponse,
     BackupVerifyRequest, BackupVerifyResponse, ConfigureBackupsRequest, DemoteRequest,
     DemoteResponse, DetachRequest, HeartbeatRequest, HeartbeatResponse, PromoteRequest,
-    PromoteResponse, ReloadRequest, ReloadResponse, RestoreRequest, SeedRequest, SeedResponse,
-    SetParametersRequest, SetParametersResponse, SetProxyAuthRequest, StatusRequest,
+    PromoteResponse, ReloadRequest, ReloadResponse, ReplicaStatus, RestoreRequest, SeedRequest,
+    SeedResponse, SetParametersRequest, SetParametersResponse, SetProxyAuthRequest, StatusRequest,
     StatusResponse, StopRequest, StopResponse,
 };
 use pgcluster::agent_clients::AgentClientPool;
+use pgcluster::config::ReplicationConfig;
 use pgcluster::failover::candidate::pick_live_candidate;
+use pgcluster::failover::seed::SeedPlan;
 use pgcluster::raft::topology::{ClusterTopology, NodeConfig, NodeRole, ReplicationMode};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -642,4 +644,75 @@ async fn failover_picks_most_caught_up_replica() {
         .await
         .ok();
     eprintln!("==> Test complete");
+}
+
+// ── Seeding from a backup, against fake agents ───────────────────────────────
+
+/// A cluster whose primary `pg1` and new node `pg2` answer at these agents.
+fn seeding(primary_agent: &str, node_agent: &str) -> ClusterTopology {
+    let mut t = ClusterTopology::default();
+    let mut primary = node("pg1", 100);
+    primary.agent_addr = primary_agent.into();
+    let mut new = node("pg2", 90);
+    new.agent_addr = node_agent.into();
+    t.node_configs.insert("pg1".into(), primary);
+    t.node_configs.insert("pg2".into(), new);
+    t.node_roles.insert("pg1".into(), NodeRole::Primary);
+    t.node_roles.insert("pg2".into(), NodeRole::Replica);
+    t.primary_node_id = "pg1".into();
+    t
+}
+
+fn seed_plan(t: &ClusterTopology) -> SeedPlan {
+    let replication: ReplicationConfig =
+        toml::from_str("replication_user = \"replicator\"").unwrap();
+    SeedPlan::new(t, "pg2", &replication).unwrap()
+}
+
+#[tokio::test]
+async fn a_restored_node_the_primary_lists_as_streaming_is_seeded() {
+    let primary = fake_agent(StatusResponse {
+        replicas: vec![ReplicaStatus {
+            application_name: "pg2".into(),
+            state: "streaming".into(),
+            ..Default::default()
+        }],
+        postgres_running: true,
+        ..Default::default()
+    })
+    .await;
+    let node = fake_agent(standby_at(100)).await;
+    let plan = seed_plan(&seeding(&primary, &node));
+    let streams = plan
+        .wait_streaming(
+            &AgentClientPool::new(),
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        )
+        .await;
+    assert!(streams);
+}
+
+/// A node that replayed a diverged timeline past the fork stands still and
+/// never streams, so the monitor seeds it from the primary instead.
+#[tokio::test]
+async fn a_restored_node_whose_replay_stands_still_is_given_up_on() {
+    let primary = fake_agent(StatusResponse {
+        postgres_running: true,
+        ..Default::default()
+    })
+    .await;
+    let node = fake_agent(standby_at(100)).await;
+    let plan = seed_plan(&seeding(&primary, &node));
+    let started = Instant::now();
+    let streams = plan
+        .wait_streaming(
+            &AgentClientPool::new(),
+            Duration::from_millis(300),
+            Duration::from_millis(20),
+        )
+        .await;
+    assert!(!streams);
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
