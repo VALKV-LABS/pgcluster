@@ -66,6 +66,8 @@ health_listen_addr = "0.0.0.0:8008"
 # Client addresses to accept. An empty list refuses everyone, and leaving it out
 # accepts everyone. SIGHUP reloads it.
 # allowed_cidrs = ["198.51.100.0/24"]
+# At each reload, also send away connected clients the list no longer accepts.
+# drop_refused_clients = false
 # Refuse clients that do not negotiate TLS.
 # require_tls = true
 

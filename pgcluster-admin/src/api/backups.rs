@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::FromRow;
 
-use super::databases::{lock, spec_of};
+use super::databases::{lock, restorable_spec_of};
 use super::{JsonBody, List, Page};
 use crate::error::ApiError;
 use crate::model::{
@@ -160,14 +160,16 @@ pub async fn delete_repository(
     }
     let users: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM databases \
-         WHERE spec->'backup'->>'repository_id' = $1 AND status <> 'deleted'",
+         WHERE spec->'backup'->>'repository_id' = $1 \
+           AND (status <> 'deleted' OR (purge_after IS NOT NULL AND purged_at IS NULL))",
     )
     .bind(&id)
     .fetch_one(&mut *tx)
     .await?;
     if users > 0 {
         return Err(ApiError::conflict(format!(
-            "{users} database(s) still use this repository"
+            "{users} database(s) still use this repository, deleted ones whose \
+             backups are kept included"
         )));
     }
     sqlx::query("DELETE FROM backup_repositories WHERE id = $1")
@@ -235,7 +237,7 @@ pub async fn list_backups(
     Path(id): Path<String>,
     page: Page,
 ) -> Result<Json<List<Backup>>, ApiError> {
-    spec_of(&state, &id).await?;
+    restorable_spec_of(&state, &id).await?;
     let rows = sqlx::query_as::<_, Backup>(
         "SELECT id, label, completed_at, size_bytes FROM backups \
          WHERE database_id = $1 AND id > $2 ORDER BY id LIMIT $3",
@@ -261,7 +263,8 @@ pub struct RestoreWindow {
 async fn window(state: &AdminState, id: &str) -> Result<Option<RestoreWindow>, ApiError> {
     let row: (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
         "SELECT (SELECT min(completed_at) FROM backups WHERE database_id = $1), \
-                (SELECT max(archived_until) FROM nodes WHERE database_id = $1)",
+                coalesce((SELECT max(archived_until) FROM nodes WHERE database_id = $1), \
+                         (SELECT archived_until FROM databases WHERE id = $1))",
     )
     .bind(id)
     .fetch_one(&state.pool)
@@ -283,7 +286,7 @@ pub async fn restore_window(
     State(state): State<AdminState>,
     Path(id): Path<String>,
 ) -> Result<Json<RestoreWindow>, ApiError> {
-    let (_, spec) = spec_of(&state, &id).await?;
+    let (_, spec) = restorable_spec_of(&state, &id).await?;
     if spec.backup.is_none() {
         return Err(no_backups());
     }
@@ -303,14 +306,15 @@ pub struct RestoreRequest {
 }
 
 /// Restore into a new database. The source stays as it is, so a failed restore
-/// harms nothing.
+/// harms nothing. A deleted source can be restored until its backups are
+/// purged.
 pub async fn restore(
     State(state): State<AdminState>,
     Path(id): Path<String>,
     JsonBody(request): JsonBody<RestoreRequest>,
 ) -> Result<(StatusCode, Json<Operation>), ApiError> {
     check_database_name(&request.name)?;
-    let (source_name, source): (String, DatabaseSpec) = spec_of(&state, &id).await?;
+    let (source_name, source): (String, DatabaseSpec) = restorable_spec_of(&state, &id).await?;
     if source.backup.is_none() {
         return Err(no_backups());
     }

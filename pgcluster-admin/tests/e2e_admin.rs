@@ -217,6 +217,11 @@ async fn endpoint(client: &reqwest::Client, id: &str) -> Endpoint {
     }
 }
 
+/// As `endpoint`, for a test whose own `endpoint` hides it.
+async fn endpoint_of(client: &reqwest::Client, id: &str) -> Endpoint {
+    endpoint(client, id).await
+}
+
 impl Endpoint {
     fn options(&self, password: &str) -> PgConnectOptions {
         PgConnectOptions::new()
@@ -429,6 +434,35 @@ async fn e2e_admin_one_node_database() {
     let client = admin_client();
     wait_online(&client, HOST).await;
 
+    // A suspension sends connected clients away and refuses new ones, while
+    // the database keeps running, and a resume lets them back in.
+    let mut owner = endpoint.wait_connectable(&password).await;
+    cli(HOST, &format!("database suspend {id} --wait"));
+    wait_for(
+        "the connected client to be sent away",
+        Duration::from_secs(20),
+        async || {
+            sqlx::query("SELECT 1")
+                .persistent(false)
+                .execute(&mut owner)
+                .await
+                .is_err()
+        },
+    )
+    .await;
+    assert!(endpoint.connect(&password).await.is_err());
+    let database = api(&client, "GET", &format!("/v1/databases/{id}"), None).await;
+    assert!(database["suspended_at"].is_string(), "{database}");
+    assert_eq!(database["status"], "active", "{database}");
+    cli(HOST, &format!("database resume {id} --wait"));
+    let mut owner = endpoint.wait_connectable(&password).await;
+    sqlx::query("INSERT INTO t VALUES ('last')")
+        .persistent(false)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    owner.close().await.ok();
+
     // A host cannot go while it runs something, and a delete removes the data.
     let (host_id, _) = host_ids(&client).await;
     let refused = cli_fails(HOST, &format!("host delete {host_id}"));
@@ -437,6 +471,36 @@ async fn e2e_admin_one_node_database() {
     let gone = exec_on(HOST, &format!("test -e {}", instance_dir(id)));
     assert!(!gone.status.success(), "the instance directory should go");
     assert!(endpoint.connect(&password).await.is_err());
+
+    // Its final backup holds the last commit, and restores into a new database.
+    let deleted = cli(HOST, "database list --deleted");
+    assert!(deleted.contains(id), "{deleted}");
+    let window = api(
+        &client,
+        "GET",
+        &format!("/v1/databases/{id}/restore-window"),
+        None,
+    )
+    .await;
+    let latest = window["latest"].as_str().unwrap();
+    let output = cli(
+        HOST,
+        &format!("database restore {id} orders_back --time {latest} --wait"),
+    );
+    let restored_id = output
+        .lines()
+        .find_map(|l| l.strip_prefix("database "))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("no database in\n{output}"));
+    let restored = endpoint_of(&client, &restored_id).await;
+    let mut copy = restored.wait_connectable(&password).await;
+    let rows = scalar(&mut copy, "SELECT string_agg(v, ',' ORDER BY v) FROM t").await;
+    assert_eq!(rows, "kept,last", "the final backup holds every commit");
+    copy.close().await.ok();
+    cli(
+        HOST,
+        &format!("database delete {restored_id} --no-final-backup --wait"),
+    );
 }
 
 /// A database created without backups opens with no repository and archives

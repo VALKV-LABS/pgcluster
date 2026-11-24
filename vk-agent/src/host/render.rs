@@ -34,6 +34,8 @@ const DELTA_STEPS: u32 = 6;
 const BACKUP_KEY_ENV: &str = "PGCLUSTER_BACKUP_KEY";
 
 pub const REPLICATION_USER: &str = "replicator";
+/// The role the proxy reads verifiers through, which `pgcluster` sets up.
+pub const AUTH_USER: &str = "pgcluster_auth";
 pub const SUPERUSER: &str = "postgres";
 
 /// Extensions that must be in `shared_preload_libraries` to install.
@@ -246,6 +248,7 @@ pub fn pgcluster_toml(instance: &Instance, layout: &Layout) -> String {
             "admin_listen_addr": local(instance, PROXY_ADMIN),
             "health_listen_addr": local(instance, PROXY_HEALTH),
             "allowed_cidrs": instance.allowed_cidrs,
+            "drop_refused_clients": instance.shut_out,
             "require_tls": true,
         },
         "tls": tls_section,

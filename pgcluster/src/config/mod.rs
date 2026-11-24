@@ -170,6 +170,12 @@ pub struct ProxyConfig {
     /// everyone, and leaving it out accepts everyone. SIGHUP reloads it.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// At each reload, also send away connected clients `allowed_cidrs` no
+    /// longer accepts, between their messages. Off, as by default, a reload
+    /// refuses only new clients. `vk-agent host` sets it for a suspended or
+    /// deleted database.
+    #[serde(default)]
+    pub drop_refused_clients: bool,
     /// Refuse clients that do not negotiate TLS.
     #[serde(default)]
     pub require_tls: bool,

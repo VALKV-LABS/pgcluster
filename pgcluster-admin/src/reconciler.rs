@@ -93,6 +93,9 @@ impl Reconciler {
                 if let Err(e) = crate::rotation::advance(&self.state).await {
                     tracing::error!(err = format!("{e:#}"), "admin CA rotation failed");
                 }
+                if let Err(e) = crate::lifecycle::advance(&self.state).await {
+                    tracing::error!(err = format!("{e:#}"), "backup purge failed");
+                }
             }
             tokio::time::sleep(self.tick).await;
         }
@@ -194,7 +197,8 @@ impl Reconciler {
             "settle" => Ok(Outcome::Done),
             "retract" => retract(tx, step).await,
             "wait_removed" => wait_removed(tx, step).await,
-            "finalize" => finalize(tx, step).await,
+            "finalize" => finalize(tx, step, &self.state).await,
+            "final_backup" => final_backup(tx, step).await,
             "first_backup" => {
                 if !has_backups(tx, &step.database_id).await? {
                     return Ok(Outcome::Done);
@@ -1117,15 +1121,96 @@ async fn wait_removed(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
     }
 }
 
-async fn finalize(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+/// Back up once more, after every node has shut clients out, so the backup
+/// holds every commit. A delete asked to skip it, or of a database with no
+/// backups, goes straight on.
+async fn final_backup(tx: &mut Tx<'_>, step: &Claimed) -> Result<Outcome> {
+    if step.params["final_backup"].as_bool() != Some(true) {
+        return Ok(Outcome::Done);
+    }
+    match wait_applied(tx, step, None).await? {
+        Outcome::Done => {}
+        waiting => return Ok(waiting),
+    }
+    let label = step.params["label"].clone();
+    let outcome = run_task(tx, step, "backup", "leader", json!({ "label": label })).await?;
+    if matches!(outcome, Outcome::Done) {
+        record_final_backup(tx, step).await?;
+    }
+    Ok(outcome)
+}
+
+/// The leader's reports list backups, but none follow once the nodes go, so
+/// the final one is recorded from what the task returned.
+async fn record_final_backup(tx: &mut Tx<'_>, step: &Claimed) -> Result<()> {
+    let output: Option<sqlx::types::Json<Value>> =
+        sqlx::query_scalar("SELECT output FROM tasks WHERE operation_id = $1 AND kind = 'backup'")
+            .bind(&step.operation_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
+    let Some(output) = output.map(|o| o.0) else {
+        return Ok(());
+    };
+    let (Some(id), Some(completed_at), Some(size_bytes)) = (
+        output["backup_id"].as_str(),
+        output["completed_at"].as_i64(),
+        output["size_bytes"].as_i64(),
+    ) else {
+        // From a host too old to say. Its last report may still list it.
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO backups (database_id, id, label, completed_at, size_bytes) \
+         VALUES ($1, $2, $3, to_timestamp($4), $5) ON CONFLICT DO NOTHING",
+    )
+    .bind(&step.database_id)
+    .bind(id)
+    .bind(step.params["label"].as_str().unwrap_or("final"))
+    .bind(completed_at as f64)
+    .bind(size_bytes)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// A deleted database with backups keeps them, and what restoring from them
+/// needs, for the retention period: its backup key, and how far the archive
+/// reached. Without backups nothing is kept.
+async fn finalize(tx: &mut Tx<'_>, step: &Claimed, state: &AdminState) -> Result<Outcome> {
+    let keeps_backups: bool = sqlx::query_scalar(
+        "SELECT spec->'backup' IS NOT NULL AND spec->'backup' <> 'null'::jsonb \
+                AND spec->'replica_of' IS NULL \
+                AND EXISTS (SELECT 1 FROM backups b WHERE b.database_id = d.id) \
+         FROM databases d WHERE id = $1",
+    )
+    .bind(&step.database_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if keeps_backups {
+        sqlx::query(
+            "UPDATE databases d SET \
+                archived_until = greatest( \
+                    (SELECT max(archived_until) FROM nodes WHERE database_id = d.id), \
+                    (SELECT max(completed_at) FROM backups WHERE database_id = d.id)), \
+                purge_after = now() + make_interval(days => $2) \
+             WHERE id = $1",
+        )
+        .bind(&step.database_id)
+        .bind(state.lifecycle.deleted_backup_retention_days as i32)
+        .execute(&mut **tx)
+        .await?;
+    }
     sqlx::query("DELETE FROM nodes WHERE database_id = $1")
         .bind(&step.database_id)
         .execute(&mut **tx)
         .await?;
-    sqlx::query("UPDATE databases SET secrets = NULL WHERE id = $1")
-        .bind(&step.database_id)
-        .execute(&mut **tx)
-        .await?;
+    if !keeps_backups {
+        sqlx::query("UPDATE databases SET secrets = NULL WHERE id = $1")
+            .bind(&step.database_id)
+            .execute(&mut **tx)
+            .await?;
+    }
     set_status(tx, &step.database_id, "deleted", None).await?;
     Ok(Outcome::Done)
 }

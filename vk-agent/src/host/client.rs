@@ -218,6 +218,22 @@ impl AdminClient {
         Ok(())
     }
 
+    pub async fn repository_purge(&self, database_id: &str, error: Option<&str>) -> Result<()> {
+        self.http()
+            .post(format!(
+                "{}/agent/v1/repository-purges/{database_id}",
+                self.base
+            ))
+            .json(&json!({ "error": error }))
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .context("send a repository purge")?
+            .error_for_status()
+            .context("repository purge refused")?;
+        Ok(())
+    }
+
     pub async fn cluster_report(&self, report: &ClusterReport) -> Result<()> {
         self.http()
             .post(format!("{}/agent/v1/cluster", self.base))

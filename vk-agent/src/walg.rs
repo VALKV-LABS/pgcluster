@@ -409,6 +409,15 @@ impl Repository {
         Ok(())
     }
 
+    /// Remove every backup and WAL segment under this repository's prefix,
+    /// for a deleted database past its retention.
+    pub async fn purge(&self) -> Result<()> {
+        let mut command = self.command();
+        command.args(["delete", "everything", "FORCE", "--confirm"]);
+        self.run(command, "delete everything").await?;
+        Ok(())
+    }
+
     /// Fill `data_dir` from the backup that suits `target_time`.
     pub async fn fetch(&self, data_dir: &Path, target_time: Option<&str>) -> Result<()> {
         let name = match target_time {

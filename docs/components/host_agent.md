@@ -56,6 +56,8 @@ Each instance is two processes: `vk-agent`, which owns Postgres, and `pgcluster`
 | New seeded node | Writes its files and starts its processes with no data. It reports `seeding`, and the host moves on, until the Raft leader has filled it, from the latest backup if there is one, or from the primary |
 | New restored node | Fills the data directory from the source's repository, finishes recovery in a private server, then starts it. See below |
 | `allowed_cidrs` | Rewrites `pgcluster.toml` and sends SIGHUP. Connected clients stay connected |
+| `shut_out`, for a suspended or deleted database | With the empty allowlist, sets `drop_refused_clients`, so the proxy sends connected clients away between their messages, and ends client backends in Postgres, so a long query stops too. The system's own roles stay |
+| `repository_purges` | Runs `wal-g delete everything FORCE` against a deleted database's prefix, and reports the result |
 | Certificates, CAs, passwords, peers | Replaces the files, sends SIGHUP to `vk-agent` and `pgcluster`, and runs `pg_ctl reload`. Nothing restarts, and connected clients stay connected |
 | Extensions with no preload | `CREATE EXTENSION` or `DROP EXTENSION`, as the superuser, so the owner never needs to be one |
 | `pg_tle`, `pg_cron`, memory | Rewrites `postgresql.conf` and restarts a one-node instance. On three nodes, `pgcluster-admin` runs a rolling restart and then a new generation, which installs the extension |

@@ -147,15 +147,51 @@ enum DatabaseCommand {
     /// Create a database, generating the owner's password on this machine
     Create(CreateArgs),
     /// List databases
-    List,
+    List {
+        /// List deleted databases whose backups can still be restored
+        #[arg(long)]
+        deleted: bool,
+    },
     /// Show one database
     Show { id: String },
-    /// Delete a database and its data
+    /// Delete a database. With backups, it takes a final one first, which
+    /// stays restorable for the configured retention
     Delete {
         id: String,
+        /// Skip the final backup, such as for a database too broken to back up
+        #[arg(long)]
+        no_final_backup: bool,
         /// Wait for it to finish
         #[arg(long)]
         wait: bool,
+    },
+    /// Shut clients out and end their sessions, keeping nodes, data and backups
+    Suspend {
+        id: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Let clients back in after a suspension
+    Resume {
+        id: String,
+        #[arg(long)]
+        wait: bool,
+    },
+    /// What each database used over a period: node, vCPU, memory and storage
+    /// hours, and the backups held now
+    Usage {
+        /// Start of the period, in RFC 3339
+        #[arg(long)]
+        from: String,
+        /// End of the period, in RFC 3339. Left out, now
+        #[arg(long)]
+        to: Option<String>,
+        /// Only this database
+        #[arg(long)]
+        database: Option<String>,
+        /// Only databases with this workspace label
+        #[arg(long)]
+        workspace: Option<String>,
     },
     /// Replace the owner's password, generating it on this machine
     RotatePassword {
@@ -615,20 +651,66 @@ async fn create_database(client: &AdminClient, args: CreateArgs) -> Result<()> {
     Ok(())
 }
 
+/// Percent-encode a query value, so a `+` in an RFC 3339 offset survives.
+fn encode_query(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 pub async fn run_database(args: DatabaseArgs) -> Result<()> {
     let client = AdminClient::new(&args.connection)?;
     match args.command {
         DatabaseCommand::Create(create) => create_database(&client, create).await,
-        DatabaseCommand::List => pretty(&client.send("GET", "/v1/databases", None).await?),
+        DatabaseCommand::List { deleted } => {
+            let path = if deleted {
+                "/v1/databases?deleted=true"
+            } else {
+                "/v1/databases"
+            };
+            pretty(&client.send("GET", path, None).await?)
+        }
         DatabaseCommand::Show { id } => pretty(
             &client
                 .send("GET", &format!("/v1/databases/{id}"), None)
                 .await?,
         ),
-        DatabaseCommand::Delete { id, wait } => {
-            let path = format!("/v1/databases/{id}");
+        DatabaseCommand::Delete {
+            id,
+            no_final_backup,
+            wait,
+        } => {
+            let mut path = format!("/v1/databases/{id}");
+            if no_final_backup {
+                path.push_str("?final_backup=false");
+            }
             let operation = client.send("DELETE", &path, None).await?;
             client.finish(&operation, wait).await
+        }
+        DatabaseCommand::Suspend { id, wait } => client.act(&id, "suspend", wait).await,
+        DatabaseCommand::Resume { id, wait } => client.act(&id, "resume", wait).await,
+        DatabaseCommand::Usage {
+            from,
+            to,
+            database,
+            workspace,
+        } => {
+            let mut query = vec![("from", from)];
+            query.extend(to.map(|to| ("to", to)));
+            query.extend(database.map(|id| ("database_id", id)));
+            query.extend(workspace.map(|w| ("workspace", w)));
+            let query: Vec<String> = query
+                .into_iter()
+                .map(|(key, value)| format!("{key}={}", encode_query(&value)))
+                .collect();
+            let path = format!("/v1/usage?{}", query.join("&"));
+            pretty(&client.send("GET", &path, None).await?)
         }
         DatabaseCommand::RotatePassword { id, wait } => {
             let (password, verifier) = generate_password();
@@ -879,6 +961,15 @@ mod tests {
         let (password, verifier) = generate_password();
         assert!(Verifier::parse(&verifier).is_some(), "{verifier}");
         assert!(!verifier.contains(&password));
+    }
+
+    #[test]
+    fn a_query_value_keeps_its_plus_sign() {
+        assert_eq!(
+            encode_query("2026-11-01T00:00:00+05:30"),
+            "2026-11-01T00:00:00%2B05:30"
+        );
+        assert_eq!(encode_query("ops team"), "ops%20team");
     }
 
     #[test]

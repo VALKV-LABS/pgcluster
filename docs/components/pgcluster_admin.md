@@ -146,7 +146,28 @@ A database with backups stays `provisioning`, with an empty allowlist, until its
 
 A database created with `{"enabled": false}` opens without one. It shows `"backup": null`, archives no WAL (its `archive_command` discards each segment, so WAL does not pile up), and answers `409` to `restore-window`, `restore`, `backup` and a change of `retention_days`. `PATCH` with `{"backup": {"repository_id": ..., "retention_days": ...}}`, in a request of its own, turns backups on as an `enable_backup` operation: hosts hand `pgcluster` the policy, which it reads on SIGHUP, archiving starts with no restart, and the first backup opens the restore window. Backups cannot be turned off.
 
-`restore-window` runs from the end of the oldest backup to the last moment every commit is known to be in the WAL archive. `POST .../restore` accepts only times inside that window, and creates a new database with the source's version, owner, extensions and size. The source is not touched. Its backups stay usable while the source exists: deleting a database discards the key that decrypts them.
+`restore-window` runs from the end of the oldest backup to the last moment every commit is known to be in the WAL archive. `POST .../restore` accepts only times inside that window, and creates a new database with the source's version, owner, extensions and size. The source is not touched. A deleted source can be restored until its backups are purged, as [Suspending and Deleting](#suspending-and-deleting) describes.
+
+## Suspending and Deleting
+
+`POST .../suspend` sets `suspended_at` and gives every node an empty allowlist. The proxy refuses new clients, and the host ends the sessions of those connected, except the system's own roles, so the proxy drops them and its pool discards their backends. Nodes, data and backups stay, and failover and operations go on. An allowlist change made while suspended is kept, and `POST .../resume` applies it. Each is an operation that waits for every node, and records a `database_suspended` or `database_resumed` event. A replica takes no clients, so it refuses both.
+
+`DELETE /v1/databases/{id}` shuts clients out the same way at once. A database with backups that has opened to clients then waits for every node to apply that and takes a final backup, labelled `final-` and the operation's first ID characters, before its nodes go. The backup task's output records it, since no cluster report follows once the nodes are gone. `?final_backup=false` skips it. A delete that fails leaves the database in `error`, and can be asked again.
+
+A deleted database with backups keeps its backup key and how far its archive reached, and sets `purge_after` to `[lifecycle] deleted_backup_retention_days` from then, 7 by default:
+
+```toml
+[lifecycle]
+deleted_backup_retention_days = 7
+```
+
+Until then `GET /v1/databases?deleted=true` lists it, its `backups` and `restore-window` still answer, and `POST .../restore` restores it into a new database. Its repository cannot be removed. Then the sweep hands the purge to an online host in the agent API's `repository_purges`, which runs `wal-g delete everything FORCE` and reports to `POST /agent/v1/repository-purges/{id}`. On success the backup rows and the sealed secrets go, with a `backups_purged` event. On failure, a `backup_purge_failed` event, and another try an hour later. A purge waits while a restore from those backups is under way.
+
+## Usage
+
+`GET /v1/usage?from=...&to=...` returns, for each database with node time in the period or backups held now, `node_hours`, `vcpu_hours`, `memory_gb_hours`, `storage_gb_hours`, `storage_gb_months` (over 730 hours) and `backup_bytes`. `database_id` and `workspace` narrow it, and it pages like other lists. A replica has `"kind": "replica"`, to bill apart.
+
+Node time comes from `usage_intervals`, which triggers in the metadata database keep: a node's interval opens when its row is inserted, closes when it is deleted, and a change to a database's resources closes every open interval and opens new ones at the new size in the same instant. So no code path that adds, resizes or removes a node can skip it. Storage is what is allocated, not what the data takes. `backup_bytes` is the backups the repository holds now, as WAL-G sizes them, without WAL. Nodes that existed before the upgrade that added this are counted from the upgrade.
 
 ## Instance Certificates
 

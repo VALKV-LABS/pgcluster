@@ -10,6 +10,7 @@ pub mod ca;
 pub mod config;
 pub mod drain;
 pub mod error;
+pub mod lifecycle;
 pub mod model;
 pub mod operations;
 pub mod reconciler;
@@ -126,6 +127,7 @@ pub async fn run(config_path: &str) -> Result<()> {
 
     let mut state = AdminState::with_keys(pool, ca.clone(), secrets, &config.api.named_keys())?;
     state.scheduler = Arc::new(config.scheduler.clone());
+    state.lifecycle = Arc::new(config.lifecycle.clone());
     let server_cert = ca.issue_server(&config.tls.server_names)?;
 
     let agent_listener = TcpListener::bind(&config.agent_api.listen_addr)

@@ -101,6 +101,7 @@ pgcluster repository list
 pgcluster database create orders --allow 198.51.100.0/24 --extension vector --wait
 pgcluster database create orders --ha --mode sync --wait   # Three nodes, in separate failure domains
 pgcluster database list
+pgcluster database list --deleted                     # Deleted, with backups still restorable
 pgcluster database show <id>
 pgcluster database allow <id> 198.51.100.0/24 203.0.113.4/32 --wait   # Replaces the whole list
 pgcluster database extensions <id> vector pg_trgm --wait              # Replaces the whole list
@@ -126,7 +127,11 @@ pgcluster database replica-delete <id> <replica> --wait
 pgcluster database rotate-password <id> --wait
 pgcluster database rotate-ca <id> --wait
 pgcluster database rotate-passwords <id> --wait
-pgcluster database delete <id> --wait
+pgcluster database suspend <id> --wait              # Clients shut out and sent away, data kept
+pgcluster database resume <id> --wait
+pgcluster database usage --from 2026-11-01T00:00:00Z [--to ...] [--database <id>] [--workspace <label>]
+pgcluster database delete <id> --wait                 # A final backup first, kept for 7 days
+pgcluster database delete <id> --no-final-backup --wait
 
 pgcluster events --after <cursor>
 pgcluster audit-log --key ci                          # Each change, and the key that made it

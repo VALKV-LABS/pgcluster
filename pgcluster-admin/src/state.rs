@@ -36,6 +36,7 @@ pub struct AdminState {
     /// Held for the length of each request to a route open to anyone.
     pub open_routes: Arc<Semaphore>,
     pub scheduler: Arc<crate::scheduler::SchedulerConfig>,
+    pub lifecycle: Arc<crate::config::LifecycleConfig>,
     /// Accepted keys by name. SIGHUP replaces them.
     api_keys: Arc<ArcSwap<Vec<NamedHash>>>,
 }
@@ -88,6 +89,7 @@ impl AdminState {
             listeners: None,
             open_routes: Arc::new(Semaphore::new(OPEN_ROUTE_LIMIT)),
             scheduler: Arc::default(),
+            lifecycle: Arc::default(),
             api_keys: Arc::new(ArcSwap::from_pointee(hashes)),
         })
     }

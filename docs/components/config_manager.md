@@ -14,7 +14,7 @@ Restarting `pgcluster` would drop the clients of its proxy, so everything that c
 | `[raft]` | This node's ID, whether it bootstraps the group, peers, timeouts | No. Membership changes through the REST API |
 | `[[nodes.node]]` | Each node's agent and Postgres addresses, priority and tags | No. Nodes are added and removed through the REST API, and recorded in Raft |
 | `[replication]` | Replication user and password variable, slot prefix, `replication_mode`, `sync_degrade_timeout_seconds`, `max_slot_wal_keep_size_mb` | The mode, through `POST /api/replication/mode`, recorded in Raft |
-| `[proxy]` | Listen addresses, pool sizes, read routing, the auth role, `quorum_lease_ms`, `allowed_cidrs`, `require_tls`, connection limits | `allowed_cidrs`, on SIGHUP |
+| `[proxy]` | Listen addresses, pool sizes, read routing, the auth role, `quorum_lease_ms`, `allowed_cidrs`, `drop_refused_clients`, `require_tls`, connection limits | `allowed_cidrs` and `drop_refused_clients`, on SIGHUP |
 | `[failover]` | Health check interval and threshold, timeouts, self-fencing | No |
 | `[tls]` | `ca_cert`, `cert`, `key`, an optional `proxy_cert` and `proxy_key`, and `insecure_plaintext` | Every file and path, on SIGHUP. See [tls_manager.md](tls_manager.md#reloading-certificates) |
 | `[metrics]` | Listen address | No |

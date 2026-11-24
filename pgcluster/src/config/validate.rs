@@ -319,6 +319,7 @@ mod tests {
                 auth_password_env: "PGCLUSTER_AUTH_PASSWORD".into(),
                 quorum_lease_ms: 1000,
                 allowed_cidrs: None,
+                drop_refused_clients: false,
                 require_tls: false,
                 max_client_connections: 10_000,
                 max_pending_logins: 512,
