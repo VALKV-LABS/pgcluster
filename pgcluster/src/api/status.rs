@@ -7,6 +7,9 @@ pub struct HealthResponse {
     pub status: &'static str,
     pub primary: Option<String>,
     pub raft_leader: bool,
+    /// The Raft term this node is in. A leader cut off from the others keeps
+    /// an old one, so a report carrying it can be told from the current one.
+    pub raft_term: u64,
 }
 
 pub async fn health(State(s): State<ApiState>) -> (StatusCode, Json<HealthResponse>) {
@@ -33,6 +36,7 @@ pub async fn health(State(s): State<ApiState>) -> (StatusCode, Json<HealthRespon
             },
             primary,
             raft_leader: is_leader,
+            raft_term: metrics.current_term,
         }),
     )
 }
@@ -132,6 +136,7 @@ mod tests {
             status: "no_primary",
             primary: None,
             raft_leader: false,
+            raft_term: 0,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"primary\":null"));

@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
+use super::prepared::BackendStatements;
 use super::ssl::SSL_REQUEST_BYTES;
 
 // ── BackendStream ─────────────────────────────────────────────────────────────
@@ -121,6 +122,9 @@ pub struct BackendConnection {
 
     /// Time of the most recent activity (last read or write).
     pub last_used: Mutex<Instant>,
+
+    /// Named prepared statements this connection holds for clients.
+    pub statements: std::sync::Mutex<BackendStatements>,
 }
 
 impl std::fmt::Debug for BackendConnection {
@@ -158,6 +162,7 @@ impl BackendConnection {
             in_use: AtomicBool::new(false),
             created_at: Instant::now(),
             last_used: Mutex::new(Instant::now()),
+            statements: std::sync::Mutex::new(BackendStatements::default()),
         })
     }
 

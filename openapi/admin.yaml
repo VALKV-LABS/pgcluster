@@ -837,6 +837,12 @@ paths:
           $ref: "#/components/responses/Error"
         "404":
           $ref: "#/components/responses/Error"
+        "409":
+          description: Nothing to restore yet, or the database has no backups.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
   /v1/databases/{id}/replicas:
     parameters:
       - name: id
@@ -1259,6 +1265,14 @@ components:
         retention_days:
           type: integer
           minimum: 1
+    NoBackup:
+      type: object
+      required: [enabled]
+      additionalProperties: false
+      properties:
+        enabled:
+          type: boolean
+          enum: [false]
     CreateDatabase:
       type: object
       required: [name, version, resources, owner, backup]
@@ -1299,9 +1313,13 @@ components:
           items:
             $ref: "#/components/schemas/ExtensionName"
         backup:
-          allOf:
+          oneOf:
             - $ref: "#/components/schemas/BackupPolicy"
-          description: A database goes active only once it has a restorable backup.
+            - $ref: "#/components/schemas/NoBackup"
+          description: |
+            A database with backups goes active only once it has a restorable
+            backup. `{"enabled": false}` creates one with no backups: no
+            repository, no WAL archive and no point-in-time restore.
     UpdateDatabase:
       type: object
       properties:
@@ -1318,6 +1336,15 @@ components:
         retention_days:
           type: integer
           minimum: 1
+          description: Only for a database with backups.
+        backup:
+          allOf:
+            - $ref: "#/components/schemas/BackupPolicy"
+          description: |
+            Turns backups on for a database created without them, in a request
+            of its own, as an `enable_backup` operation. Archiving starts with
+            no restart, and the restore window starts at the end of the first
+            backup. Backups cannot be turned off.
     Upgrade:
       type: object
       properties:
@@ -1400,7 +1427,11 @@ components:
           items:
             $ref: "#/components/schemas/NodeAddress"
         backup:
-          $ref: "#/components/schemas/BackupPolicy"
+          type: object
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/BackupPolicy"
+          description: "`null` when the database has no backups."
         primary:
           type: string
           nullable: true
@@ -1548,6 +1579,7 @@ components:
             - upgrade
             - create_replica
             - promote_replica
+            - enable_backup
         status:
           type: string
           enum: [pending, running, succeeded, failed]

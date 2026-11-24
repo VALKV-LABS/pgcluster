@@ -257,7 +257,9 @@ function createDatabaseForm(hosts, repositories) {
         extensions: checked(form, "extension"),
         ha: values.ha === "on",
         replication_mode: values.mode,
-        backup: { repository_id: values.repository, retention_days: Number(values.retention) },
+        backup: values.no_backup === "on"
+          ? { enabled: false }
+          : { repository_id: values.repository, retention_days: Number(values.retention) },
       };
       if (values.host) body.hosts = [values.host];
       const operation = await call("POST", "/admin/v1/databases", body);
@@ -279,9 +281,10 @@ function createDatabaseForm(hosts, repositories) {
     field("Host", el("select", { name: "host" }, el("option", { value: "" }, "Most free"),
       hosts.filter(h => h.status === "online").map(h => el("option", { value: h.id }, h.name)))),
     field("Allowed CIDRs", el("input", { name: "cidrs", value: "0.0.0.0/0", size: 20 })),
-    field("Backup repository", el("select", { name: "repository", required: true },
+    field("Backup repository", el("select", { name: "repository" },
       repositories.map(r => el("option", { value: r.id }, r.name)))),
     field("Retention days", el("input", { name: "retention", type: "number", min: "1", value: "7", style: "width:70px" })),
+    field("No backups", el("input", { name: "no_backup", type: "checkbox", title: "No WAL archive and no point-in-time restore. Backups can be turned on later." })),
     field("Three nodes", el("input", { name: "ha", type: "checkbox" })),
     field("Replication", el("select", { name: "mode" }, ["async", "sync", "sync_strict"].map(m => el("option", {}, m)))),
     checks("extension", ["vector"]),
@@ -309,7 +312,23 @@ async function databaseDetail(id) {
   const mode = el("select", { "aria-label": "Replication mode" }, ["async", "sync", "sync_strict"].map(m =>
     el("option", m === database.replication_mode ? { selected: true } : {}, m)));
   const backups = await call("GET", `/admin/v1/databases/${id}/backups`);
-  const restoreWindow = await call("GET", `/admin/v1/databases/${id}/restore-window`).catch(() => null);
+  const restoreWindow = database.backup
+    ? await call("GET", `/admin/v1/databases/${id}/restore-window`).catch(() => null)
+    : null;
+  const repositories = database.backup ? null : await call("GET", "/admin/v1/backup-repositories");
+  const enableForm = repositories ? el("form", { onsubmit: event => {
+    event.preventDefault();
+    const values = formValues(enableForm);
+    act("Turn backups on", async () => {
+      const body = { backup: { repository_id: values.repository, retention_days: Number(values.retention) } };
+      await waitFor(await call("PATCH", `/admin/v1/databases/${id}`, body));
+      return "backups on";
+    });
+  } },
+    field("Backup repository", el("select", { name: "repository", required: true },
+      repositories.items.map(r => el("option", { value: r.id }, r.name)))),
+    field("Retention days", el("input", { name: "retention", type: "number", min: "1", value: "7", style: "width:70px" })),
+    el("button", { class: "plain" }, "Turn backups on")) : null;
   const restoreForm = el("form", { onsubmit: event => {
     event.preventDefault();
     const values = formValues(restoreForm);
@@ -421,17 +440,22 @@ async function databaseDetail(id) {
       el("button", { class: "plain", onclick: () => change("Rolling restart", "restart", "POST") }, "Rolling restart"),
       el("button", { class: "plain", title: database.server_version ? `Runs ${database.server_version}` : "",
         onclick: () => change("Minor upgrade", "upgrade", "POST", {}) }, "Upgrade to the hosts' minor release"),
-      el("button", { class: "plain", onclick: () => change("Take a backup", "backup", "POST") }, "Take a backup"),
+      database.backup ? el("button", { class: "plain", onclick: () => change("Take a backup", "backup", "POST") }, "Take a backup") : null,
       el("button", { class: "plain", onclick: () => change("Rotate the CA", "rotate-ca", "POST") }, "Rotate the CA"),
       el("button", { class: "plain", onclick: () => change("Rotate internal passwords", "rotate-passwords", "POST") }, "Rotate internal passwords")),
     el("h3", {}, "Backups"),
-    table([
-      { label: "Label", cell: b => b.label },
-      { label: "Finished", cell: b => b.finished_at },
-      { label: "Size", cell: b => String(b.size_bytes) },
-    ], backups.items, { empty: "No backups yet." }),
-    restoreWindow ? el("p", { class: "hint" }, `Restorable from ${restoreWindow.earliest} to ${restoreWindow.latest}.`) : null,
-    restoreForm,
+    ...(database.backup ? [
+      table([
+        { label: "Label", cell: b => b.label },
+        { label: "Finished", cell: b => b.finished_at },
+        { label: "Size", cell: b => String(b.size_bytes) },
+      ], backups.items, { empty: "No backups yet." }),
+      restoreWindow ? el("p", { class: "hint" }, `Restorable from ${restoreWindow.earliest} to ${restoreWindow.latest}.`) : null,
+      restoreForm,
+    ] : [
+      el("p", { class: "hint" }, "Backups are off: no WAL archive and no point-in-time restore. Turning them on needs no restart, and the restore window starts with the first backup."),
+      enableForm,
+    ]),
     el("h3", {}, "Owner password"),
     el("div", { class: "row" },
       el("button", { class: "plain", onclick: () => act("Rotate password", async () => {
@@ -480,7 +504,7 @@ async function drawDatabases() {
   ]);
   const parts = [
     el("section", {}, el("h2", {}, "Backup repositories"),
-      el("p", { class: "hint" }, "A database opens only once it has a restorable backup, so register one first. A host proves it can write there."),
+      el("p", { class: "hint" }, "A database with backups opens only once it has a restorable backup, so register a repository first. A host proves it can write there."),
       table([
         { label: "Name", cell: r => r.name },
         { label: "Type", cell: r => r.type },

@@ -196,6 +196,9 @@ impl Reconciler {
             "wait_removed" => wait_removed(tx, step).await,
             "finalize" => finalize(tx, step).await,
             "first_backup" => {
+                if !has_backups(tx, &step.database_id).await? {
+                    return Ok(Outcome::Done);
+                }
                 let label = json!({ "label": FIRST_BACKUP_LABEL });
                 run_task(tx, step, "backup", "leader", label).await
             }
@@ -937,6 +940,17 @@ pub async fn bump_hosts(tx: &mut Tx<'_>, database_id: &str) -> Result<(), sqlx::
 
 /// Hand a host work and wait for it. The step's first attempt records the task,
 /// and later attempts look at how it went.
+/// Whether the database has a backup policy. One created without backups
+/// opens with no first backup.
+async fn has_backups(tx: &mut Tx<'_>, database_id: &str) -> Result<bool> {
+    let enabled: Option<bool> =
+        sqlx::query_scalar("SELECT spec->'backup' IS NOT NULL AND spec->'backup' <> 'null'::jsonb FROM databases WHERE id = $1")
+            .bind(database_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(enabled.unwrap_or(false))
+}
+
 async fn run_task(
     tx: &mut Tx<'_>,
     step: &Claimed,

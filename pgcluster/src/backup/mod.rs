@@ -35,8 +35,8 @@ const RETRY_DELAY: Duration = Duration::from_secs(60);
 pub struct BackupScheduler {
     raft: Arc<RaftNode>,
     topology_rx: TopologyWatch,
-    config: BackupConfig,
     pool: Arc<AgentClientPool>,
+    /// Holds `[backup]`, which SIGHUP may add, change or remove.
     runtime: Arc<Runtime>,
 }
 
@@ -44,14 +44,12 @@ impl BackupScheduler {
     pub fn new(
         raft: Arc<RaftNode>,
         topology_rx: TopologyWatch,
-        config: BackupConfig,
         pool: Arc<AgentClientPool>,
         runtime: Arc<Runtime>,
     ) -> Self {
         Self {
             raft,
             topology_rx,
-            config,
             pool,
             runtime,
         }
@@ -68,9 +66,9 @@ impl BackupScheduler {
         loop {
             tick.tick().await;
 
-            if !self.config.enabled {
+            let Some(config) = self.runtime.backup() else {
                 continue;
-            }
+            };
             if last_failure.is_some_and(|at| at.elapsed() < RETRY_DELAY) {
                 continue;
             }
@@ -87,7 +85,7 @@ impl BackupScheduler {
             let failing = self.runtime.last_backup_failure().is_some();
             if !failing
                 && !is_due(
-                    self.config.interval_seconds,
+                    config.interval_seconds,
                     last_backup_ts(&topology),
                     unix_now(),
                 )
@@ -96,8 +94,6 @@ impl BackupScheduler {
             }
 
             let label = format!("scheduled-{}", chrono::Utc::now().format("%Y-%m-%d"));
-            let mut config = self.config.clone();
-            config.retain_full = self.runtime.retain_full(config.retain_full);
             match run_backup(
                 &self.raft,
                 &topology,

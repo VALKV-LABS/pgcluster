@@ -124,20 +124,11 @@ pub async fn write_pgpass(
         esc(password)
     );
 
+    // PostgreSQL refuses to read .pgpass if it is world- or group-readable,
+    // so the file is created owner-only rather than narrowed afterwards.
     let path = data_dir.join(".pgpass");
-    fs::write(&path, content.as_bytes())
-        .await
+    crate::host::fsutil::write_private(&path, content.as_bytes())
         .with_context(|| format!("failed to write .pgpass at {}", path.display()))?;
-
-    // PostgreSQL refuses to read .pgpass if it is world- or group-readable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&path, perms)
-            .await
-            .with_context(|| format!("failed to chmod 0600 {}", path.display()))?;
-    }
 
     tracing::info!(path = %path.display(), "wrote .pgpass");
     Ok(())

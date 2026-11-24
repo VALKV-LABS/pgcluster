@@ -43,7 +43,7 @@ lint-openapi:  ## Validate the admin and agent API contracts (needs Docker)
 	docker run --rm -v "$(CURDIR)/openapi:/spec" -w /spec $(REDOCLY_IMAGE) lint admin.yaml agent.yaml --config redocly.yaml
 
 lint-deploy:  ## Validate the Packer recipe and the Terraform template (needs Docker)
-	docker run --rm -v "$(CURDIR)/images:/w" -w /w $(PACKER_IMAGE) init node.pkr.hcl
+	docker run --rm -v "$(CURDIR)/images:/w" -w /w -e PACKER_GITHUB_API_TOKEN $(PACKER_IMAGE) init node.pkr.hcl
 	docker run --rm -v "$(CURDIR)/images:/w" -w /w -e PACKER_PLUGIN_PATH=/w/.packer.d/plugins $(PACKER_IMAGE) validate -syntax-only node.pkr.hcl
 	docker run --rm -v "$(CURDIR)/deploy/aws:/w" -w /w $(TERRAFORM_IMAGE) fmt -check -diff
 	docker run --rm -v "$(CURDIR)/deploy/aws:/w" -w /w $(TERRAFORM_IMAGE) init -backend=false -input=false

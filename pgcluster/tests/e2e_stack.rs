@@ -1694,6 +1694,74 @@ async fn e2e_proxy_authenticates_clients_and_uses_tls_to_postgres() {
     compose(&["down", "-v", "--remove-orphans"]);
 }
 
+/// A client keeps using its named prepared statements while other clients,
+/// which reuse the same statement names for other queries, come and go
+/// through the same pooled backends.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_prepared_statements_survive_pooling() {
+    start_stack();
+    let dsn = "host=localhost port=5432 user=postgres password=test dbname=postgres";
+
+    let pg = connect_with_retries(dsn).await;
+    let add = pg.prepare("SELECT $1::int + 1").await.expect("prepare");
+
+    for i in 0..30i32 {
+        // Each visitor's driver names its first statement as `pg`'s was.
+        let visitor = connect_with_retries(dsn).await;
+        let other = visitor
+            .prepare("SELECT $1::text || '!'")
+            .await
+            .expect("visitor prepares");
+        let row = visitor
+            .query_one(&other, &[&"hi"])
+            .await
+            .expect("visitor runs its statement");
+        assert_eq!(row.get::<_, String>(0), "hi!");
+        drop(visitor);
+
+        let row = tokio::time::timeout(Duration::from_secs(10), pg.query_one(&add, &[&i]))
+            .await
+            .expect("a prepared statement must not hang")
+            .unwrap_or_else(|e| panic!("round {i}: reuse a prepared statement: {e}"));
+        assert_eq!(row.get::<_, i32>(0), i + 1);
+    }
+
+    // A statement prepared inside a transaction outlives it.
+    pg.batch_execute("BEGIN").await.expect("begin");
+    let double = pg
+        .prepare("SELECT $1::int * 2")
+        .await
+        .expect("prepare in a transaction");
+    pg.batch_execute("COMMIT").await.expect("commit");
+    let row = pg
+        .query_one(&double, &[&21i32])
+        .await
+        .expect("use after commit");
+    assert_eq!(row.get::<_, i32>(0), 42);
+
+    // DEALLOCATE ALL forgets this client's statements, and new ones work.
+    pg.batch_execute("DEALLOCATE ALL")
+        .await
+        .expect("deallocate");
+    let err = pg
+        .query_one(&add, &[&1i32])
+        .await
+        .expect_err("a deallocated statement is gone");
+    assert_eq!(
+        err.code(),
+        Some(&tokio_postgres::error::SqlState::INVALID_SQL_STATEMENT_NAME)
+    );
+    let again = pg
+        .prepare("SELECT $1::int + 1")
+        .await
+        .expect("prepare again");
+    let row = pg.query_one(&again, &[&1i32]).await.expect("run again");
+    assert_eq!(row.get::<_, i32>(0), 2);
+
+    compose(&["down", "-v", "--remove-orphans"]);
+}
+
 /// Runs switchover only — useful when the stack is already up (E2E_SKIP_BUILD=1).
 #[tokio::test]
 #[ignore = "requires Docker e2e stack (make start) with E2E_STACK_ADDR or localhost:8009"]

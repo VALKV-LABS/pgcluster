@@ -5,6 +5,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Added
+- A database can opt out of backups with `"backup": {"enabled": false}` or `--no-backup`: no repository, no first backup before access, no WAL archive and no restore window. `PATCH` with a backup policy, or `pgcluster database enable-backups`, turns them on later with no restart. The console does both.
+- SIGHUP reads `pgcluster`'s whole `[backup]` section, so one added later starts backups and archiving.
+- Named prepared statements work through the proxy across transactions and pooled backends. The proxy prepares a statement again on a backend that lacks it, and `[proxy.pool] max_prepared_statements` caps how many each backend keeps.
+- `SECURITY.md` describes the deployment security model: which file holds which secret, who can read it, and what to back up.
 - A scheduler that never overcommits a host, keeps memory back for the OS and the page cache, and refuses a request no host can hold at once. `[scheduler]` sets the reserves and the port range.
 - Each instance runs in a systemd slice with `CPUQuota=`, `MemoryMax=` and `IOWeight=`, and gets an XFS project quota for disk, set by `disk_quota` in the host config. A host refuses to start an instance whose ports something else holds.
 - `POST /v1/hosts/{id}/drain` moves every node off a host with no downtime, and `DELETE` stops it.
@@ -25,6 +29,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `postgres_config_file` runs Postgres from a config outside the data directory.
 
 ### Changed
+- **Breaking:** the agent API's `Instance.backup` may be `null`, and the admin API's `Database.backup` is `null` for a database without backups. Older hosts cannot run such a database.
+- The leader seeds an empty node, such as a replacement, from the latest backup when one exists, and from the primary only when there is none or the restore fails. This spares the primary a base backup.
 - **Breaking:** the agent API's `Instance` gains `role` and `replicas`, and its secrets may carry a proxy certificate. Reports gain `postgres_versions` and `server_version`. Older hosts ignore what they do not know, but cannot run replicas.
 - **Breaking:** `POST /v1/hosts/{id}/drain` answers with the host, not an operation.
 - **Breaking:** `POST /v1/databases/{id}/backup`, `restart` and other changes answer `409` on a replica, and a database with replicas refuses `rotate-ca`, `rotate-passwords` and deletion.
@@ -32,6 +38,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Breaking:** the agent API's `Instance` gains `address`, `backup` and `tasks`, and `bootstrap` can be `seed` or `restore`.
 
 ### Fixed
+- A statement prepared on one client connection could fail with `prepared statement does not exist`, or `already exists`, once other clients had used the same pooled backend.
+- `walg.json` and `.pgpass` are created owner-only, where before they were briefly readable by others until a `chmod`.
+- An API-triggered failover read the replication password from the environment only, ignoring `[cluster] secrets_file`.
 - `vk-agent` built only alongside crates that turned on sqlx's `chrono` feature.
 - Failover, switchover and the repair of a stale standby used port 5432 for the primary, whatever its address said.
 - A standby counted as already following the primary if the primary's host appeared anywhere in its conninfo.

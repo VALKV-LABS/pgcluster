@@ -233,17 +233,18 @@ impl InstanceManager<'_> {
         let files = self.write_files(instance, layout, &pg_bin, &nodes)?;
         let applied = previous.unwrap_or_default();
         let first_start = self.initialize(instance, layout, &pg_bin, &applied).await?;
-        let conf_changed = write_private_if_changed(
-            &layout.postgres_conf(),
-            &render::managed_conf(instance, layout),
-            self.run_as,
-        )?;
+        let conf = render::managed_conf(instance, layout);
+        let before = std::fs::read_to_string(layout.postgres_conf()).ok();
+        let conf_written = write_private_if_changed(&layout.postgres_conf(), &conf, self.run_as)?;
+        // Only some settings need Postgres to restart; the rest reload.
+        let conf_changed =
+            conf_written && before.is_none_or(|before| render::needs_restart(&before, &conf));
 
         self.runner.install(&processes).await?;
         // A reload that failed is owed, though the files no longer change.
         let owed = layout.reload_owed();
         let files = FilesChanged {
-            reload: files.reload || owed.exists(),
+            reload: files.reload || owed.exists() || (conf_written && !conf_changed),
             proxy_config: files.proxy_config,
         };
         if files.reload || files.proxy_config {
@@ -377,7 +378,8 @@ impl InstanceManager<'_> {
 
     /// WAL-G needs a directory repository's root to exist before it writes.
     fn prepare_repository(&self, instance: &Instance) -> Result<()> {
-        if let Some(path) = &instance.backup.target.path {
+        let target = instance.backup.as_ref().map(|b| &b.target);
+        if let Some(path) = target.and_then(|t| t.path.as_ref()) {
             std::fs::create_dir_all(path).with_context(|| format!("create {path}"))?;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
                 .with_context(|| format!("secure {path}"))?;

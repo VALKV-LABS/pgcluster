@@ -37,8 +37,8 @@ fn raft_bind_addr(peer_addr: &str) -> String {
     }
 }
 
-/// Read passwords, API keys and retention again on SIGHUP, none of which needs a
-/// restart. A file that does not load leaves the old values in use.
+/// Read passwords, API keys and backup settings again on SIGHUP, none of which
+/// needs a restart. A file that does not load leaves the old values in use.
 fn spawn_settings_reload(
     config_path: String,
     secrets_file: Option<String>,
@@ -375,11 +375,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         let fcfg = cfg.failover.clone();
         let mon_metrics = metrics.clone();
         let replication = cfg.replication.clone();
-        let backup_settings = cfg
-            .backup
-            .as_ref()
-            .filter(|b| b.enabled)
-            .map(backup::walg::settings);
+        let monitor_runtime = runtime.clone();
         tasks.push(tokio::spawn(async move {
             let mut monitor = node_monitor::NodeMonitor::new(
                 raft,
@@ -389,7 +385,7 @@ pub async fn run_server(config_path: &str) -> Result<()> {
                 mon_metrics,
                 &replication,
                 &auth_role,
-                backup_settings,
+                monitor_runtime,
                 op_in_progress.clone(),
                 quorum,
             );
@@ -397,12 +393,12 @@ pub async fn run_server(config_path: &str) -> Result<()> {
         }));
     }
 
-    // Backup scheduler (only started when [backup] section is present in config)
-    if let Some(backup_cfg) = cfg.backup.clone() {
+    // Backup scheduler. It idles until `[backup]` is present and enabled,
+    // which SIGHUP can change.
+    {
         let mut scheduler = backup::BackupScheduler::new(
             raft_node.clone(),
             topology_rx.clone(),
-            backup_cfg,
             pool.clone(),
             runtime.clone(),
         );

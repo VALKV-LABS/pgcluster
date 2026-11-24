@@ -467,6 +467,14 @@ components:
       properties:
         database_id:
           type: string
+        term:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            The reporting leader's Raft term. A report with a lower term than
+            one already recorded is stale, such as from a leader cut off by a
+            partition, and is ignored.
         primary:
           type: [string, "null"]
         sync_degraded:
@@ -574,7 +582,10 @@ components:
             - $ref: "#/components/schemas/Restore"
             - type: "null"
         backup:
-          $ref: "#/components/schemas/BackupPolicy"
+          description: "`null` when the database has no backups. WAL is then discarded, not archived."
+          oneOf:
+            - $ref: "#/components/schemas/BackupPolicy"
+            - type: "null"
         tasks:
           type: array
           items:

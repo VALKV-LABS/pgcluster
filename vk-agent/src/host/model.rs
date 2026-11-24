@@ -161,7 +161,9 @@ pub struct Instance {
     pub bootstrap: String,
     #[serde(default)]
     pub restore: Option<Restore>,
-    pub backup: BackupPolicy,
+    /// `None` when the database has no backups: nothing is archived.
+    #[serde(default)]
+    pub backup: Option<BackupPolicy>,
     #[serde(default)]
     pub tasks: Vec<Task>,
     pub replication_mode: String,
@@ -283,7 +285,9 @@ impl Instance {
             cidr.parse::<ipnet::IpNet>()
                 .with_context(|| format!("invalid CIDR block {cidr:?}"))?;
         }
-        self.backup.target.validate()?;
+        if let Some(backup) = &self.backup {
+            backup.target.validate()?;
+        }
         if let Some(restore) = &self.restore {
             restore.source.validate()?;
         }
@@ -394,6 +398,8 @@ pub struct TaskResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct ClusterReport {
     pub database_id: String,
+    /// The reporting leader's Raft term.
+    pub term: u64,
     pub primary: Option<String>,
     pub sync_degraded: bool,
     pub needs_reseed: Vec<String>,
@@ -448,7 +454,7 @@ pub mod tests {
             peers: vec![],
             bootstrap: "initdb".into(),
             restore: None,
-            backup: BackupPolicy {
+            backup: Some(BackupPolicy {
                 target: BackupTarget {
                     kind: "posix".into(),
                     path: Some("/backups/db-1".into()),
@@ -456,7 +462,7 @@ pub mod tests {
                     ..Default::default()
                 },
                 retain_full: 2,
-            },
+            }),
             tasks: vec![],
             replication_mode: "async".into(),
             allowed_cidrs: vec!["198.51.100.0/24".into()],
@@ -543,11 +549,11 @@ pub mod tests {
         assert!(i.validate().is_err());
 
         let mut i = instance();
-        i.backup.target.path = Some("/backups' ; x".into());
+        i.backup.as_mut().unwrap().target.path = Some("/backups' ; x".into());
         assert!(i.validate().is_err());
 
         let mut i = instance();
-        i.backup.target.path = Some("relative".into());
+        i.backup.as_mut().unwrap().target.path = Some("relative".into());
         assert!(i.validate().is_err());
 
         let mut i = instance();
@@ -564,7 +570,7 @@ pub mod tests {
         i.bootstrap = "restore".into();
         assert!(i.validate().is_err(), "a restore needs a source");
         i.restore = Some(Restore {
-            source: i.backup.target.clone(),
+            source: i.backup.clone().unwrap().target,
             target_time: Some("2026-11-01T10:00:00Z".into()),
             source_database: "orders".into(),
         });

@@ -15,18 +15,9 @@ use serde::{Deserialize, Serialize};
 type ApiError = (StatusCode, String);
 
 fn enabled(s: &ApiState) -> Result<BackupConfig, ApiError> {
-    let config = s
-        .config
-        .backup
-        .clone()
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "backup not configured".to_string()))?;
-    if !config.enabled {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "backup is disabled".to_string(),
-        ));
-    }
-    Ok(config)
+    s.runtime
+        .backup()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "backup not configured".to_string()))
 }
 
 // ── List ───────────────────────────────────────────────────────────────────────
@@ -74,8 +65,7 @@ pub async fn trigger_backup(
     State(s): State<ApiState>,
     Json(req): Json<TriggerBackupRequest>,
 ) -> Result<(StatusCode, Json<TriggerBackupResponse>), ApiError> {
-    let mut config = enabled(&s)?;
-    config.retain_full = s.runtime.retain_full(config.retain_full);
+    let config = enabled(&s)?;
     let frequency = req.frequency.unwrap_or_else(|| "manual".to_string());
     let label = req
         .label

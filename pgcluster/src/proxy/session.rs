@@ -81,6 +81,15 @@ impl Default for SessionState {
 }
 
 impl SessionState {
+    /// The `ReadyForQuery` status byte for the current transaction state.
+    pub fn txn_status_byte(&self) -> u8 {
+        match self.txn_state {
+            TxnState::Idle => b'I',
+            TxnState::InTransaction => b'T',
+            TxnState::Failed => b'E',
+        }
+    }
+
     /// Update transaction state from the status byte in a `ReadyForQuery` ('Z') message.
     ///
     /// `b'I'` → `Idle`, `b'T'` → `InTransaction`, `b'E'` → `Failed`.

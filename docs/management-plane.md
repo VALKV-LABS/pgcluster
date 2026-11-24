@@ -12,7 +12,7 @@ The management plane adds fleet management on top, using two new components:
 - **`pgcluster-admin`:** one service and one API for every cluster in a fleet.
 - **`vk-agent host`:** a new mode of the existing `vk-agent` binary. One runs on every host and does what `pgcluster-admin` asks.
 
-An operator enrols their hosts, calls `POST /v1/databases`, and gets a running Postgres endpoint with failover and point-in-time restore. Both components are open source and run on their own. They need one Postgres database, and no cloud account.
+An operator enrols their hosts, calls `POST /v1/databases`, and gets a running Postgres endpoint with failover and, unless it opts out, point-in-time restore. Both components are open source and run on their own. They need one Postgres database, and no cloud account.
 
 ## 2. Principles
 
@@ -161,7 +161,7 @@ DELETE /v1/backup-repositories/{id}
 POST   /v1/databases
 GET    /v1/databases
 GET    /v1/databases/{id}
-PATCH  /v1/databases/{id}                       resources, replication_mode, retention_days
+PATCH  /v1/databases/{id}                       resources, replication_mode, retention_days, backup
 DELETE /v1/databases/{id}
 
 POST   /v1/databases/{id}/restart
@@ -205,6 +205,8 @@ POST     /v1/databases/{id}/replicas/{replica_id}/promote
 ```
 
 `hosts` is optional; the scheduler chooses when it is omitted. The CLI generates the password locally and sends only the SCRAM verifier.
+
+`backup` is required. `{ "enabled": false }` in its place, or `--no-backup` in the CLI, creates a database with no backups: no repository, no first backup before access, WAL archiving off, and no point-in-time restore. Such a database shows `"backup": null`, and its `restore-window` is empty. `PATCH` with a `backup` policy turns backups on later, with no restart: archiving starts, a first full backup is taken, and the restore window begins at its end. Backups cannot be turned off once on.
 
 **Status** is one of `provisioning`, `active`, `degraded`, `deleting`, `deleted` or `error`, with a `status_reason`. `degraded` means the database is serving with a problem, such as a node being down, sync having fallen back to async, or backups failing.
 
@@ -286,16 +288,16 @@ Each database has a `spec` and a `generation`. `vk-agent host` long-polls for de
 3. Node 1 runs `initdb --data-checksums`. Other nodes seed from it.
 4. pgcluster forms the Raft group.
 5. Apply the replication mode, install extensions, create the owner role.
-6. Take the first full backup.
+6. Take the first full backup, unless the database has opted out of backups.
 7. Apply the allowlist and mark the database `active`.
 
-Clients get no access until step 7, so a reachable database always has a restorable backup. A `backup` policy is therefore required on every create.
+Clients get no access until step 7, so a reachable database with backups always has a restorable backup. A `backup` policy, or an explicit opt-out, is therefore required on every create.
 
 **Other operations**
 
 | Operation | How |
 |---|---|
-| Replace a node | Add the new node as a Raft learner, seed it from the primary, promote it to voter, remove the old member |
+| Replace a node | Add the new node as a Raft learner, seed it from the latest backup, or from the primary when there is none, promote it to voter, remove the old member |
 | Drain a host | Replace each of its nodes onto another host, one database at a time |
 | Grow storage | Raise each node's disk quota online |
 | Change resources | CPU limits change online. New memory restarts one standby at a time, then switches over, then restarts the old primary |
@@ -328,7 +330,7 @@ Even strict settings cannot promise literal zero loss. A transaction can become 
 
 ### Backups and restore
 
-Every database has point-in-time restore.
+Every database has point-in-time restore unless it was created without backups.
 
 | Setting | Value |
 |---|---|
@@ -341,7 +343,7 @@ Every database has point-in-time restore.
 
 The coordinator talks to `vk-agent` through backup RPCs that name no tool, and the API and topology carry nothing specific to WAL-G, so another engine can replace it.
 
-Restore always creates a new database, so the source stays up and a failed restore harms nothing. `restore-window` returns the earliest and latest restorable times: from the end of the oldest backup to the last moment every commit is known to be in the archive. Deleting a database discards the key that decrypts its backups.
+Restore always creates a new database, so the source stays up and a failed restore harms nothing. `restore-window` returns the earliest and latest restorable times: from the end of the oldest backup to the last moment every commit is known to be in the archive. Deleting a database discards the key that decrypts its backups. A database without backups archives no WAL: `archive_command` discards each segment, so WAL does not pile up, and turning backups on replaces it with no restart.
 
 Scheduling stays on each cluster's Raft leader, so backups continue during a management-plane outage.
 
