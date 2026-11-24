@@ -1063,18 +1063,125 @@ async fn e2e_admin_console_full_stack() {
     .await;
     console(&client, "GET", "/cluster/api/backups/verify", None).await;
 
-    // Delete the database again.
+    // A suspension shuts the owner out, and a resume lets them back in.
+    let path = format!("/admin/v1/databases/{id}");
+    let as_owner = |database: &Value, sql: &str| {
+        let endpoint = &database["endpoint"];
+        serde_json::json!({
+            "target": "database",
+            "host": endpoint["host"],
+            "port": endpoint["port"],
+            "database": endpoint["database"],
+            "username": "app_owner",
+            "password": secret["password"],
+            "ca_cert_pem": endpoint["ca_cert_pem"],
+            "sql": sql,
+        })
+    };
+    let operation = console(&client, "POST", &format!("{path}/suspend"), None).await;
+    console_operation(&client, &operation).await;
+    let suspended = console(&client, "GET", &path, None).await;
+    assert!(suspended["suspended_at"].is_string(), "{suspended}");
+    let (status, _) = console_call(
+        &client,
+        "POST",
+        "/console/sql",
+        Some(as_owner(&database, "SELECT 1")),
+    )
+    .await;
+    assert_eq!(status, 400, "a suspended database refuses clients");
+    let operation = console(&client, "POST", &format!("{path}/resume"), None).await;
+    console_operation(&client, &operation).await;
+    wait_for(
+        "the owner to get back in",
+        Duration::from_secs(30),
+        async || {
+            let (status, _) = console_call(
+                &client,
+                "POST",
+                "/console/sql",
+                Some(as_owner(&database, "SELECT 1")),
+            )
+            .await;
+            status == 200
+        },
+    )
+    .await;
+
+    // Retention changes online.
+    let operation = console(
+        &client,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "retention_days": 14 })),
+    )
+    .await;
+    console_operation(&client, &operation).await;
+    let changed = console(&client, "GET", &path, None).await;
+    assert_eq!(changed["backup"]["retention_days"], 14);
+
+    // Usage, events, the audit log and the admin CA all answer.
+    let from = (chrono::Utc::now() - chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let usage = console(
+        &client,
+        "GET",
+        &format!("/admin/v1/usage?from={from}&database_id={id}"),
+        None,
+    )
+    .await;
+    assert_eq!(usage["items"][0]["database_id"], id, "{usage}");
+    assert!(usage["items"][0]["node_hours"].as_f64().unwrap() > 0.0);
+    let events = console(&client, "GET", "/admin/v1/events?limit=500", None).await;
+    let kinds = events.to_string();
+    assert!(kinds.contains("database_suspended"), "{kinds}");
+    assert!(kinds.contains("database_resumed"), "{kinds}");
+    let audit = console(&client, "GET", "/admin/v1/audit-log?limit=500", None).await;
+    assert!(audit.to_string().contains("/suspend"), "{audit}");
+    let admin_ca = console(&client, "GET", "/admin/v1/admin-ca", None).await;
+    assert!(admin_ca["bundle_pem"]
+        .as_str()
+        .unwrap()
+        .contains("BEGIN CERTIFICATE"));
+
+    // Delete the database, with a final backup it can be restored from.
+    let operation = console(&client, "DELETE", &path, None).await;
+    console_operation(&client, &operation).await;
+    let (status, _) = console_call(&client, "GET", &path, None).await;
+    assert_eq!(status, 404);
+    let deleted = console(&client, "GET", "/admin/v1/databases?deleted=true", None).await;
+    assert_eq!(deleted["items"][0]["id"], id, "{deleted}");
+    let window = console(&client, "GET", &format!("{path}/restore-window"), None).await;
+    let operation = console(
+        &client,
+        "POST",
+        &format!("{path}/restore"),
+        Some(serde_json::json!({ "name": "console_back", "target_time": window["latest"] })),
+    )
+    .await;
+    console_operation(&client, &operation).await;
+    let restored_id = operation["database_id"].as_str().unwrap();
+    let restored_path = format!("/admin/v1/databases/{restored_id}");
+    let restored = console(&client, "GET", &restored_path, None).await;
+    let result = console(
+        &client,
+        "POST",
+        "/console/sql",
+        Some(as_owner(
+            &restored,
+            "SELECT extname FROM pg_extension WHERE extname = 'vector'",
+        )),
+    )
+    .await;
+    assert_eq!(result["rows"][0], serde_json::json!(["vector"]));
     let operation = console(
         &client,
         "DELETE",
-        &format!("/admin/v1/databases/{id}"),
+        &format!("{restored_path}?final_backup=false"),
         None,
     )
     .await;
     console_operation(&client, &operation).await;
-    let (status, _) =
-        console_call(&client, "GET", &format!("/admin/v1/databases/{id}"), None).await;
-    assert_eq!(status, 404);
 }
 
 // ── Three nodes ───────────────────────────────────────────────────────────────
