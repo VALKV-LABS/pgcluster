@@ -460,6 +460,37 @@ mod tests {
             .starts_with("SCRAM-SHA-256$"));
     }
 
+    /// The console tries every flow of the admin API, so each route in its
+    /// contract must be called from the page. A route's last fixed segment
+    /// stands for it, as the page fills in IDs at run time, and passes a
+    /// database's own routes to `change` by that name alone.
+    #[test]
+    fn the_page_calls_every_admin_route() {
+        let contract = include_str!("../../../openapi/admin.yaml");
+        let mut missing = Vec::new();
+        for line in contract.lines() {
+            let Some(path) = line
+                .strip_prefix("  /v1/")
+                .and_then(|rest| rest.strip_suffix(':'))
+            else {
+                continue;
+            };
+            let fixed: Vec<&str> = path.split('/').filter(|s| !s.starts_with('{')).collect();
+            let segment = fixed.last().expect("a route has a fixed segment");
+            let wanted = if fixed.len() == 1 {
+                format!("/admin/v1/{segment}")
+            } else {
+                format!("/{segment}")
+            };
+            // `change` takes the part after the database's ID, as "suspend".
+            let named = format!("\"{segment}\"");
+            if !PAGE.contains(&wanted) && (fixed.len() == 1 || !PAGE.contains(&named)) {
+                missing.push(path.to_string());
+            }
+        }
+        assert!(missing.is_empty(), "the console never calls {missing:?}");
+    }
+
     #[test]
     fn the_page_escapes_what_it_shows() {
         // Names and logs come from servers, so nothing may reach the page as HTML.

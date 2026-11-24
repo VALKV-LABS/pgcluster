@@ -5,6 +5,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Added
+- The console covers every admin API route: suspend and resume, delete with or without a final backup and restore from a deleted database, usage, node replacement, retention, custom proxy certificates, S3 repositories and their removal, workspaces and chosen hosts, every operation's steps and logs, the event feed, the audit log, and the admin CA and its rotation.
 - `POST /v1/databases/{id}/suspend` and `resume`, and `pgcluster database suspend` and `resume`. A suspension shuts clients out and ends their sessions, while nodes, data and backups stay.
 - A deleted database's backups, with a final one taken at delete, stay restorable into a new database for `[lifecycle] deleted_backup_retention_days`, 7 by default, then a host purges them from the repository. `GET /v1/databases?deleted=true` and `pgcluster database list --deleted` list such databases.
 - `GET /v1/usage` and `pgcluster database usage`: node, vCPU, memory and storage hours per database over a period, recorded by triggers as nodes are added, resized and removed, and the backup bytes held now.

@@ -33,9 +33,13 @@ Any website can make a browser call `localhost`, and DNS rebinding can make that
 
 | Tab | Try |
 |---|---|
-| Databases | Create one or three nodes, with or without backups, turn backups on later, change the allowlist and extensions, resize, switch over, change the replication mode, restart, upgrade to the hosts' minor release, back up, restore to a point in time, rotate the CA, internal passwords and the owner's password, add, promote and delete cross-region replicas, and query as the owner |
-| Hosts | Add a host and get its enrolment token, see capacity, free capacity and installed Postgres releases, drain a host and stop draining it, and remove it |
+| Databases | Register a POSIX or S3 repository and remove one. Create one or three nodes on chosen hosts, with a workspace label, with or without backups, and turn backups on later. Change the allowlist and extensions, resize, switch over, change the replication mode, restart, upgrade to the hosts' minor release, replace a node on a spare host, back up, change retention, restore to a point in time, set a custom proxy certificate, rotate the CA, internal passwords and the owner's password, add, promote and delete cross-region replicas, suspend and resume, and query as the owner. Delete, with or without a final backup, then restore a deleted database from its kept backups |
+| Hosts | Add a host and get its enrolment token, see capacity, free capacity and installed Postgres releases, drain a host and stop draining it, and remove it. See the admin CA, which hosts a rotation waits for, and rotate it |
+| Usage | Node, vCPU, memory and storage hours per database over a period, and the backups held now, by workspace or database, with totals |
+| Events and audit | The newest events across the fleet, and the audit log of changes, by API key |
 | Cluster | The `make start` cluster: nodes, maintenance, switchover, replication mode, rolling restart, manual failover and its history, and SQL through the proxy |
 | Backups | The cluster's backups: take one, check the WAL archive, delete one, and restore onto a spare agent |
+
+Every route in the admin API's contract is called from the page, which a unit test checks, so a new route needs a place here.
 
 Each action shows its operation's steps and logs as they run.
