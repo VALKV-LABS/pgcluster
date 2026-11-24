@@ -45,6 +45,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Breaking:** the agent API's `Instance` gains `address`, `backup` and `tasks`, and `bootstrap` can be `seed` or `restore`.
 
 ### Fixed
+- A switchover with no target could pick the current primary, when the topology still listed it as a replica, and so either fail or move nothing. It now leaves the primary out by name.
 - A switchover task failed when the cluster reached the target on its own between the task's check and its request, with `target is already the primary`. The task now succeeds when the target ends up primary.
 - After a failover that dropped the old primary's last commits, as async replication can, every backup failed, because the newest one ended past the new timeline's position and WAL-G cannot build a delta on it. The agent now takes a full backup instead.
 - The backup scheduler counted a backup it could not start, before a new cluster had a primary, as a failure, which marked a new database `degraded` until a retry a minute later. It now waits for a primary.

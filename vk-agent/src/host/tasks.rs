@@ -172,12 +172,15 @@ impl LocalApi {
         Ok(self.get::<NodeList>("/api/nodes").await?.nodes)
     }
 
-    /// The standby closest to the primary.
-    async fn best_standby(&self) -> Result<String> {
+    /// The standby closest to the primary. Roles and the primary are kept
+    /// apart in the topology and can briefly disagree, so the primary is left
+    /// out by name too: picking it would make a switchover that moves nothing.
+    async fn best_standby(&self, primary: Option<&str>) -> Result<String> {
         self.nodes()
             .await?
             .into_iter()
             .filter(|n| n.role.eq_ignore_ascii_case("replica"))
+            .filter(|n| Some(n.node_id.as_str()) != primary)
             .min_by_key(|n| n.lag_bytes)
             .map(|n| n.node_id)
             .context("no standby can take over")
@@ -191,7 +194,7 @@ impl LocalApi {
         }
         let target = match target {
             Some(target) => target.to_string(),
-            None => self.best_standby().await?,
+            None => self.best_standby(primary.as_deref()).await?,
         };
         // The cluster may get there on its own between the check and this,
         // such as through a failover. The primary it ends with is what counts.
