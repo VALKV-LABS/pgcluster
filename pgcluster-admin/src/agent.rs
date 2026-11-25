@@ -785,9 +785,11 @@ async fn cluster_report(
         if known.contains(&backup.id) {
             continue;
         }
-        sqlx::query(
+        // A cluster can list one backup twice, as when two were taken at
+        // once. That must not fail the report, which carries the primary too.
+        let inserted = sqlx::query(
             "INSERT INTO backups (database_id, id, label, completed_at, size_bytes) \
-             VALUES ($1, $2, $3, to_timestamp($4), $5)",
+             VALUES ($1, $2, $3, to_timestamp($4), $5) ON CONFLICT DO NOTHING",
         )
         .bind(id)
         .bind(&backup.id)
@@ -796,6 +798,9 @@ async fn cluster_report(
         .bind(backup.size_bytes)
         .execute(&mut *tx)
         .await?;
+        if inserted.rows_affected() == 0 {
+            continue;
+        }
         let detail = serde_json::json!({ "backup_id": backup.id, "label": backup.label });
         event(&mut tx, "backup_completed", Some(id), None, detail).await?;
     }

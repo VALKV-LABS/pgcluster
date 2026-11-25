@@ -3436,3 +3436,31 @@ async fn usage_counts_each_node_for_as_long_as_it_ran() {
     .unwrap();
     assert_eq!(open, 0);
 }
+
+/// A cluster that lists one backup twice, as when two were taken at once,
+/// still has its report taken: it carries the primary too.
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_report_listing_a_backup_twice_still_moves_the_primary() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let ha = f.ha().await;
+    let url = format!("{}/agent/v1/cluster", f.agent_url);
+    let backup = |label: &str| json!({ "id": "base_1", "label": label, "completed_at": 1_800_000_000, "size_bytes": 5 });
+    let body = json!({
+        "database_id": ha.database_id,
+        "primary": "n3",
+        "backups": [backup("first-backup"), backup("scheduled")],
+    });
+    let response = ha.hosts[0].1.post(&url).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), 204);
+    let (_, database) = f.api("GET", &ha.path, None).await;
+    assert_eq!(database["primary"], "n3");
+    let completed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE type = 'backup_completed'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(completed, 1);
+}

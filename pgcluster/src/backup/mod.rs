@@ -30,6 +30,11 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// How long to wait after a failed backup.
 const RETRY_DELAY: Duration = Duration::from_secs(60);
 
+/// Held for the length of each backup. Two at once, such as a new database's
+/// first backup and the scheduler's, can start in the same WAL segment on an
+/// idle cluster, and WAL-G then gives both the same name.
+static RUNNING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // ── BackupScheduler ────────────────────────────────────────────────────────────
 
 pub struct BackupScheduler {
@@ -141,6 +146,7 @@ pub async fn run_backup(
     frequency: &str,
     label: &str,
 ) -> Result<BackupManifest> {
+    let _running = RUNNING.lock().await;
     let (mut source_node, agent_addr) = select_source(topology, config.prefer_replica)
         .ok_or_else(|| anyhow!("no suitable backup source"))?;
 
