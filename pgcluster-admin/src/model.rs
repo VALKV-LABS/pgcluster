@@ -483,6 +483,8 @@ pub struct DesiredState {
     pub generation: i64,
     pub instances: Vec<Instance>,
     pub repository_checks: Vec<RepositoryCheck>,
+    /// Deleted databases past retention, whose backups this host removes.
+    pub repository_purges: Vec<RepositoryPurge>,
     pub admin_ca: Option<AdminCa>,
 }
 
@@ -544,6 +546,12 @@ pub struct RepositoryCheck {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RepositoryPurge {
+    pub database_id: String,
+    pub target: BackupTarget,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct InstanceBackup {
     pub target: BackupTarget,
     pub retain_full: u32,
@@ -584,6 +592,9 @@ pub struct Instance {
     pub tasks: Vec<Task>,
     pub replication_mode: String,
     pub allowed_cidrs: Vec<String>,
+    /// Set while suspended or being deleted: connected clients are sent away,
+    /// not only new ones refused.
+    pub shut_out: bool,
     pub extensions: Vec<String>,
     pub owner: Owner,
     pub secrets: InstanceSecrets,

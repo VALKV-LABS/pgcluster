@@ -30,6 +30,11 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// How long to wait after a failed backup.
 const RETRY_DELAY: Duration = Duration::from_secs(60);
 
+/// Held for the length of each backup. Two at once, such as a new database's
+/// first backup and the scheduler's, can start in the same WAL segment on an
+/// idle cluster, and WAL-G then gives both the same name.
+static RUNNING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // ── BackupScheduler ────────────────────────────────────────────────────────────
 
 pub struct BackupScheduler {
@@ -80,6 +85,13 @@ impl BackupScheduler {
             }
 
             let topology = self.topology_rx.current();
+            // With no primary yet, as while a new cluster starts, nothing can
+            // be backed up. That is no backup failure: it would mark a new
+            // database degraded, and the cluster reports a missing primary
+            // itself.
+            if select_source(&topology, false).is_none() {
+                continue;
+            }
             // A failure, such as one while there was no primary, is retried
             // until a backup succeeds, rather than waiting for the next one due.
             let failing = self.runtime.last_backup_failure().is_some();
@@ -134,6 +146,7 @@ pub async fn run_backup(
     frequency: &str,
     label: &str,
 ) -> Result<BackupManifest> {
+    let _running = RUNNING.lock().await;
     let (mut source_node, agent_addr) = select_source(topology, config.prefer_replica)
         .ok_or_else(|| anyhow!("no suitable backup source"))?;
 

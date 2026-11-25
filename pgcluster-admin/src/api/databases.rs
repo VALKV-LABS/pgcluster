@@ -64,6 +64,12 @@ pub struct Database {
     server_version: Option<String>,
     /// The database this one is an external standby of.
     replica_of: Option<String>,
+    /// Set while a suspension keeps clients out.
+    suspended_at: Option<DateTime<Utc>>,
+    /// For a deleted database, when its backups are purged. Until then it can
+    /// be restored into a new database.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    purge_after: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -85,13 +91,15 @@ struct DatabaseRow {
     addresses: sqlx::types::Json<Vec<NodeAddress>>,
     observed: sqlx::types::Json<serde_json::Value>,
     server_version: Option<String>,
+    suspended_at: Option<DateTime<Utc>>,
+    purge_after: Option<DateTime<Utc>>,
 }
 
 /// Any node's proxy routes writes, so the endpoint is the first node on a host
 /// that is online.
 const DATABASE_QUERY: &str = "SELECT d.id, d.name, d.workspace, d.status, d.status_reason, \
         d.generation, d.spec, d.ca_cert_pem, d.created_at, d.updated_at, d.observed, \
-        e.address, e.port_base, a.addresses, v.server_version \
+        d.suspended_at, d.purge_after, e.address, e.port_base, a.addresses, v.server_version \
     FROM databases d \
     LEFT JOIN LATERAL (SELECT h.address, n.port_base FROM nodes n \
         JOIN hosts h ON h.id = n.host_id \
@@ -139,6 +147,8 @@ impl From<DatabaseRow> for Database {
             primary: row.observed.0["primary"].as_str().map(str::to_string),
             server_version: row.server_version,
             replica_of: spec.replica_of.map(|r| r.database_id),
+            suspended_at: row.suspended_at,
+            purge_after: row.purge_after,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -235,12 +245,30 @@ pub async fn check_capacity(state: &AdminState, spec: &DatabaseSpec) -> Result<(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct ListQuery {
+    /// `true` lists deleted databases whose backups can still be restored,
+    /// instead of live ones.
+    #[serde(default)]
+    deleted: bool,
+}
+
+/// A deleted database whose backups are kept. It can be restored from.
+pub const RESTORABLE_DELETED: &str =
+    "d.status = 'deleted' AND d.purge_after IS NOT NULL AND d.purged_at IS NULL";
+
 pub async fn list(
     State(state): State<AdminState>,
     page: Page,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<List<Database>>, ApiError> {
+    let filter = if query.deleted {
+        RESTORABLE_DELETED
+    } else {
+        "d.status <> 'deleted'"
+    };
     let rows = sqlx::query_as::<_, DatabaseRow>(&format!(
-        "{DATABASE_QUERY} WHERE d.status <> 'deleted' AND d.id > $1 ORDER BY d.id LIMIT $2"
+        "{DATABASE_QUERY} WHERE {filter} AND d.id > $1 ORDER BY d.id LIMIT $2"
     ))
     .bind(page.after())
     .bind(page.fetch_limit())
@@ -268,6 +296,23 @@ pub async fn spec_of(state: &AdminState, id: &str) -> Result<(String, DatabaseSp
             .await?;
     row.filter(|(_, status, _)| status != "deleted")
         .map(|(name, _, spec)| (name, spec.0))
+        .ok_or_else(|| ApiError::not_found("database"))
+}
+
+/// As `spec_of`, but also a deleted database whose backups are still kept,
+/// for what reads or restores them.
+pub async fn restorable_spec_of(
+    state: &AdminState,
+    id: &str,
+) -> Result<(String, DatabaseSpec), ApiError> {
+    let row: Option<(String, sqlx::types::Json<DatabaseSpec>)> = sqlx::query_as(&format!(
+        "SELECT d.name, d.spec FROM databases d \
+         WHERE d.id = $1 AND (d.status <> 'deleted' OR ({RESTORABLE_DELETED}))"
+    ))
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+    row.map(|(name, spec)| (name, spec.0))
         .ok_or_else(|| ApiError::not_found("database"))
 }
 
@@ -836,15 +881,48 @@ pub async fn start_replacement(
     Ok(operation)
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteQuery {
+    /// Left out, a database with backups that has opened to clients takes a
+    /// final backup before its nodes go. `false` skips it, such as when the
+    /// database is too broken to back up.
+    #[serde(default)]
+    final_backup: Option<bool>,
+}
+
+/// The label of the final backup a delete takes, unique to the operation so a
+/// retried delete never mistakes an older one for its own.
+fn final_backup_label(operation_id: &str) -> String {
+    format!("final-{}", &operation_id[..8.min(operation_id.len())])
+}
+
 pub async fn delete(
     State(state): State<AdminState>,
     Path(id): Path<String>,
+    Query(query): Query<DeleteQuery>,
 ) -> Result<(StatusCode, Json<Operation>), ApiError> {
     let mut tx = state.pool.begin().await?;
-    let (status, _) = lock(&mut tx, &id).await?;
+    let (status, spec) = lock(&mut tx, &id).await?;
     if status == "deleting" {
         return Err(ApiError::conflict("the database is already being deleted"));
     }
+    let access_open: bool = sqlx::query_scalar("SELECT access_open FROM databases WHERE id = $1")
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
+    // A replica's backups are its source's, and a database that never opened
+    // holds nothing a client wrote.
+    let can_back_up = spec.backup.is_some() && spec.replica_of.is_none() && access_open;
+    let final_backup = match query.final_backup {
+        Some(true) if !can_back_up => {
+            return Err(ApiError::conflict(
+                "the database has no backups to take a final one into",
+            ))
+        }
+        Some(wanted) => wanted,
+        None => can_back_up,
+    };
     if has_replicas(&mut tx, &id).await? {
         return Err(ApiError::conflict(
             "promote or delete this database's replicas first",
@@ -867,18 +945,103 @@ pub async fn delete(
     .bind(&id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "UPDATE databases SET status = 'deleting', status_reason = NULL, updated_at = now() \
-         WHERE id = $1",
+    // Clients are shut out at once: what they write after this would be lost.
+    let generation: i64 = sqlx::query_scalar(
+        "UPDATE databases SET status = 'deleting', status_reason = NULL, \
+                              generation = generation + 1, updated_at = now() \
+         WHERE id = $1 RETURNING generation",
     )
     .bind(&id)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
-    let generation: i64 = sqlx::query_scalar("SELECT generation FROM databases WHERE id = $1")
-        .bind(&id)
-        .fetch_one(&mut *tx)
+    bump_hosts(&mut tx, &id).await?;
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let operation = operations::create_with_id(
+        &mut tx,
+        &operation_id,
+        &id,
+        Kind::Delete,
+        generation,
+        json!({
+            "final_backup": final_backup,
+            "label": final_backup_label(&operation_id),
+        }),
+    )
+    .await?;
+    if final_backup {
+        // A backup takes as long as the data does.
+        sqlx::query(
+            "UPDATE operations SET deadline = now() + make_interval(secs => $2) WHERE id = $1",
+        )
+        .bind(&operation.id)
+        .bind(f64::from(operations::DATA_OPERATION_TIMEOUT_SECONDS))
+        .execute(&mut *tx)
         .await?;
-    let operation = operations::create(&mut tx, &id, Kind::Delete, generation).await?;
+    }
+    tx.commit().await?;
+    Ok((StatusCode::ACCEPTED, Json(operation)))
+}
+
+/// Shut clients out and drop those connected, keeping nodes, data and
+/// backups. Operations go on as before.
+pub async fn suspend(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<Operation>), ApiError> {
+    set_suspended(&state, &id, true).await
+}
+
+/// Let clients back in, through the allowlist the database had.
+pub async fn resume(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<Operation>), ApiError> {
+    set_suspended(&state, &id, false).await
+}
+
+async fn set_suspended(
+    state: &AdminState,
+    id: &str,
+    suspend: bool,
+) -> Result<(StatusCode, Json<Operation>), ApiError> {
+    let mut tx = state.pool.begin().await?;
+    let (status, spec) = lock(&mut tx, id).await?;
+    if spec.replica_of.is_some() {
+        return Err(ApiError::conflict(
+            "a replica takes no clients; suspend the database it follows",
+        ));
+    }
+    if status == "deleting" {
+        return Err(ApiError::conflict("the database is being deleted"));
+    }
+    let suspended: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT suspended_at FROM databases WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    match (suspend, suspended.is_some()) {
+        (true, true) => return Err(ApiError::conflict("the database is already suspended")),
+        (false, false) => return Err(ApiError::conflict("the database is not suspended")),
+        _ => {}
+    }
+    let generation: i64 = sqlx::query_scalar(
+        "UPDATE databases SET suspended_at = CASE WHEN $2 THEN now() END, \
+                              generation = generation + 1, updated_at = now() \
+         WHERE id = $1 RETURNING generation",
+    )
+    .bind(id)
+    .bind(suspend)
+    .fetch_one(&mut *tx)
+    .await?;
+    bump_hosts(&mut tx, id).await?;
+    let kind = if suspend { Kind::Suspend } else { Kind::Resume };
+    let operation = operations::create(&mut tx, id, kind, generation).await?;
+    let event = if suspend {
+        "database_suspended"
+    } else {
+        "database_resumed"
+    };
+    operations::event(&mut tx, event, Some(id), None, json!({})).await?;
     tx.commit().await?;
     Ok((StatusCode::ACCEPTED, Json(operation)))
 }

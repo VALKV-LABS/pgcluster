@@ -107,7 +107,7 @@ impl ProxyServer {
                 }
             };
 
-            if !self.allowlist.load().allows(peer_addr.ip()) {
+            if !self.allowlist.borrow().list.allows(peer_addr.ip()) {
                 tracing::debug!(%peer_addr, "client refused by allowed_cidrs");
                 continue;
             }
@@ -125,6 +125,7 @@ impl ProxyServer {
             let auth = Arc::clone(&self.auth);
             let require_tls = self.config.require_tls;
             let login_timeout = limits.login_timeout;
+            let allowlist = Arc::clone(&self.allowlist);
 
             tokio::spawn(async move {
                 m.proxy_connections_total.inc();
@@ -141,7 +142,11 @@ impl ProxyServer {
                     pool,
                     tls_clone,
                     auth,
-                    require_tls,
+                    connection::ClientPolicy {
+                        require_tls,
+                        allowlist,
+                        peer: peer_addr.ip(),
+                    },
                     login,
                 );
                 // A client that has not logged in by the deadline is dropped.

@@ -18,6 +18,7 @@
     }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body { margin: 0; background: var(--bg); color: var(--ink);
          font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
   header { display: flex; align-items: center; gap: 16px; padding: 12px 20px;
@@ -103,6 +104,9 @@ const WAIT_TIMEOUT_MS = 660000;
 const state = {
   tab: "databases",
   selected: null,
+  operation: null,
+  usage: null,     // The last usage query, so a refresh keeps it.
+  auditKey: "",
   passwords: {},   // Held in this page only, and gone on reload.
   once: null,
 };
@@ -225,17 +229,35 @@ function sqlBox(target, examples) {
 // ── Databases ─────────────────────────────────────────────────────────────────
 
 function repositoryForm() {
+  const s3 = el("div", { class: "row", hidden: true },
+    field("Bucket", el("input", { name: "bucket", size: 16 })),
+    field("Prefix", el("input", { name: "prefix", size: 12 })),
+    field("Region", el("input", { name: "region", size: 10 })),
+    field("Endpoint, for S3-compatible stores", el("input", { name: "endpoint", size: 24 })),
+    field("Path-style", el("input", { name: "path_style", type: "checkbox" })),
+    field("Access key ID", el("input", { name: "access_key_id", size: 16 })),
+    field("Secret access key", el("input", { name: "secret_access_key", type: "password", size: 16 })));
+  const posix = field("Directory every host can reach", el("input", { name: "path", value: "/backups", size: 24 }));
+  const kind = el("select", { name: "type", onchange: () => {
+    s3.hidden = kind.value !== "s3";
+    posix.hidden = kind.value === "s3";
+  } }, el("option", { value: "posix" }, "POSIX directory"), el("option", { value: "s3" }, "S3"));
   const form = el("form", { onsubmit: event => {
     event.preventDefault();
     const values = formValues(form);
-    act(`Register ${values.name}`, async () => {
-      const created = await call("POST", "/admin/v1/backup-repositories", { name: values.name, type: "posix", path: values.path });
-      await draw();
-      return created;
-    });
+    const body = values.type === "s3"
+      ? Object.fromEntries(Object.entries({
+          name: values.name, type: "s3", bucket: values.bucket, prefix: values.prefix, region: values.region,
+          endpoint: values.endpoint, access_key_id: values.access_key_id, secret_access_key: values.secret_access_key,
+        }).filter(([, value]) => value))
+      : { name: values.name, type: "posix", path: values.path };
+    if (values.type === "s3") body.path_style = values.path_style === "on";
+    act(`Register ${values.name}`, () => call("POST", "/admin/v1/backup-repositories", body));
   } },
     field("Name", el("input", { name: "name", required: true, value: "main" })),
-    field("Directory every host can reach", el("input", { name: "path", required: true, value: "/backups", size: 24 })),
+    field("Type", kind),
+    posix,
+    s3,
     el("button", { class: "primary" }, "Register repository"));
   return form;
 }
@@ -261,7 +283,9 @@ function createDatabaseForm(hosts, repositories) {
           ? { enabled: false }
           : { repository_id: values.repository, retention_days: Number(values.retention) },
       };
-      if (values.host) body.hosts = [values.host];
+      const chosen = [...form.querySelector('select[name="hosts"]').selectedOptions].map(option => option.value);
+      if (chosen.length) body.hosts = chosen;
+      if (values.workspace) body.workspace = values.workspace;
       const operation = await call("POST", "/admin/v1/databases", body);
       state.passwords[operation.database_id] = { username: values.owner, password: secret.password };
       state.once = { label: `Password for ${values.owner} on ${values.name}. It is not stored, and this page forgets it on reload.`, value: secret.password };
@@ -278,8 +302,9 @@ function createDatabaseForm(hosts, repositories) {
     field("vCPU", el("input", { name: "vcpu", type: "number", step: "0.5", min: "0.5", value: "1", style: "width:70px" })),
     field("Memory GB", el("input", { name: "memory_gb", type: "number", step: "0.5", min: "0.5", value: "1", style: "width:80px" })),
     field("Storage GB", el("input", { name: "storage_gb", type: "number", min: "1", value: "10", style: "width:80px" })),
-    field("Host", el("select", { name: "host" }, el("option", { value: "" }, "Most free"),
+    field("Hosts, one per node; none picks the most free", el("select", { name: "hosts", multiple: true, size: "3" },
       hosts.filter(h => h.status === "online").map(h => el("option", { value: h.id }, h.name)))),
+    field("Workspace label", el("input", { name: "workspace", size: 14 })),
     field("Allowed CIDRs", el("input", { name: "cidrs", value: "0.0.0.0/0", size: 20 })),
     field("Backup repository", el("select", { name: "repository" },
       repositories.map(r => el("option", { value: r.id }, r.name)))),
@@ -292,14 +317,16 @@ function createDatabaseForm(hosts, repositories) {
   return form;
 }
 
-async function databaseDetail(id) {
+async function databaseDetail(id, hosts) {
   const [database, nodes, operations] = await Promise.all([
     call("GET", `/admin/v1/databases/${id}`),
     call("GET", `/admin/v1/databases/${id}/nodes`),
     call("GET", `/admin/v1/databases/${id}/operations?limit=50`),
   ]);
-  const latest = [...operations.items].sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
-  const detail = latest ? await call("GET", `/admin/v1/databases/${id}/operations/${latest.id}`) : null;
+  const history = [...operations.items].sort((a, b) => b.created_at.localeCompare(a.created_at));
+  const shown = history.find(o => o.id === state.operation) || history[0];
+  const latest = shown;
+  const detail = shown ? await call("GET", `/admin/v1/databases/${id}/operations/${shown.id}`) : null;
   const endpoint = database.endpoint;
   const secret = state.passwords[id];
   const change = (label, path, method, body) => act(label, async () => {
@@ -342,6 +369,26 @@ async function databaseDetail(id) {
     field("New database", el("input", { name: "name", required: true, pattern: "[a-z_][a-z0-9_]*" })),
     field("Time, within the window", el("input", { name: "target_time", required: true, size: 28, value: restoreWindow ? restoreWindow.latest : "" })),
     el("button", { class: "plain" }, "Restore to a new database"));
+  const retentionForm = database.backup ? el("form", { onsubmit: event => {
+    event.preventDefault();
+    const days = Number(formValues(retentionForm).days);
+    act(`Keep ${days} days`, async () => {
+      await waitFor(await call("PATCH", `/admin/v1/databases/${id}`, { retention_days: days }));
+      return "applied";
+    });
+  } },
+    field("Restore window, days", el("input", { name: "days", type: "number", min: "1", value: String(database.backup.retention_days), style: "width:70px" })),
+    el("button", { class: "plain" }, "Change retention")) : null;
+  const certificateForm = el("form", { onsubmit: event => {
+    event.preventDefault();
+    const values = formValues(certificateForm);
+    change("Set the proxy certificate", "certificate", "PUT", {
+      certificate_pem: values.certificate_pem, private_key_pem: values.private_key_pem,
+    });
+  } },
+    field("Certificate chain, PEM", el("textarea", { name: "certificate_pem", required: true, spellcheck: "false" })),
+    field("Private key, PEM. It goes to pgcluster-admin, which stores it encrypted", el("textarea", { name: "private_key_pem", required: true, spellcheck: "false" })),
+    el("button", { class: "plain" }, "Use this certificate"));
   const extensionForm = el("form", { onsubmit: event => {
     event.preventDefault();
     change("Change extensions", "extensions", "PUT", { extensions: checked(extensionForm, "installed") });
@@ -376,6 +423,7 @@ async function databaseDetail(id) {
     el("button", { class: "plain" }, "Add a replica"));
 
   const password = el("input", { type: "password", value: secret?.password || "", "aria-label": "Owner password", size: 30 });
+  const finalBackup = el("input", { type: "checkbox", checked: true, "aria-label": "Take a final backup" });
   const sqlTarget = () => ({
     target: "database", host: endpoint.host, port: endpoint.port, database: endpoint.database,
     username: database.owner_username, password: password.value, ca_cert_pem: endpoint.ca_cert_pem,
@@ -392,9 +440,32 @@ async function databaseDetail(id) {
       { label: "Port", cell: n => String(n.port_base) },
       { label: "Generation", cell: n => `${n.observed_generation} of ${database.generation}` },
       { label: "State", cell: n => statusCell(n.state) },
+      { label: "Release", cell: n => n.server_version || "" },
       { label: "Error", cell: n => n.error || "" },
+      { label: "Replace", cell: n => {
+          if (!database.ha || database.replica_of) return "";
+          const used = new Set(nodes.items.map(m => m.host_id));
+          const spare = hosts.filter(h => h.status === "online" && !h.draining && !used.has(h.id));
+          if (!spare.length) return el("span", { class: "empty" }, "No spare host");
+          const pick = el("select", { "aria-label": `New host for ${n.node}` }, spare.map(h => el("option", { value: h.id }, h.name)));
+          return el("div", { class: "row" }, pick, el("button", { class: "plain", onclick: () => {
+            if (confirm(`Replace ${n.node} with a new node on the chosen host? The new one comes up first.`)) {
+              change(`Replace ${n.node}`, `nodes/${n.node}/replace`, "POST", { host_id: pick.value });
+            }
+          } }, "Replace"));
+        } },
     ], nodes.items, { empty: "Not placed yet." }),
-    el("h3", {}, "Allowlist. Empty means no access"),
+    database.replica_of ? null : [
+      el("h3", {}, database.suspended_at
+        ? `Suspended since ${database.suspended_at}: clients are shut out, and data and backups kept`
+        : "Access. A suspension shuts clients out and ends their sessions, keeping data and backups"),
+      el("div", { class: "row" }, database.suspended_at
+        ? el("button", { class: "primary", onclick: () => change("Resume", "resume", "POST") }, "Resume")
+        : el("button", { class: "danger", onclick: () => {
+            if (confirm(`Suspend ${database.name}? Connected clients are sent away.`)) change("Suspend", "suspend", "POST");
+          } }, "Suspend")),
+    ],
+    el("h3", {}, database.suspended_at ? "Allowlist, applied on resume. Empty means no access" : "Allowlist. Empty means no access"),
     el("div", { class: "row" }, allow,
       el("button", { class: "plain", onclick: () =>
         change("Change allowlist", "allowlist", "PUT", { allowed_cidrs: words(allow.value) }) }, "Apply allowlist")),
@@ -452,10 +523,15 @@ async function databaseDetail(id) {
       ], backups.items, { empty: "No backups yet." }),
       restoreWindow ? el("p", { class: "hint" }, `Restorable from ${restoreWindow.earliest} to ${restoreWindow.latest}.`) : null,
       restoreForm,
+      retentionForm,
     ] : [
       el("p", { class: "hint" }, "Backups are off: no WAL archive and no point-in-time restore. Turning them on needs no restart, and the restore window starts with the first backup."),
       enableForm,
     ]),
+    database.replica_of ? null : [
+      el("h3", {}, "Proxy certificate. Clients then verify the proxy against your CA, not the database's"),
+      certificateForm,
+    ],
     el("h3", {}, "Owner password"),
     el("div", { class: "row" },
       el("button", { class: "plain", onclick: () => act("Rotate password", async () => {
@@ -475,8 +551,19 @@ async function databaseDetail(id) {
         "SELECT rolname, rolsuper, rolcreatedb FROM pg_roles WHERE rolname = current_user;",
       ]),
     ] : null,
+    el("h3", {}, "Operation history"),
+    table([
+      { label: "Kind", cell: o => o.kind },
+      { label: "Status", cell: o => statusCell(o.status) },
+      { label: "Started", cell: o => o.created_at },
+      { label: "Finished", cell: o => o.finished_at || "" },
+      { label: "Error", cell: o => o.error || "" },
+    ], history.slice(0, 12), {
+      selected: o => o.id === shown?.id,
+      onrow: o => { state.operation = o.id; draw(); },
+    }),
     latest ? [
-      el("h3", {}, `Latest operation: ${latest.kind}`),
+      el("h3", {}, `${latest.id === history[0]?.id ? "Latest operation" : "Operation"}: ${latest.kind}`),
       table([
         { label: "Step", cell: s => s.name },
         { label: "Status", cell: s => statusCell(s.status) },
@@ -484,24 +571,42 @@ async function databaseDetail(id) {
       ], detail.steps),
       el("pre", {}, detail.logs.map(l => `${l.source}: ${l.message}`).join("\n") || "No log lines yet."),
     ] : null,
-    el("h3", {}, "Delete"),
-    el("button", { class: "danger", onclick: () => {
-      if (!confirm(`Delete ${database.name} and all its data?`)) return;
-      act(`Delete ${database.name}`, async () => {
-        const operation = await call("DELETE", `/admin/v1/databases/${id}`);
-        state.selected = null;
-        await waitFor(operation);
-        return "deleted";
-      });
-    } }, "Delete this database"));
+    el("h3", {}, database.backup
+      ? "Delete. Clients are shut out, then a final backup is taken, which stays restorable for the retention set in pgcluster-admin"
+      : "Delete"),
+    el("div", { class: "row" },
+      database.backup ? el("label", { style: "display:flex;gap:4px;align-items:center" }, finalBackup, "Take a final backup") : null,
+      el("button", { class: "danger", onclick: () => {
+        const keep = database.backup && finalBackup.checked;
+        if (!confirm(`Delete ${database.name}?${keep ? " A final backup is kept." : " Its data is gone for good."}`)) return;
+        act(`Delete ${database.name}`, async () => {
+          const query = database.backup && !finalBackup.checked ? "?final_backup=false" : "";
+          const operation = await call("DELETE", `/admin/v1/databases/${id}${query}`);
+          state.selected = null;
+          await waitFor(operation);
+          return keep ? "deleted, with its final backup kept" : "deleted";
+        });
+      } }, "Delete this database")));
 }
 
 async function drawDatabases() {
-  const [databases, hosts, repositories] = await Promise.all([
+  const [databases, hosts, repositories, deleted] = await Promise.all([
     call("GET", "/admin/v1/databases"),
     call("GET", "/admin/v1/hosts"),
     call("GET", "/admin/v1/backup-repositories"),
+    call("GET", "/admin/v1/databases?deleted=true"),
   ]);
+  const restoreDeleted = d => {
+    const name = prompt(`Name for the copy of ${d.name}, restored from its kept backups`, `${d.name}_restored`);
+    if (!name) return;
+    act(`Restore ${d.name} into ${name}`, async () => {
+      const span = await call("GET", `/admin/v1/databases/${d.id}/restore-window`);
+      const operation = await call("POST", `/admin/v1/databases/${d.id}/restore`, { name, target_time: span.latest });
+      state.selected = operation.database_id;
+      await waitFor(operation);
+      return { database: operation.database_id, restored_to: span.latest };
+    });
+  };
   const parts = [
     el("section", {}, el("h2", {}, "Backup repositories"),
       el("p", { class: "hint" }, "A database with backups opens only once it has a restorable backup, so register a repository first. A host proves it can write there."),
@@ -510,6 +615,11 @@ async function drawDatabases() {
         { label: "Type", cell: r => r.type },
         { label: "Where", cell: r => r.config.path || r.config.bucket || "" },
         { label: "Status", cell: r => statusCell(r.status) },
+        { label: "", cell: r => el("button", { class: "danger", onclick: () => {
+            if (confirm(`Remove repository ${r.name}? Databases using it must be gone, and their kept backups purged.`)) {
+              act(`Remove repository ${r.name}`, () => call("DELETE", `/admin/v1/backup-repositories/${r.id}`));
+            }
+          } }, "Remove") },
       ], repositories.items, { empty: "No repositories yet." }),
       repositoryForm()),
     el("section", {}, el("h2", {}, "Create a database"),
@@ -520,6 +630,9 @@ async function drawDatabases() {
       table([
         { label: "Name", cell: d => d.name },
         { label: "Status", cell: d => statusCell(d.status) },
+        { label: "Access", cell: d => d.suspended_at ? el("span", { class: "warn" }, "suspended") : "open" },
+        { label: "Workspace", cell: d => d.workspace || "" },
+        { label: "Nodes", cell: d => d.replica_of ? "replica" : d.ha ? "3" : "1" },
         { label: "Postgres", cell: d => d.version },
         { label: "Endpoint", cell: d => d.endpoint ? `${d.endpoint.host}:${d.endpoint.port}` : "" },
         { label: "Generation", cell: d => String(d.generation) },
@@ -529,8 +642,16 @@ async function drawDatabases() {
         onrow: d => { state.selected = d.id; draw(); },
       })),
   ];
+  parts.push(el("section", {}, el("h2", {}, "Deleted databases"),
+    el("p", { class: "hint" }, "A deleted database's backups, its final one included, stay restorable into a new database until they are purged."),
+    table([
+      { label: "Name", cell: d => d.name },
+      { label: "Deleted", cell: d => d.updated_at },
+      { label: "Purged after", cell: d => d.purge_after },
+      { label: "", cell: d => el("button", { class: "plain", onclick: () => restoreDeleted(d) }, "Restore into a new database") },
+    ], deleted.items, { empty: "None with backups kept." })));
   if (state.selected && databases.items.some(d => d.id === state.selected)) {
-    parts.push(await databaseDetail(state.selected));
+    parts.push(await databaseDetail(state.selected, hosts.items));
   }
   return parts;
 }
@@ -538,7 +659,7 @@ async function drawDatabases() {
 // ── Hosts ─────────────────────────────────────────────────────────────────────
 
 async function drawHosts() {
-  const hosts = await call("GET", "/admin/v1/hosts");
+  const [hosts, adminCa] = await Promise.all([call("GET", "/admin/v1/hosts"), call("GET", "/admin/v1/admin-ca")]);
   const capacity = c => c ? `${c.vcpu.toFixed(1)} vCPU, ${c.memory_gb.toFixed(1)} GB, ${c.storage_gb.toFixed(0)} GB disk` : "";
   const form = el("form", { onsubmit: event => {
     event.preventDefault();
@@ -577,6 +698,117 @@ async function drawHosts() {
               if (confirm(`Remove host ${h.name}?`)) act(`Remove host ${h.name}`, () => call("DELETE", `/admin/v1/hosts/${h.id}`));
             } }, "Remove")) },
       ], hosts.items)),
+    el("section", {}, el("h2", {}, "Admin CA"),
+      el("p", { class: "hint" }, "Hosts and API clients trust this. A rotation moves in three phases, each once every enrolled host has caught up: trust both, issue from the new one, then drop the old. Read the bundle again before the issue phase."),
+      el("div", { class: "cards" },
+        el("div", { class: "card" }, el("span", {}, "Rotation"), adminCa.phase || "none running"),
+        el("div", { class: "card" }, el("span", {}, "Waiting for"), adminCa.waiting_for.length ? adminCa.waiting_for.join(", ") : "nobody")),
+      el("div", { class: "row" }, el("button", { class: "plain", disabled: Boolean(adminCa.phase), onclick: () => {
+        if (confirm("Rotate the admin CA? Every host gets a new certificate, and API clients need the new bundle.")) {
+          act("Rotate the admin CA", () => call("POST", "/admin/v1/admin-ca/rotate"));
+        }
+      } }, adminCa.phase ? "Rotation running" : "Rotate the admin CA")),
+      el("pre", {}, adminCa.bundle_pem)),
+  ];
+}
+
+// ── Usage ─────────────────────────────────────────────────────────────────────
+
+function monthStart() {
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString().replace(".000", "");
+}
+
+async function drawUsage() {
+  const query = state.usage || { from: monthStart(), to: "", workspace: "", database_id: "" };
+  const params = new URLSearchParams(Object.entries(query).filter(([, value]) => value));
+  const [usage, databases] = await Promise.all([
+    call("GET", `/admin/v1/usage?${params}`),
+    call("GET", "/admin/v1/databases"),
+  ]);
+  const form = el("form", { onsubmit: event => {
+    event.preventDefault();
+    state.usage = formValues(form);
+    draw();
+  } },
+    field("From, RFC 3339", el("input", { name: "from", required: true, size: 24, value: query.from })),
+    field("To, or empty for now", el("input", { name: "to", size: 24, value: query.to })),
+    field("Workspace", el("input", { name: "workspace", size: 14, value: query.workspace })),
+    field("Database", el("select", { name: "database_id" }, el("option", { value: "" }, "All"),
+      databases.items.map(d => el("option", { value: d.id, selected: d.id === query.database_id }, d.name)))),
+    el("button", { class: "primary" }, "Show usage"));
+  const number = (value, digits = 2) => Number(value).toFixed(digits);
+  const gb = bytes => `${(bytes / 1073741824).toFixed(3)} GB`;
+  const total = key => usage.items.reduce((sum, item) => sum + item[key], 0);
+  const rows = usage.items.length ? [...usage.items, {
+    name: "Total", kind: "", status: "", workspace: "",
+    node_hours: total("node_hours"), vcpu_hours: total("vcpu_hours"), memory_gb_hours: total("memory_gb_hours"),
+    storage_gb_hours: total("storage_gb_hours"), storage_gb_months: total("storage_gb_months"),
+    backup_bytes: total("backup_bytes"),
+  }] : [];
+  return [
+    el("section", {}, el("h2", {}, "Usage"),
+      el("p", { class: "hint" }, "Node time at the resources each node had, so three nodes for an hour is three node-hours. Backups are what the repository holds now, so a deleted database counts until its backups are purged."),
+      form,
+      el("p", { class: "hint" }, `From ${usage.from} to ${usage.to}.`),
+      table([
+        { label: "Database", cell: u => u.name },
+        { label: "Kind", cell: u => u.kind },
+        { label: "Status", cell: u => u.status ? statusCell(u.status) : "" },
+        { label: "Workspace", cell: u => u.workspace || "" },
+        { label: "Node hours", cell: u => number(u.node_hours) },
+        { label: "vCPU hours", cell: u => number(u.vcpu_hours) },
+        { label: "Memory GB-hours", cell: u => number(u.memory_gb_hours) },
+        { label: "Storage GB-months", cell: u => number(u.storage_gb_months, 3) },
+        { label: "Backups held", cell: u => gb(u.backup_bytes) },
+      ], rows, { empty: "Nothing ran in this period." }),
+      usage.next_page_token ? el("p", { class: "hint" }, "More databases follow; narrow the query to see them.") : null),
+  ];
+}
+
+// ── Events and audit ──────────────────────────────────────────────────────────
+
+// Both feeds list oldest first, so follow them to their end and keep the newest.
+async function newest(path, params, keep = 50) {
+  let items = [];
+  let token = null;
+  for (let page = 0; page < 40; page++) {
+    const query = new URLSearchParams({ ...params, limit: "500" });
+    if (token) query.set("page_token", token);
+    const result = await call("GET", `${path}?${query}`);
+    items = items.concat(result.items).slice(-keep);
+    token = result.next_page_token;
+    if (!token) break;
+  }
+  return items.reverse();
+}
+
+async function drawEvents() {
+  const [events, audit] = await Promise.all([
+    newest("/admin/v1/events", {}),
+    newest("/admin/v1/audit-log", state.auditKey ? { key: state.auditKey } : {}),
+  ]);
+  const key = el("input", { value: state.auditKey, size: 16, "aria-label": "API key name" });
+  return [
+    el("section", {}, el("h2", {}, "Events"),
+      el("p", { class: "hint" }, "What changed across the fleet, newest first: nodes going offline, failovers, backups, suspensions, purges. Tooling reads this with a cursor instead of polling every database."),
+      table([
+        { label: "When", cell: e => e.at },
+        { label: "Event", cell: e => statusCell(e.type) },
+        { label: "Database", cell: e => e.database_id || "" },
+        { label: "Node", cell: e => e.node || "" },
+        { label: "Detail", cell: e => Object.keys(e.detail || {}).length ? el("code", {}, JSON.stringify(e.detail)) : "" },
+      ], events, { empty: "No events yet." })),
+    el("section", {}, el("h2", {}, "Audit log"),
+      el("p", { class: "hint" }, "Every change made through the admin API, and the key that made it."),
+      el("div", { class: "row" }, field("Key name, or empty for all", key),
+        el("button", { class: "plain", onclick: () => { state.auditKey = key.value.trim(); draw(); } }, "Filter")),
+      table([
+        { label: "When", cell: a => a.at },
+        { label: "Key", cell: a => a.key_name },
+        { label: "Change", cell: a => el("code", {}, `${a.method} ${a.path}`) },
+        { label: "Answer", cell: a => el("span", { class: a.status < 400 ? "good" : "bad" }, String(a.status)) },
+      ], audit, { empty: "No changes yet." })),
   ];
 }
 
@@ -698,6 +930,8 @@ async function drawBackups() {
 const TABS = {
   databases: ["Databases", drawDatabases],
   hosts: ["Hosts", drawHosts],
+  usage: ["Usage", drawUsage],
+  events: ["Events and audit", drawEvents],
   cluster: ["Cluster", drawCluster],
   backups: ["Backups", drawBackups],
 };

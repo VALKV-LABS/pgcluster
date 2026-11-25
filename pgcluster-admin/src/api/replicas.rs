@@ -3,7 +3,7 @@
 //! asynchronously, takes no part in its Raft group or failover, and `promote`
 //! detaches it into a one-node database of its own.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -141,7 +141,7 @@ pub async fn delete(
     Path((id, replica_id)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<Operation>), ApiError> {
     replica_of(&state, &id, &replica_id).await?;
-    super::databases::delete(State(state), Path(replica_id)).await
+    super::databases::delete(State(state), Path(replica_id), Query(Default::default())).await
 }
 
 /// Detach a replica into an independent one-node database. It keeps what it

@@ -127,6 +127,30 @@ impl WalG {
             .unwrap_or_default()
     }
 
+    /// The config version, but only while Postgres archives through this
+    /// node's config. `pg_basebackup` and `pg_rewind` copy
+    /// `postgresql.auto.conf` from the node they read, and with it that node's
+    /// `archive_command`, which names a file this host does not have. The
+    /// version file lives outside the data directory and survives the copy,
+    /// so on its own it would claim archiving works while every segment
+    /// fails. Reporting no version has the monitor configure the node again.
+    pub async fn applied_version(&self, pg: &LocalPostgres) -> String {
+        let version = self.config_version().await;
+        if version.is_empty() {
+            return version;
+        }
+        match pg.get_setting("archive_command").await {
+            Ok(command) if command != self.archive_command() => {
+                tracing::warn!(
+                    archive_command = %command,
+                    "archive_command is not this node's own, so the backup settings are applied again"
+                );
+                String::new()
+            }
+            _ => version,
+        }
+    }
+
     fn version_path(&self) -> String {
         format!("{}.version", self.config_path)
     }
@@ -135,7 +159,18 @@ impl WalG {
     pub async fn backup_push(&self, data_dir: &Path) -> Result<(String, u64)> {
         let mut command = self.command();
         command.arg("backup-push").arg(data_dir);
-        self.run(command, "backup-push").await?;
+        if let Err(e) = self.run(command, "backup-push").await {
+            // After a failover that dropped the old primary's last commits,
+            // as async replication can, the newest backup may end past where
+            // this timeline is now. No delta can build on it, so take a full.
+            if !format!("{e:#}").contains(DELTA_BASE_AHEAD) {
+                return Err(e);
+            }
+            tracing::warn!("the last backup ends past this timeline, taking a full backup");
+            let mut full = self.command();
+            full.arg("backup-push").arg("--full").arg(data_dir);
+            self.run(full, "backup-push --full").await?;
+        }
         let newest = self
             .list()
             .await?
@@ -313,6 +348,9 @@ pub fn repository_settings(target: &BackupTarget) -> HashMap<String, String> {
     settings
 }
 
+/// What WAL-G says when the newest backup ends past the current WAL position.
+const DELTA_BASE_AHEAD: &str = "greater than current LSN";
+
 /// A repository reached from outside any instance, by `vk-agent host`.
 pub struct Repository {
     pub binary: String,
@@ -382,6 +420,15 @@ impl Repository {
         let mut remove = self.command();
         remove.args(["st", "rm"]).arg(&name);
         self.run(remove, "cleanup check").await?;
+        Ok(())
+    }
+
+    /// Remove every backup and WAL segment under this repository's prefix,
+    /// for a deleted database past its retention.
+    pub async fn purge(&self) -> Result<()> {
+        let mut command = self.command();
+        command.args(["delete", "everything", "FORCE", "--confirm"]);
+        self.run(command, "delete everything").await?;
         Ok(())
     }
 

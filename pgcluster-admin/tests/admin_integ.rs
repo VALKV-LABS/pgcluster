@@ -704,6 +704,10 @@ async fn a_database_goes_through_its_whole_life() {
     assert_eq!(operation["target_generation"], 3);
     let (_, state) = f.desired(&host, before).await;
     assert_eq!(state["instances"][0]["allowed_cidrs"], json!([]));
+    assert_eq!(
+        state["instances"][0]["shut_out"], false,
+        "an empty allowlist keeps connected clients"
+    );
     let (_, list) = f.api("GET", &format!("{path}/allowlist"), None).await;
     assert_eq!(list["allowed_cidrs"], json!([]));
     f.report(
@@ -724,6 +728,28 @@ async fn a_database_goes_through_its_whole_life() {
     let (status, _) = f.api("DELETE", &path, None).await;
     assert_eq!(status, 409, "a second delete conflicts");
     f.drain().await;
+    // Clients are shut out at once, and the final backup waits until the
+    // host has done that, so it holds every commit.
+    let (_, state) = f.desired(&host, 0).await;
+    assert_eq!(state["instances"][0]["allowed_cidrs"], json!([]));
+    assert_eq!(state["instances"][0]["shut_out"], true);
+    assert_eq!(state["instances"][0]["tasks"], json!([]));
+    f.report(
+        &host,
+        f.generation(&host_id).await,
+        running(&database_id, 4),
+    )
+    .await;
+    f.hurry().await;
+    f.drain().await;
+    let (_, state) = f.desired(&host, 0).await;
+    let task = &state["instances"][0]["tasks"][0];
+    assert_eq!(task["kind"], "backup");
+    let label = task["params"]["label"].as_str().unwrap().to_string();
+    assert!(label.starts_with("final-"), "{label}");
+    f.answer_backup(&host, task, "base_final").await;
+    f.hurry().await;
+    f.drain().await;
     let (_, state) = f.desired(&host, 0).await;
     assert_eq!(state["instances"], json!([]));
     f.report(&host, f.generation(&host_id).await, json!([]))
@@ -731,6 +757,19 @@ async fn a_database_goes_through_its_whole_life() {
     f.hurry().await;
     f.drain().await;
     assert_eq!(f.api("GET", &path, None).await.0, 404);
+
+    // Its backups are kept, the final one included, and it is listed as
+    // deleted until they are purged.
+    let (_, deleted) = f.api("GET", "/v1/databases?deleted=true", None).await;
+    assert_eq!(deleted["items"][0]["id"], database_id.as_str(), "{deleted}");
+    assert_eq!(deleted["items"][0]["status"], "deleted");
+    assert!(deleted["items"][0]["purge_after"].is_string(), "{deleted}");
+    let (_, live) = f.api("GET", "/v1/databases", None).await;
+    assert_eq!(live["items"], json!([]));
+    let (status, backups) = f.api("GET", &format!("{path}/backups"), None).await;
+    assert_eq!(status, 200, "{backups}");
+    assert_eq!(backups["items"][0]["id"], "base_final");
+    assert_eq!(backups["items"][0]["label"], label.as_str());
     let (status, _) = f.api("DELETE", &format!("/v1/hosts/{host_id}"), None).await;
     assert_eq!(status, 204);
 
@@ -2226,6 +2265,25 @@ impl Fixture {
             .1
     }
 
+    /// Answer a backup task as the leader does, with what a delete records.
+    async fn answer_backup(&self, host: &reqwest::Client, task: &Value, backup_id: &str) {
+        let url = format!(
+            "{}/agent/v1/tasks/{}/result",
+            self.agent_url,
+            task["id"].as_str().unwrap()
+        );
+        let body = json!({
+            "success": true,
+            "output": {
+                "backup_id": backup_id,
+                "completed_at": chrono::Utc::now().timestamp(),
+                "size_bytes": 4096,
+            },
+        });
+        let response = host.post(url).json(&body).send().await.unwrap();
+        assert_eq!(response.status(), 204);
+    }
+
     async fn database_generation(&self, database_id: &str) -> i64 {
         sqlx::query_scalar("SELECT generation FROM databases WHERE id = $1")
             .bind(database_id)
@@ -3036,4 +3094,373 @@ async fn a_stale_leader_cannot_overwrite_the_cluster_report() {
     // A host that sends no term is not fenced.
     report(1, 0, "n2").await;
     assert_eq!(primary().await.as_deref(), Some("n2"));
+}
+
+/// A suspension shuts clients out while the database keeps running, and a
+/// resume lets them back in through the allowlist it had.
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_suspended_database_shuts_clients_out_until_it_resumes() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (host_id, database_id, host) = active_database(&f).await;
+    let path = format!("/v1/databases/{database_id}");
+
+    let (status, resume) = f.api("POST", &format!("{path}/resume"), None).await;
+    assert_eq!(status, 409, "{resume}");
+    let (status, operation) = f.api("POST", &format!("{path}/suspend"), None).await;
+    assert_eq!(status, 202, "{operation}");
+    assert_eq!(operation["kind"], "suspend");
+    let (status, _) = f.api("POST", &format!("{path}/suspend"), None).await;
+    assert_eq!(status, 409, "a second suspend conflicts");
+    let (_, state) = f.desired(&host, 0).await;
+    assert_eq!(state["instances"][0]["allowed_cidrs"], json!([]));
+    assert_eq!(
+        state["instances"][0]["shut_out"], true,
+        "connected clients go too"
+    );
+    let (_, body) = f.api("GET", &path, None).await;
+    assert!(body["suspended_at"].is_string(), "{body}");
+    assert_eq!(body["status"], "active", "a suspended database still runs");
+    assert_eq!(body["allowed_cidrs"], json!(["198.51.100.0/24"]), "kept");
+
+    // An allowlist change while suspended waits for the resume.
+    let (status, _) = f
+        .api(
+            "PUT",
+            &format!("{path}/allowlist"),
+            Some(json!({ "allowed_cidrs": ["203.0.113.0/24"] })),
+        )
+        .await;
+    assert_eq!(status, 202);
+    let (_, state) = f.desired(&host, 0).await;
+    assert_eq!(state["instances"][0]["allowed_cidrs"], json!([]));
+
+    let generation = f.database_generation(&database_id).await;
+    f.report(
+        &host,
+        f.generation(&host_id).await,
+        running(&database_id, generation),
+    )
+    .await;
+    f.hurry().await;
+    f.drain().await;
+    let detail = f.operation(&path, &operation).await;
+    assert_eq!(detail["status"], "succeeded", "{detail}");
+
+    let (status, operation) = f.api("POST", &format!("{path}/resume"), None).await;
+    assert_eq!(status, 202, "{operation}");
+    let (_, state) = f.desired(&host, 0).await;
+    assert_eq!(
+        state["instances"][0]["allowed_cidrs"],
+        json!(["203.0.113.0/24"])
+    );
+    assert_eq!(state["instances"][0]["shut_out"], false);
+    let (_, body) = f.api("GET", &path, None).await;
+    assert_eq!(body["suspended_at"], Value::Null);
+    let (_, events) = f.api("GET", "/v1/events", None).await;
+    let kinds = events.to_string();
+    assert!(kinds.contains("database_suspended"), "{kinds}");
+    assert!(kinds.contains("database_resumed"), "{kinds}");
+}
+
+/// A delete can skip the final backup, such as for a database too broken to
+/// back up, and asking for one without backups is refused.
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_delete_can_skip_its_final_backup() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (host_id, database_id, host) = active_database(&f).await;
+    let path = format!("/v1/databases/{database_id}");
+    let (status, operation) = f
+        .api("DELETE", &format!("{path}?final_backup=false"), None)
+        .await;
+    assert_eq!(status, 202, "{operation}");
+    f.drain().await;
+    let (_, state) = f.desired(&host, 0).await;
+    assert_eq!(state["instances"], json!([]), "no backup was asked for");
+    f.report(&host, f.generation(&host_id).await, json!([]))
+        .await;
+    f.hurry().await;
+    f.drain().await;
+    let (_, deleted) = f.api("GET", "/v1/databases?deleted=true", None).await;
+    assert_eq!(deleted["items"], json!([]), "nothing was kept: {deleted}");
+    let secrets: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT secrets FROM databases WHERE id = $1")
+            .bind(&database_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert!(secrets.is_none(), "nothing left to restore needs a key");
+
+    let mut request = database_request("ledger");
+    request["backup"] = json!({ "enabled": false });
+    let (status, body) = f.api("POST", "/v1/databases", Some(request)).await;
+    assert_eq!(status, 202, "{body}");
+    let ledger = body["database_id"].as_str().unwrap();
+    let (status, _) = f
+        .api(
+            "DELETE",
+            &format!("/v1/databases/{ledger}?final_backup=true"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 409);
+}
+
+/// A deleted database's backups restore into a new database until they are
+/// purged, which waits for a restore under way and is then done by a host.
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_deleted_database_restores_until_its_backups_are_purged() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (host_id, database_id, host) = active_database(&f).await;
+    let path = format!("/v1/databases/{database_id}");
+    let (status, _) = f.api("DELETE", &path, None).await;
+    assert_eq!(status, 202);
+    f.drain().await;
+    let generation = f.database_generation(&database_id).await;
+    f.report(
+        &host,
+        f.generation(&host_id).await,
+        running(&database_id, generation),
+    )
+    .await;
+    f.hurry().await;
+    f.drain().await;
+    let (_, state) = f.desired(&host, 0).await;
+    f.answer_backup(&host, &state["instances"][0]["tasks"][0], "base_final")
+        .await;
+    f.hurry().await;
+    f.drain().await;
+    f.report(&host, f.generation(&host_id).await, json!([]))
+        .await;
+    f.hurry().await;
+    f.drain().await;
+    assert_eq!(f.api("GET", &path, None).await.0, 404);
+
+    let (status, window) = f.api("GET", &format!("{path}/restore-window"), None).await;
+    assert_eq!(status, 200, "{window}");
+    let (status, operation) = f
+        .api(
+            "POST",
+            &format!("{path}/restore"),
+            Some(json!({ "name": "orders_back", "target_time": window["latest"] })),
+        )
+        .await;
+    assert_eq!(status, 202, "{operation}");
+    let restored = operation["database_id"].as_str().unwrap().to_string();
+    f.drain().await;
+    let (_, state) = f.desired(&host, 0).await;
+    let instance = &state["instances"][0];
+    assert_eq!(instance["database_id"], restored.as_str());
+    assert_eq!(
+        instance["restore"]["source"]["path"],
+        format!("/backups/{database_id}"),
+        "{instance}"
+    );
+    assert_eq!(instance["restore"]["source_database"], "orders");
+
+    // Past retention, the purge waits while the restore still reads them.
+    sqlx::query("UPDATE databases SET purge_after = now() - interval '1 second' WHERE id = $1")
+        .bind(&database_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    pgcluster_admin::lifecycle::advance(&f.state).await.unwrap();
+    let (_, state) = f.desired(&host, 0).await;
+    assert_eq!(state["repository_purges"], json!([]));
+
+    sqlx::query("UPDATE databases SET status = 'active' WHERE id = $1")
+        .bind(&restored)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    pgcluster_admin::lifecycle::advance(&f.state).await.unwrap();
+    let (_, state) = f.desired(&host, 0).await;
+    let purge = &state["repository_purges"][0];
+    assert_eq!(purge["database_id"], database_id.as_str(), "{state}");
+    assert_eq!(purge["target"]["path"], format!("/backups/{database_id}"));
+
+    // A failure is tried again later.
+    let url = format!("{}/agent/v1/repository-purges/{database_id}", f.agent_url);
+    let response = host
+        .post(&url)
+        .json(&json!({ "error": "the repository is unreachable" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let (_, state) = f.desired(&host, 0).await;
+    assert_eq!(state["repository_purges"], json!([]));
+    pgcluster_admin::lifecycle::advance(&f.state).await.unwrap();
+    let (_, state) = f.desired(&host, 0).await;
+    assert_eq!(
+        state["repository_purges"],
+        json!([]),
+        "not before the retry"
+    );
+
+    sqlx::query("UPDATE databases SET purge_after = now() - interval '1 second' WHERE id = $1")
+        .bind(&database_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    pgcluster_admin::lifecycle::advance(&f.state).await.unwrap();
+    let response = host.post(&url).json(&json!({})).send().await.unwrap();
+    assert_eq!(response.status(), 204);
+    let (_, state) = f.desired(&host, 0).await;
+    assert_eq!(state["repository_purges"], json!([]));
+    let (_, deleted) = f.api("GET", "/v1/databases?deleted=true", None).await;
+    assert_eq!(deleted["items"], json!([]));
+    let (status, _) = f.api("GET", &format!("{path}/backups"), None).await;
+    assert_eq!(status, 404);
+    let (status, _) = f
+        .api(
+            "POST",
+            &format!("{path}/restore"),
+            Some(json!({ "name": "too_late", "target_time": window["latest"] })),
+        )
+        .await;
+    assert_eq!(status, 404);
+    let (_, events) = f.api("GET", "/v1/events", None).await;
+    let kinds = events.to_string();
+    assert!(kinds.contains("backup_purge_failed"), "{kinds}");
+    assert!(kinds.contains("backups_purged"), "{kinds}");
+}
+
+/// Usage counts each node for as long as it ran, at the resources it had.
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn usage_counts_each_node_for_as_long_as_it_ran() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (_, database_id, _) = active_database(&f).await;
+    let path = format!("/v1/databases/{database_id}");
+    // The node has run for two hours.
+    sqlx::query(
+        "UPDATE usage_intervals SET started_at = now() - interval '2 hours' \
+         WHERE database_id = $1",
+    )
+    .bind(&database_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO backups (database_id, id, label, completed_at, size_bytes) \
+         VALUES ($1, 'base_1', 'nightly', now(), 1000), ($1, 'base_2', 'nightly', now(), 500)",
+    )
+    .bind(&database_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+
+    let from = (chrono::Utc::now() - chrono::Duration::hours(3))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (status, usage) = f.api("GET", &format!("/v1/usage?from={from}"), None).await;
+    assert_eq!(status, 200, "{usage}");
+    let item = &usage["items"][0];
+    assert_eq!(item["database_id"], database_id.as_str());
+    assert_eq!(item["kind"], "database");
+    let near = |value: &Value, want: f64| {
+        let got = value.as_f64().unwrap();
+        assert!((got - want).abs() < 0.05, "{got} is not near {want}");
+    };
+    near(&item["node_hours"], 2.0);
+    near(&item["vcpu_hours"], 2.0);
+    near(&item["memory_gb_hours"], 2.0);
+    near(&item["storage_gb_hours"], 20.0);
+    near(&item["storage_gb_months"], 20.0 / 730.0);
+    assert_eq!(item["backup_bytes"], 1500);
+
+    // A resize starts a new interval at the new size.
+    let (status, body) = f
+        .api(
+            "PATCH",
+            &path,
+            Some(json!({ "resources": { "vcpu": 2, "memory_gb": 1, "storage_gb": 10 } })),
+        )
+        .await;
+    assert_eq!(status, 202, "{body}");
+    let intervals: Vec<(f64, bool)> = sqlx::query_as(
+        "SELECT vcpu, ended_at IS NULL FROM usage_intervals WHERE database_id = $1 ORDER BY id",
+    )
+    .bind(&database_id)
+    .fetch_all(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(intervals, vec![(1.0, false), (2.0, true)]);
+
+    // Only what falls inside the period counts, and filters narrow it.
+    let from = (chrono::Utc::now() - chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (_, usage) = f
+        .api(
+            "GET",
+            &format!("/v1/usage?from={from}&database_id={database_id}"),
+            None,
+        )
+        .await;
+    near(&usage["items"][0]["node_hours"], 1.0);
+    let (_, usage) = f
+        .api(
+            "GET",
+            &format!("/v1/usage?from={from}&workspace=other"),
+            None,
+        )
+        .await;
+    assert_eq!(usage["items"], json!([]));
+    let (status, _) = f
+        .api("GET", "/v1/usage?from=2099-01-01T00:00:00Z", None)
+        .await;
+    assert_eq!(status, 422);
+
+    // Removing the node ends its interval.
+    sqlx::query("DELETE FROM nodes WHERE database_id = $1")
+        .bind(&database_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM usage_intervals WHERE database_id = $1 AND ended_at IS NULL",
+    )
+    .bind(&database_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(open, 0);
+}
+
+/// A cluster that lists one backup twice, as when two were taken at once,
+/// still has its report taken: it carries the primary too.
+#[tokio::test]
+#[ignore = "requires Postgres (ADMIN_TEST_DATABASE_URL)"]
+async fn a_report_listing_a_backup_twice_still_moves_the_primary() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let ha = f.ha().await;
+    let url = format!("{}/agent/v1/cluster", f.agent_url);
+    let backup = |label: &str| json!({ "id": "base_1", "label": label, "completed_at": 1_800_000_000, "size_bytes": 5 });
+    let body = json!({
+        "database_id": ha.database_id,
+        "primary": "n3",
+        "backups": [backup("first-backup"), backup("scheduled")],
+    });
+    let response = ha.hosts[0].1.post(&url).json(&body).send().await.unwrap();
+    assert_eq!(response.status(), 204);
+    let (_, database) = f.api("GET", &ha.path, None).await;
+    assert_eq!(database["primary"], "n3");
+    let completed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE type = 'backup_completed'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(completed, 1);
 }

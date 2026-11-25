@@ -16,7 +16,7 @@ use sqlx::Connection;
 
 use super::instance::{quote_literal, InstanceManager};
 use super::model::{raft_id, BackupReport, ClusterReport, Instance, Task};
-use super::render::{self, REPLICATION_USER, SUPERUSER};
+use super::render::{self, AUTH_USER, REPLICATION_USER, SUPERUSER};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Adding a learner returns once it has caught up, which is the slow part.
@@ -28,7 +28,6 @@ const BACKUP_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 const SEED_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 /// Close enough to the primary to take over from a node.
 const CAUGHT_UP_BYTES: u64 = 16 * 1024 * 1024;
-const AUTH_USER: &str = "pgcluster_auth";
 
 /// This instance's own `pgcluster`, on loopback.
 pub struct LocalApi {
@@ -173,12 +172,15 @@ impl LocalApi {
         Ok(self.get::<NodeList>("/api/nodes").await?.nodes)
     }
 
-    /// The standby closest to the primary.
-    async fn best_standby(&self) -> Result<String> {
+    /// The standby closest to the primary. Roles and the primary are kept
+    /// apart in the topology and can briefly disagree, so the primary is left
+    /// out by name too: picking it would make a switchover that moves nothing.
+    async fn best_standby(&self, primary: Option<&str>) -> Result<String> {
         self.nodes()
             .await?
             .into_iter()
             .filter(|n| n.role.eq_ignore_ascii_case("replica"))
+            .filter(|n| Some(n.node_id.as_str()) != primary)
             .min_by_key(|n| n.lag_bytes)
             .map(|n| n.node_id)
             .context("no standby can take over")
@@ -192,10 +194,18 @@ impl LocalApi {
         }
         let target = match target {
             Some(target) => target.to_string(),
-            None => self.best_standby().await?,
+            None => self.best_standby(primary.as_deref()).await?,
         };
-        self.post("/api/switchover", json!({ "target_node_id": target }))
-            .await?;
+        // The cluster may get there on its own between the check and this,
+        // such as through a failover. The primary it ends with is what counts.
+        if let Err(e) = self
+            .post("/api/switchover", json!({ "target_node_id": target }))
+            .await
+        {
+            if self.primary().await.ok().flatten().as_deref() != Some(target.as_str()) {
+                return Err(e);
+            }
+        }
         let deadline = Instant::now() + SWITCHOVER_TIMEOUT;
         loop {
             if self.primary().await.ok().flatten().as_deref() == Some(target.as_str()) {
@@ -232,7 +242,13 @@ impl LocalApi {
         loop {
             let backups: Backups = self.get("/api/backups").await?;
             if let Some(found) = backups.backups.iter().find(|b| b.label == label) {
-                return Ok(json!({ "backup_id": found.backup_id }));
+                // A delete records its final backup from this, since no
+                // report follows once the nodes are gone.
+                return Ok(json!({
+                    "backup_id": found.backup_id,
+                    "completed_at": found.completed_at,
+                    "size_bytes": found.size_bytes,
+                }));
             }
             let status: BackupStatus = self.get("/api/backups/status").await?;
             if status.failed_label.as_deref() == Some(label) {

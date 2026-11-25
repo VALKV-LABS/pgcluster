@@ -18,6 +18,9 @@ pub struct DesiredState {
     /// Backup repositories this host should prove it can write to.
     #[serde(default)]
     pub repository_checks: Vec<RepositoryCheck>,
+    /// Deleted databases whose backups this host should remove.
+    #[serde(default)]
+    pub repository_purges: Vec<RepositoryPurge>,
     /// Which CAs to trust for the agent API, during a rotation of the admin CA.
     #[serde(default)]
     pub admin_ca: Option<AdminCa>,
@@ -65,6 +68,12 @@ impl std::fmt::Debug for BackupTarget {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryCheck {
     pub id: String,
+    pub target: BackupTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepositoryPurge {
+    pub database_id: String,
     pub target: BackupTarget,
 }
 
@@ -168,6 +177,10 @@ pub struct Instance {
     pub tasks: Vec<Task>,
     pub replication_mode: String,
     pub allowed_cidrs: Vec<String>,
+    /// Set while the database is suspended or being deleted: connected
+    /// clients are sent away too, where an empty allowlist alone keeps them.
+    #[serde(default)]
+    pub shut_out: bool,
     pub extensions: Vec<String>,
     pub owner: Owner,
     pub secrets: InstanceSecrets,
@@ -466,6 +479,7 @@ pub mod tests {
             tasks: vec![],
             replication_mode: "async".into(),
             allowed_cidrs: vec!["198.51.100.0/24".into()],
+            shut_out: false,
             extensions: vec!["vector".into()],
             owner: Owner {
                 username: "app_owner".into(),

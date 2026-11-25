@@ -262,7 +262,7 @@ This is a custom virtual schema served entirely by pgcluster — the queries nev
 
 ## Client Access
 
-`[proxy] allowed_cidrs` lists the client addresses the proxy accepts. An empty list refuses everyone, and leaving it out accepts everyone. SIGHUP reloads it from the config file, and clients already connected stay connected. The proxy is the only place this can work: Postgres sees the proxy's address, so `pg_hba.conf` cannot filter clients.
+`[proxy] allowed_cidrs` lists the client addresses the proxy accepts. An empty list refuses everyone, and leaving it out accepts everyone. SIGHUP reloads it from the config file, and clients already connected stay connected, unless `drop_refused_clients = true`: then a reload also sends away each connected client the list no longer accepts, with `57P01`, once it next waits for a message, so no reply is cut short and its backend goes back to the pool. `vk-agent host` sets it for a suspended or deleted database. The proxy is the only place this can work: Postgres sees the proxy's address, so `pg_hba.conf` cannot filter clients.
 
 `[proxy] require_tls = true` refuses clients that do not negotiate TLS.
 

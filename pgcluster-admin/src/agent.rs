@@ -21,7 +21,7 @@ use crate::error::ApiError;
 use crate::model::{
     BackupTarget, ClusterReport, DatabaseSpec, DesiredState, Instance, InstanceBackup,
     InstanceRestore, InstanceSecrets, Peer, Report, RepositoryCheck, RepositoryCheckResult,
-    RepositoryConfig, Task, TaskResult,
+    RepositoryConfig, RepositoryPurge, Task, TaskResult,
 };
 use crate::operations::{self, event};
 use crate::reconciler::bump_hosts;
@@ -51,6 +51,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/agent/v1/operations/:id/log", post(append_log))
         .route("/agent/v1/tasks/:id/result", post(task_result))
         .route("/agent/v1/repository-checks/:id", post(repository_check))
+        .route("/agent/v1/repository-purges/:id", post(repository_purge))
         .route("/agent/v1/cluster", post(cluster_report))
         .with_state(state)
 }
@@ -260,6 +261,7 @@ struct InstanceRow {
     bootstrap: String,
     address: Option<String>,
     access_open: bool,
+    shut_out: bool,
 }
 
 /// What a database's nodes need to know about its repository.
@@ -305,6 +307,36 @@ async fn checks_for(state: &AdminState, host_id: &str) -> Result<Vec<RepositoryC
     Ok(checks)
 }
 
+/// Deleted databases whose backups this host was chosen to remove.
+async fn purges_for(state: &AdminState, host_id: &str) -> Result<Vec<RepositoryPurge>, ApiError> {
+    let rows: Vec<(String, sqlx::types::Json<DatabaseSpec>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT id, spec, secrets FROM databases \
+         WHERE purge_host_id = $1 AND purged_at IS NULL ORDER BY id",
+    )
+    .bind(host_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let mut purges = Vec::with_capacity(rows.len());
+    for (database_id, spec, sealed) in rows {
+        let (Some(policy), Some(sealed)) = (&spec.0.backup, sealed) else {
+            continue;
+        };
+        let database: DatabaseSecrets = state.secrets.open(&database_id, &sealed)?;
+        let (kind, config, credentials) = repository(state, &policy.repository_id).await?;
+        purges.push(RepositoryPurge {
+            target: BackupTarget::for_database(
+                &kind,
+                config,
+                credentials,
+                &database_id,
+                database.backup_key,
+            ),
+            database_id,
+        });
+    }
+    Ok(purges)
+}
+
 fn to_peers(rows: Vec<(String, Option<String>, i32)>) -> Vec<Peer> {
     rows.into_iter()
         .filter_map(|(node, address, port_base)| {
@@ -334,7 +366,10 @@ pub async fn build_desired_state(
     let rows = sqlx::query_as::<_, InstanceRow>(
         "SELECT n.database_id, d.name AS database_name, n.node, n.port_base, \
                 n.secrets AS node_secrets, d.generation, d.spec, n.bootstrap, h.address, \
-                d.access_open, d.secrets AS database_secrets, \
+                (d.access_open AND d.suspended_at IS NULL AND d.status <> 'deleting') \
+                    AS access_open, \
+                (d.suspended_at IS NOT NULL OR d.status = 'deleting') AS shut_out, \
+                d.secrets AS database_secrets, \
                 (SELECT o.id FROM operations o \
                  WHERE o.database_id = d.id AND o.status IN ('pending', 'running') \
                  ORDER BY o.seq LIMIT 1) AS operation_id \
@@ -348,6 +383,7 @@ pub async fn build_desired_state(
     .await?;
     tx.commit().await?;
     let repository_checks = checks_for(state, host_id).await?;
+    let repository_purges = purges_for(state, host_id).await?;
     let admin_ca = crate::rotation::for_hosts(state).await?;
 
     let mut instances = Vec::with_capacity(rows.len());
@@ -447,12 +483,14 @@ pub async fn build_desired_state(
             backup,
             tasks,
             replication_mode: spec.replication_mode,
-            // Clients get no access until a restorable backup exists.
+            // Clients get no access until a restorable backup exists, while
+            // suspended, or once a delete starts.
             allowed_cidrs: if row.access_open {
                 spec.allowed_cidrs
             } else {
                 vec![]
             },
+            shut_out: row.shut_out,
             extensions: spec.extensions,
             owner: spec.owner,
             secrets: InstanceSecrets::merge(database, node),
@@ -465,6 +503,7 @@ pub async fn build_desired_state(
         generation,
         instances,
         repository_checks,
+        repository_purges,
         admin_ca,
     })
 }
@@ -614,6 +653,69 @@ async fn repository_check(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// A host removed a deleted database's backups, or could not. A failure is
+/// tried again later, on whichever host is chosen then.
+async fn repository_purge(
+    State(state): State<AdminState>,
+    Host(host_id): Host,
+    Path(id): Path<String>,
+    Body(result): Body<RepositoryCheckResult>,
+) -> Result<StatusCode, ApiError> {
+    let mut tx = state.pool.begin().await?;
+    let updated = match &result.error {
+        None => {
+            // Nothing is left to restore, so the backup key goes too.
+            sqlx::query(
+                "UPDATE databases SET purged_at = now(), purge_host_id = NULL, \
+                                      purge_error = NULL, secrets = NULL \
+                 WHERE id = $1 AND purge_host_id = $2 AND purged_at IS NULL",
+            )
+            .bind(&id)
+            .bind(&host_id)
+            .execute(&mut *tx)
+            .await?
+        }
+        Some(error) => {
+            sqlx::query(
+                "UPDATE databases SET purge_host_id = NULL, purge_error = $3, \
+                                      purge_after = now() + make_interval(secs => $4) \
+                 WHERE id = $1 AND purge_host_id = $2 AND purged_at IS NULL",
+            )
+            .bind(&id)
+            .bind(&host_id)
+            .bind(error)
+            .bind(crate::lifecycle::PURGE_RETRY.as_secs_f64())
+            .execute(&mut *tx)
+            .await?
+        }
+    };
+    if updated.rows_affected() > 0 {
+        crate::reconciler::bump_host(&mut tx, &host_id).await?;
+        match &result.error {
+            None => {
+                sqlx::query("DELETE FROM backups WHERE database_id = $1")
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await?;
+                event(
+                    &mut tx,
+                    "backups_purged",
+                    Some(&id),
+                    None,
+                    serde_json::json!({}),
+                )
+                .await?;
+            }
+            Some(error) => {
+                let detail = serde_json::json!({ "error": error });
+                event(&mut tx, "backup_purge_failed", Some(&id), None, detail).await?;
+            }
+        }
+    }
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Record what a cluster's leader says, and turn what changed into events. This
 /// is a record: the cluster goes on deciding for itself.
 async fn cluster_report(
@@ -683,9 +785,11 @@ async fn cluster_report(
         if known.contains(&backup.id) {
             continue;
         }
-        sqlx::query(
+        // A cluster can list one backup twice, as when two were taken at
+        // once. That must not fail the report, which carries the primary too.
+        let inserted = sqlx::query(
             "INSERT INTO backups (database_id, id, label, completed_at, size_bytes) \
-             VALUES ($1, $2, $3, to_timestamp($4), $5)",
+             VALUES ($1, $2, $3, to_timestamp($4), $5) ON CONFLICT DO NOTHING",
         )
         .bind(id)
         .bind(&backup.id)
@@ -694,6 +798,9 @@ async fn cluster_report(
         .bind(backup.size_bytes)
         .execute(&mut *tx)
         .await?;
+        if inserted.rows_affected() == 0 {
+            continue;
+        }
         let detail = serde_json::json!({ "backup_id": backup.id, "label": backup.label });
         event(&mut tx, "backup_completed", Some(id), None, detail).await?;
     }

@@ -217,6 +217,11 @@ async fn endpoint(client: &reqwest::Client, id: &str) -> Endpoint {
     }
 }
 
+/// As `endpoint`, for a test whose own `endpoint` hides it.
+async fn endpoint_of(client: &reqwest::Client, id: &str) -> Endpoint {
+    endpoint(client, id).await
+}
+
 impl Endpoint {
     fn options(&self, password: &str) -> PgConnectOptions {
         PgConnectOptions::new()
@@ -429,6 +434,35 @@ async fn e2e_admin_one_node_database() {
     let client = admin_client();
     wait_online(&client, HOST).await;
 
+    // A suspension sends connected clients away and refuses new ones, while
+    // the database keeps running, and a resume lets them back in.
+    let mut owner = endpoint.wait_connectable(&password).await;
+    cli(HOST, &format!("database suspend {id} --wait"));
+    wait_for(
+        "the connected client to be sent away",
+        Duration::from_secs(20),
+        async || {
+            sqlx::query("SELECT 1")
+                .persistent(false)
+                .execute(&mut owner)
+                .await
+                .is_err()
+        },
+    )
+    .await;
+    assert!(endpoint.connect(&password).await.is_err());
+    let database = api(&client, "GET", &format!("/v1/databases/{id}"), None).await;
+    assert!(database["suspended_at"].is_string(), "{database}");
+    assert_eq!(database["status"], "active", "{database}");
+    cli(HOST, &format!("database resume {id} --wait"));
+    let mut owner = endpoint.wait_connectable(&password).await;
+    sqlx::query("INSERT INTO t VALUES ('last')")
+        .persistent(false)
+        .execute(&mut owner)
+        .await
+        .unwrap();
+    owner.close().await.ok();
+
     // A host cannot go while it runs something, and a delete removes the data.
     let (host_id, _) = host_ids(&client).await;
     let refused = cli_fails(HOST, &format!("host delete {host_id}"));
@@ -437,6 +471,36 @@ async fn e2e_admin_one_node_database() {
     let gone = exec_on(HOST, &format!("test -e {}", instance_dir(id)));
     assert!(!gone.status.success(), "the instance directory should go");
     assert!(endpoint.connect(&password).await.is_err());
+
+    // Its final backup holds the last commit, and restores into a new database.
+    let deleted = cli(HOST, "database list --deleted");
+    assert!(deleted.contains(id), "{deleted}");
+    let window = api(
+        &client,
+        "GET",
+        &format!("/v1/databases/{id}/restore-window"),
+        None,
+    )
+    .await;
+    let latest = window["latest"].as_str().unwrap();
+    let output = cli(
+        HOST,
+        &format!("database restore {id} orders_back --time {latest} --wait"),
+    );
+    let restored_id = output
+        .lines()
+        .find_map(|l| l.strip_prefix("database "))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("no database in\n{output}"));
+    let restored = endpoint_of(&client, &restored_id).await;
+    let mut copy = restored.wait_connectable(&password).await;
+    let rows = scalar(&mut copy, "SELECT string_agg(v, ',' ORDER BY v) FROM t").await;
+    assert_eq!(rows, "kept,last", "the final backup holds every commit");
+    copy.close().await.ok();
+    cli(
+        HOST,
+        &format!("database delete {restored_id} --no-final-backup --wait"),
+    );
 }
 
 /// A database created without backups opens with no repository and archives
@@ -999,18 +1063,125 @@ async fn e2e_admin_console_full_stack() {
     .await;
     console(&client, "GET", "/cluster/api/backups/verify", None).await;
 
-    // Delete the database again.
+    // A suspension shuts the owner out, and a resume lets them back in.
+    let path = format!("/admin/v1/databases/{id}");
+    let as_owner = |database: &Value, sql: &str| {
+        let endpoint = &database["endpoint"];
+        serde_json::json!({
+            "target": "database",
+            "host": endpoint["host"],
+            "port": endpoint["port"],
+            "database": endpoint["database"],
+            "username": "app_owner",
+            "password": secret["password"],
+            "ca_cert_pem": endpoint["ca_cert_pem"],
+            "sql": sql,
+        })
+    };
+    let operation = console(&client, "POST", &format!("{path}/suspend"), None).await;
+    console_operation(&client, &operation).await;
+    let suspended = console(&client, "GET", &path, None).await;
+    assert!(suspended["suspended_at"].is_string(), "{suspended}");
+    let (status, _) = console_call(
+        &client,
+        "POST",
+        "/console/sql",
+        Some(as_owner(&database, "SELECT 1")),
+    )
+    .await;
+    assert_eq!(status, 400, "a suspended database refuses clients");
+    let operation = console(&client, "POST", &format!("{path}/resume"), None).await;
+    console_operation(&client, &operation).await;
+    wait_for(
+        "the owner to get back in",
+        Duration::from_secs(30),
+        async || {
+            let (status, _) = console_call(
+                &client,
+                "POST",
+                "/console/sql",
+                Some(as_owner(&database, "SELECT 1")),
+            )
+            .await;
+            status == 200
+        },
+    )
+    .await;
+
+    // Retention changes online.
+    let operation = console(
+        &client,
+        "PATCH",
+        &path,
+        Some(serde_json::json!({ "retention_days": 14 })),
+    )
+    .await;
+    console_operation(&client, &operation).await;
+    let changed = console(&client, "GET", &path, None).await;
+    assert_eq!(changed["backup"]["retention_days"], 14);
+
+    // Usage, events, the audit log and the admin CA all answer.
+    let from = (chrono::Utc::now() - chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let usage = console(
+        &client,
+        "GET",
+        &format!("/admin/v1/usage?from={from}&database_id={id}"),
+        None,
+    )
+    .await;
+    assert_eq!(usage["items"][0]["database_id"], id, "{usage}");
+    assert!(usage["items"][0]["node_hours"].as_f64().unwrap() > 0.0);
+    let events = console(&client, "GET", "/admin/v1/events?limit=500", None).await;
+    let kinds = events.to_string();
+    assert!(kinds.contains("database_suspended"), "{kinds}");
+    assert!(kinds.contains("database_resumed"), "{kinds}");
+    let audit = console(&client, "GET", "/admin/v1/audit-log?limit=500", None).await;
+    assert!(audit.to_string().contains("/suspend"), "{audit}");
+    let admin_ca = console(&client, "GET", "/admin/v1/admin-ca", None).await;
+    assert!(admin_ca["bundle_pem"]
+        .as_str()
+        .unwrap()
+        .contains("BEGIN CERTIFICATE"));
+
+    // Delete the database, with a final backup it can be restored from.
+    let operation = console(&client, "DELETE", &path, None).await;
+    console_operation(&client, &operation).await;
+    let (status, _) = console_call(&client, "GET", &path, None).await;
+    assert_eq!(status, 404);
+    let deleted = console(&client, "GET", "/admin/v1/databases?deleted=true", None).await;
+    assert_eq!(deleted["items"][0]["id"], id, "{deleted}");
+    let window = console(&client, "GET", &format!("{path}/restore-window"), None).await;
+    let operation = console(
+        &client,
+        "POST",
+        &format!("{path}/restore"),
+        Some(serde_json::json!({ "name": "console_back", "target_time": window["latest"] })),
+    )
+    .await;
+    console_operation(&client, &operation).await;
+    let restored_id = operation["database_id"].as_str().unwrap();
+    let restored_path = format!("/admin/v1/databases/{restored_id}");
+    let restored = console(&client, "GET", &restored_path, None).await;
+    let result = console(
+        &client,
+        "POST",
+        "/console/sql",
+        Some(as_owner(
+            &restored,
+            "SELECT extname FROM pg_extension WHERE extname = 'vector'",
+        )),
+    )
+    .await;
+    assert_eq!(result["rows"][0], serde_json::json!(["vector"]));
     let operation = console(
         &client,
         "DELETE",
-        &format!("/admin/v1/databases/{id}"),
+        &format!("{restored_path}?final_backup=false"),
         None,
     )
     .await;
     console_operation(&client, &operation).await;
-    let (status, _) =
-        console_call(&client, "GET", &format!("/admin/v1/databases/{id}"), None).await;
-    assert_eq!(status, 404);
 }
 
 // ── Three nodes ───────────────────────────────────────────────────────────────

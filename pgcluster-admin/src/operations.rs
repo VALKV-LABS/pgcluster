@@ -34,6 +34,10 @@ pub enum Kind {
     PromoteReplica,
     /// Backups turned on for a database created without them.
     EnableBackup,
+    /// Clients shut out, with nodes, data and backups kept.
+    Suspend,
+    /// Clients let back in after a suspension.
+    Resume,
 }
 
 impl Kind {
@@ -55,6 +59,8 @@ impl Kind {
             Self::CreateReplica => "create_replica",
             Self::PromoteReplica => "promote_replica",
             Self::EnableBackup => "enable_backup",
+            Self::Suspend => "suspend",
+            Self::Resume => "resume",
         }
     }
 
@@ -76,6 +82,8 @@ impl Kind {
             "create_replica" => Some(Self::CreateReplica),
             "promote_replica" => Some(Self::PromoteReplica),
             "enable_backup" => Some(Self::EnableBackup),
+            "suspend" => Some(Self::Suspend),
+            "resume" => Some(Self::Resume),
             _ => None,
         }
     }
@@ -101,8 +109,15 @@ impl Kind {
                 "settle",
             ],
             Self::ReplicationMode => &["wait_applied", "set_replication_mode", "settle"],
-            // A replica leaves its source's cluster first.
-            Self::Delete => &["remove_replica", "retract", "wait_removed", "finalize"],
+            // A replica leaves its source's cluster first. Clients are shut
+            // out from the start, so the final backup holds every commit.
+            Self::Delete => &[
+                "remove_replica",
+                "final_backup",
+                "retract",
+                "wait_removed",
+                "finalize",
+            ],
             Self::Restart => &["rolling_restart", "settle"],
             Self::Switchover => &["switchover", "settle"],
             Self::Backup => &["backup", "settle"],
@@ -154,6 +169,8 @@ impl Kind {
             // Every node archives, and the leader backs up, once hosts apply
             // the policy. The restore window starts with this backup.
             Self::EnableBackup => &["wait_applied", "first_backup", "settle"],
+            // Nodes drop connected clients as they apply the empty allowlist.
+            Self::Suspend | Self::Resume => &["wait_applied", "settle"],
         }
     }
 
@@ -207,12 +224,24 @@ pub async fn create_with(
     params: Value,
 ) -> Result<Operation, sqlx::Error> {
     let id = uuid::Uuid::new_v4().to_string();
+    create_with_id(tx, &id, database_id, kind, target_generation, params).await
+}
+
+/// As `create_with`, under an ID chosen first, for params that name it.
+pub async fn create_with_id(
+    tx: &mut Transaction<'_, Postgres>,
+    id: &str,
+    database_id: &str,
+    kind: Kind,
+    target_generation: i64,
+    params: Value,
+) -> Result<Operation, sqlx::Error> {
     let operation = sqlx::query_as::<_, Operation>(&format!(
         "INSERT INTO operations (id, database_id, kind, target_generation, deadline, params) \
          VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5), $6) \
          RETURNING {OPERATION_COLUMNS}"
     ))
-    .bind(&id)
+    .bind(id)
     .bind(database_id)
     .bind(kind.as_str())
     .bind(target_generation)
@@ -222,7 +251,7 @@ pub async fn create_with(
     .await?;
     for (seq, name) in kind.steps().iter().enumerate() {
         sqlx::query("INSERT INTO operation_steps (operation_id, seq, name) VALUES ($1, $2, $3)")
-            .bind(&id)
+            .bind(id)
             .bind(seq as i32)
             .bind(name)
             .execute(&mut **tx)

@@ -19,7 +19,7 @@ use super::firewall;
 use super::fsutil::{give_to, write_private_if_changed};
 use super::model::Instance;
 use super::quota;
-use super::render::{self, Layout, REPLICATION_USER, SUPERUSER};
+use super::render::{self, Layout, AUTH_USER, REPLICATION_USER, SUPERUSER};
 use super::restore::Restorer;
 use super::runner::{command_as, Processes, RunAs, Runner};
 
@@ -37,6 +37,9 @@ pub struct Applied {
     /// The bootstrap ran to its end, so a restart must not repeat it.
     #[serde(default)]
     pub bootstrapped: bool,
+    /// The allowlist was empty, and connected clients were sent away.
+    #[serde(default)]
+    pub shut_out: bool,
 }
 
 /// How far an instance got.
@@ -277,6 +280,23 @@ impl InstanceManager<'_> {
             .fetch_one(&mut postgres)
             .await
             .context("ask whether this is a standby")?;
+        // A suspension or a delete empties the allowlist, which keeps new
+        // clients out at the proxy, reloaded by now. Those already connected
+        // are sent away here: ending their backends has the proxy drop them,
+        // and its pool discards those connections. An allowlist emptied by
+        // hand leaves connected clients be, as a reload always has.
+        let shut_out = instance.shut_out;
+        if shut_out && !applied.shut_out {
+            let ended = end_client_sessions(&mut postgres).await?;
+            if ended > 0 {
+                self.client
+                    .log(
+                        instance.operation_id.as_deref(),
+                        &format!("ended {ended} client session(s)"),
+                    )
+                    .await;
+            }
+        }
         // Replication carries everything below to standbys, which cannot write.
         // A standby keeps the old record, so that if it is promoted before the
         // primary finished, the health check notices and it finishes the job.
@@ -307,6 +327,7 @@ impl InstanceManager<'_> {
         record.host_id = self.client.host_id.clone();
         record.generation = instance.generation;
         record.bootstrapped = true;
+        record.shut_out = shut_out;
         write_applied(layout, &record, self.run_as)?;
         Ok(Progress::Running)
     }
@@ -879,6 +900,22 @@ struct FilesChanged {
     proxy_config: bool,
 }
 
+/// End every client's session, leaving those of the system's own roles:
+/// superusers (this agent and `pgcluster`), replication, and the role the
+/// proxy reads verifiers through. Works on a standby too, where the proxy
+/// sends reads. Returns how many were ended.
+async fn end_client_sessions(postgres: &mut PgConnection) -> Result<i64> {
+    sqlx::query_scalar(
+        "SELECT count(*) FILTER (WHERE pg_terminate_backend(a.pid)) \
+         FROM pg_stat_activity a JOIN pg_roles r ON r.oid = a.usesysid \
+         WHERE a.backend_type = 'client backend' AND a.pid <> pg_backend_pid() \
+           AND NOT r.rolsuper AND NOT r.rolreplication AND r.rolname <> $1",
+    )
+    .bind(AUTH_USER)
+    .fetch_one(postgres)
+    .await
+    .context("end client sessions")
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,10 +1001,12 @@ mod tests {
             verifier: "v".into(),
             extensions: vec!["vector".into()],
             bootstrapped: true,
+            shut_out: true,
         };
         write_applied(&layout, &applied, None).unwrap();
         let back = read_applied(&layout).unwrap();
         assert_eq!(back.generation, 3);
         assert_eq!(back.host_id, "h");
+        assert!(back.shut_out);
     }
 }
