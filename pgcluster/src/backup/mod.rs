@@ -84,6 +84,9 @@ impl BackupScheduler {
                 continue;
             }
 
+            // Read what is due only once no other backup runs: one that just
+            // finished, such as a new database's first, makes this one early.
+            let _running = RUNNING.lock().await;
             let topology = self.topology_rx.current();
             // With no primary yet, as while a new cluster starts, nothing can
             // be backed up. That is no backup failure: it would mark a new
@@ -106,7 +109,7 @@ impl BackupScheduler {
             }
 
             let label = format!("scheduled-{}", chrono::Utc::now().format("%Y-%m-%d"));
-            match run_backup(
+            match run_backup_locked(
                 &self.raft,
                 &topology,
                 &self.pool,
@@ -147,6 +150,18 @@ pub async fn run_backup(
     label: &str,
 ) -> Result<BackupManifest> {
     let _running = RUNNING.lock().await;
+    run_backup_locked(raft, topology, pool, config, frequency, label).await
+}
+
+/// As `run_backup`, for a caller already holding `RUNNING`.
+async fn run_backup_locked(
+    raft: &Arc<RaftNode>,
+    topology: &ClusterTopology,
+    pool: &AgentClientPool,
+    config: &BackupConfig,
+    frequency: &str,
+    label: &str,
+) -> Result<BackupManifest> {
     let (mut source_node, agent_addr) = select_source(topology, config.prefer_replica)
         .ok_or_else(|| anyhow!("no suitable backup source"))?;
 

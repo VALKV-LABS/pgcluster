@@ -35,13 +35,23 @@ fn project_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
+/// A connection string for pgcluster-1's proxy. `E2E_PROXY_PORT` moves it,
+/// with an override that publishes it there.
+fn proxy_dsn(user: &str, password: &str) -> String {
+    let port = std::env::var("E2E_PROXY_PORT").unwrap_or_else(|_| "5432".into());
+    format!("host=localhost port={port} user={user} password={password} dbname=postgres")
+}
+
 /// Run a `docker compose` command from the project root.  Panics on failure.
 fn compose(args: &[&str]) -> std::process::Output {
     let root = project_root();
-    let output = Command::new("docker")
-        .arg("compose")
-        .arg("-f")
-        .arg(COMPOSE_FILE)
+    let mut command = Command::new("docker");
+    command.arg("compose").arg("-f").arg(COMPOSE_FILE);
+    // Another compose file, such as one moving the proxy off a port in use.
+    if let Ok(path) = std::env::var("E2E_COMPOSE_OVERRIDE") {
+        command.arg("-f").arg(path);
+    }
+    let output = command
         .args(args)
         .current_dir(&root)
         .stdout(Stdio::piped())
@@ -316,7 +326,7 @@ async fn e2e_cluster_forms_and_has_primary() {
         .expect("POST /api/switchover");
     assert_eq!(response.status(), 401, "a write without a key must fail");
 
-    let dsn = "host=localhost port=5432 user=postgres password=test dbname=postgres";
+    let dsn = &proxy_dsn("postgres", "test");
     let (pg, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
         .await
         .expect("connect through the proxy");
@@ -1619,7 +1629,7 @@ async fn e2e_proxy_authenticates_clients_and_uses_tls_to_postgres() {
     );
 
     // The extended protocol, as drivers use it.
-    let dsn = "host=localhost port=5432 user=app password=app-secret dbname=postgres";
+    let dsn = &proxy_dsn("app", "app-secret");
     let (pg, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
         .await
         .expect("connect with the extended protocol");
@@ -1650,26 +1660,32 @@ async fn e2e_proxy_authenticates_clients_and_uses_tls_to_postgres() {
     );
 
     // pgcluster-3 has read routing on, so it logs in to a replica for the client.
+    // Until it has heard how far the replicas are behind, it rightly sends
+    // reads to the primary, so a fresh stack may need a moment.
     let dsn = "host=localhost port=25432 user=app password=app-secret dbname=postgres";
-    let (pg, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
-        .await
-        .expect("connect to the routing proxy");
-    tokio::spawn(connection);
     let value = |rows: &[tokio_postgres::SimpleQueryMessage]| {
         rows.iter().find_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
             _ => None,
         })
     };
-    let rows = pg
-        .simple_query("SELECT pg_is_in_recovery()")
-        .await
-        .expect("read through the routing proxy");
-    assert_eq!(
-        value(&rows).as_deref(),
-        Some("t"),
-        "reads must reach a replica"
-    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let pg = loop {
+        let (pg, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to the routing proxy");
+        tokio::spawn(connection);
+        let rows = pg
+            .simple_query("SELECT pg_is_in_recovery()")
+            .await
+            .expect("read through the routing proxy");
+        if value(&rows).as_deref() == Some("t") {
+            break pg;
+        }
+        assert!(Instant::now() < deadline, "reads must reach a replica");
+        drop(pg);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
     let rows = pg
         .simple_query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
         .await
@@ -1701,7 +1717,7 @@ async fn e2e_proxy_authenticates_clients_and_uses_tls_to_postgres() {
 #[ignore = "requires Docker daemon and sufficient system resources"]
 async fn e2e_prepared_statements_survive_pooling() {
     start_stack();
-    let dsn = "host=localhost port=5432 user=postgres password=test dbname=postgres";
+    let dsn = &proxy_dsn("postgres", "test");
 
     let pg = connect_with_retries(dsn).await;
     let add = pg.prepare("SELECT $1::int + 1").await.expect("prepare");
@@ -1758,6 +1774,73 @@ async fn e2e_prepared_statements_survive_pooling() {
         .expect("prepare again");
     let row = pg.query_one(&again, &[&1i32]).await.expect("run again");
     assert_eq!(row.get::<_, i32>(0), 2);
+
+    compose(&["down", "-v", "--remove-orphans"]);
+}
+
+/// A client that leaves inside a transaction must leave nothing behind. Each
+/// login brings a fresh backend that its own session uses first, so the
+/// client that would inherit a leaked one is one already connected: `pg`
+/// below. It must never find itself inside another client's open
+/// transaction, seeing its uncommitted rows and holding its locks. More rounds
+/// than the pool holds per user also show each abandoned backend gives its
+/// place back.
+#[tokio::test]
+#[ignore = "requires Docker daemon and sufficient system resources"]
+async fn e2e_a_client_leaving_mid_transaction_leaves_nothing_behind() {
+    start_stack();
+    let dsn = &proxy_dsn("postgres", "test");
+
+    let pg = connect_with_retries(dsn).await;
+    pg.batch_execute(
+        "DROP TABLE IF EXISTS abandoned, kept; \
+         CREATE TABLE abandoned (round int); CREATE TABLE kept (round int)",
+    )
+    .await
+    .expect("create tables");
+
+    for round in 0..40i32 {
+        let leaver = connect_with_retries(dsn).await;
+        leaver.batch_execute("BEGIN").await.expect("begin");
+        leaver
+            .execute("INSERT INTO abandoned VALUES ($1)", &[&round])
+            .await
+            .expect("insert inside the transaction");
+        drop(leaver);
+        // Let the proxy see the client go before `pg` asks for a backend.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let seen: i64 = tokio::time::timeout(
+            Duration::from_secs(10),
+            pg.query_one("SELECT count(*) FROM abandoned", &[]),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("round {round}: the pool must not run out"))
+        .expect("count")
+        .get(0);
+        assert_eq!(
+            seen, 0,
+            "round {round}: another client's open transaction leaked"
+        );
+        pg.execute("INSERT INTO kept VALUES ($1)", &[&round])
+            .await
+            .expect("autocommit insert");
+    }
+
+    // Every autocommit insert committed, so none ran inside an abandoned
+    // transaction, and no abandoned insert ever did.
+    let check = connect_with_retries(dsn).await;
+    let kept: i64 = check
+        .query_one("SELECT count(*) FROM kept", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let abandoned: i64 = check
+        .query_one("SELECT count(*) FROM abandoned", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!((kept, abandoned), (40, 0));
 
     compose(&["down", "-v", "--remove-orphans"]);
 }

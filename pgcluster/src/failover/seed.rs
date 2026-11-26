@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use tracing::warn;
@@ -14,6 +15,8 @@ use crate::raft::topology::ClusterTopology;
 pub struct SeedPlan {
     node_id: String,
     agent_addr: String,
+    primary_node_id: String,
+    primary_agent_addr: String,
     primary_host: String,
     primary_port: u32,
     primary_addr: String,
@@ -38,6 +41,11 @@ impl SeedPlan {
         let primary_addr = topology
             .primary_postgres_addr()
             .ok_or_else(|| anyhow!("the cluster has no primary"))?;
+        let primary_agent_addr = topology
+            .node_configs
+            .get(&topology.primary_node_id)
+            .map(|p| p.agent_addr.clone())
+            .ok_or_else(|| anyhow!("the primary has no agent address"))?;
         let (host, port) = primary_addr
             .rsplit_once(':')
             .ok_or_else(|| anyhow!("primary address {primary_addr} has no port"))?;
@@ -45,6 +53,8 @@ impl SeedPlan {
         Ok(Self {
             node_id: node_id.to_string(),
             agent_addr: node.agent_addr.clone(),
+            primary_node_id: topology.primary_node_id.clone(),
+            primary_agent_addr,
             primary_host: host.to_string(),
             primary_port: port.parse()?,
             primary_addr: primary_addr.to_string(),
@@ -90,6 +100,63 @@ impl SeedPlan {
             bail!("{}", response.error);
         }
         Ok(())
+    }
+
+    /// Wait until a node restored from a backup streams from the primary.
+    /// Before it does, it may replay archived WAL for hours, so this gives up
+    /// only once its replay has stood still for `stall` without it streaming.
+    /// One that replayed a diverged timeline past the fork, such as WAL an old
+    /// primary archived after a partition, stands still for good. Returns
+    /// whether it streams.
+    pub async fn wait_streaming(
+        &self,
+        pool: &AgentClientPool,
+        stall: Duration,
+        poll: Duration,
+    ) -> bool {
+        let mut replayed = 0;
+        let mut moved = Instant::now();
+        loop {
+            if self.streams(pool).await {
+                return true;
+            }
+            let now = self.replayed(pool).await;
+            if now > replayed {
+                replayed = now;
+                moved = Instant::now();
+            } else if moved.elapsed() >= stall {
+                warn!(
+                    node_id = self.node_id,
+                    replayed, "replay has stood still and the node does not stream"
+                );
+                return false;
+            }
+            tokio::time::sleep(poll).await;
+        }
+    }
+
+    /// Whether the primary lists this node as streaming.
+    async fn streams(&self, pool: &AgentClientPool) -> bool {
+        let Ok(mut primary) = pool
+            .get_or_connect(&self.primary_node_id, &self.primary_agent_addr)
+            .await
+        else {
+            return false;
+        };
+        primary.get_status().await.is_ok_and(|status| {
+            status
+                .replicas
+                .iter()
+                .any(|r| r.application_name == self.node_id && r.state == "streaming")
+        })
+    }
+
+    /// How far the node has replayed, or 0 if it cannot say.
+    async fn replayed(&self, pool: &AgentClientPool) -> u64 {
+        match pool.get_or_connect(&self.node_id, &self.agent_addr).await {
+            Ok(mut node) => node.get_status().await.map_or(0, |s| s.replayed_lsn),
+            Err(_) => 0,
+        }
     }
 
     /// Bring a diverged old primary back as a standby: rewind it, and seed it

@@ -28,6 +28,12 @@ use replication::{DegradeTimer, StalePrimaries};
 /// How long to wait before trying again to rejoin an old primary.
 const REJOIN_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// How long a node restored from a backup may replay nothing without
+/// streaming before it is seeded from the primary instead.
+const SEED_STALL: Duration = Duration::from_secs(300);
+/// How often to look while waiting for it.
+const SEED_POLL: Duration = Duration::from_secs(10);
+
 /// What an agent answers while a seed, restore or rewind is under way.
 const SEED_RUNNING: &str = "already running";
 
@@ -262,9 +268,15 @@ impl NodeMonitor {
             if let Some(settings) = from_backup {
                 info!(node_id, "seeding an empty node from the latest backup");
                 match plan.run_from_backup(&pool, settings, false).await {
-                    Ok(()) => {
+                    Ok(()) if plan.wait_streaming(&pool, SEED_STALL, SEED_POLL).await => {
                         info!(node_id, "node seeded from a backup");
                         return;
+                    }
+                    // Restored, but it cannot follow the primary, so it would
+                    // wait out its operation for nothing.
+                    Ok(()) => {
+                        warn!(node_id, "the node restored from a backup cannot follow the primary, seeding it from the primary");
+                        force = true;
                     }
                     // A seed already under way, such as one this monitor
                     // started a cooldown ago, must be left to finish.
